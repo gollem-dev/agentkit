@@ -1,0 +1,548 @@
+package agentkit_test
+
+import (
+	"context"
+	"encoding/json"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gollem-dev/agentkit"
+	"github.com/gollem-dev/agentkit/repository/memory"
+	"github.com/gollem-dev/gollem"
+	"github.com/gollem-dev/gollem/mock"
+	"github.com/m-mizutani/gt"
+)
+
+// --- scriptable fake strategy (drives the worker in tests) ---
+
+type scriptInput struct {
+	Seed string `json:"seed"`
+}
+
+type scriptState struct {
+	Seed string `json:"seed"`
+	N    int    `json:"n"`
+}
+
+// scriptStrategy is a Strategy whose behavior is supplied by closures. Init
+// rejects an empty Seed (to exercise the Init-error path).
+type scriptStrategy struct {
+	version int
+	step    func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error)
+}
+
+func (s *scriptStrategy) Version() int {
+	if s.version == 0 {
+		return 1
+	}
+	return s.version
+}
+
+func (s *scriptStrategy) Init(in scriptInput) (scriptState, error) {
+	if in.Seed == "" {
+		return scriptState{}, gollemErr("seed required")
+	}
+	return scriptState{Seed: in.Seed}, nil
+}
+
+func (s *scriptStrategy) Step(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	return s.step(ctx, sys, st)
+}
+
+func (s *scriptStrategy) EncodeState(st scriptState) ([]byte, error) { return json.Marshal(st) }
+
+func (s *scriptStrategy) DecodeState(_ int, raw []byte) (scriptState, error) {
+	var st scriptState
+	err := json.Unmarshal(raw, &st)
+	return st, err
+}
+
+func gollemErr(msg string) error { return &simpleErr{msg} }
+
+type simpleErr struct{ msg string }
+
+func (e *simpleErr) Error() string { return e.msg }
+
+// --- gollem mock helpers ---
+
+// mockLLM returns an LLMClient whose sessions yield the given responses in
+// order (cycling on the last one), and whose History() returns an empty
+// gollem-v3 history. callCount tracks how many Generate calls happened.
+func mockLLM(responses ...*gollem.Response) (gollem.LLMClient, *int) {
+	var mu sync.Mutex
+	count := 0
+	idx := 0
+	hist := &gollem.History{LLType: gollem.LLMTypeClaude, Version: gollem.HistoryVersion}
+	client := &mock.LLMClientMock{
+		NewSessionFunc: func(ctx context.Context, _ ...gollem.SessionOption) (gollem.Session, error) {
+			return &mock.SessionMock{
+				GenerateFunc: func(_ context.Context, _ []gollem.Input, _ ...gollem.GenerateOption) (*gollem.Response, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					count++
+					r := responses[idx]
+					if idx < len(responses)-1 {
+						idx++
+					}
+					return r, nil
+				},
+				HistoryFunc: func() (*gollem.History, error) { return hist, nil },
+			}, nil
+		},
+	}
+	return client, &count
+}
+
+// textResponse is a plain-text LLM response with token usage.
+func textResponse(text string) *gollem.Response {
+	return &gollem.Response{Texts: []string{text}, InputToken: 5, OutputToken: 7}
+}
+
+func mockTool(name string, result map[string]any) gollem.Tool {
+	return &mock.ToolMock{
+		SpecFunc: func() gollem.ToolSpec { return gollem.ToolSpec{Name: name} },
+		RunFunc:  func(_ context.Context, _ map[string]any) (map[string]any, error) { return result, nil },
+	}
+}
+
+// --- serve helper ---
+
+// serveUntil runs the kernel in a background goroutine and polls until want is
+// satisfied (or a timeout), then stops the worker and returns the final Process.
+func serveUntil(t *testing.T, k *agentkit.Kernel, repo agentkit.Repository, pid agentkit.ProcessID, timeout time.Duration, want func(*agentkit.Process) bool, extra ...agentkit.ServeOption) *agentkit.Process {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	opts := append([]agentkit.ServeOption{
+		agentkit.WithPollInterval(2 * time.Millisecond),
+		agentkit.WithLease(2 * time.Second),
+	}, extra...)
+	go func() {
+		_ = k.Serve(ctx, opts...)
+		close(done)
+	}()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if p, err := repo.GetProcess(context.Background(), pid); err == nil && want(p) {
+			return p
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("condition not met within %s", timeout)
+	return nil
+}
+
+func isTerminal(p *agentkit.Process) bool { return p.Status.Terminal() }
+
+// setup builds a kernel over memory with the given options and registers the
+// script strategy "main" with the given step. Returns kernel, repo, handle.
+func setupScript(t *testing.T, step stepFn, model gollem.LLMClient, opts ...agentkit.KernelOption) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput]) {
+	t.Helper()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, model, reg, opts...)
+	gt.NoError(t, err)
+	return k, repo, ag
+}
+
+type stepFn = func(context.Context, agentkit.Syscalls, scriptState) (scriptState, agentkit.Decision, error)
+
+func TestUC1_GenerateThenDone(t *testing.T) {
+	ctx := context.Background()
+	model, count := mockLLM(textResponse("the answer"))
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		res, err := sys.Generate(c, []gollem.Input{gollem.Text(st.Seed)})
+		if err != nil {
+			return st, agentkit.Decision{}, err
+		}
+		return st, agentkit.Done([]byte(res.Texts[0])), nil
+	}
+	k, repo, ag := setupScript(t, step, model)
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "hello"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("the answer")
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(5))
+	gt.Value(t, p.Metrics[agentkit.MetricSteps]).Equal(int64(1))
+	gt.Value(t, *count).Equal(1)
+	events, _ := repo.ListEvents(ctx, pid)
+	gt.Bool(t, hasEvent(events, agentkit.EventProcessCreated)).True()
+	gt.Bool(t, hasEvent(events, agentkit.EventProcessFinished)).True()
+}
+
+func TestE6_RetryExhausted(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		_, _ = sys.Generate(c, []gollem.Input{gollem.Text("go")})
+		return st, agentkit.Decision{}, gollemErr("boom")
+	}
+	// maxStepAttempts=0 -> fail on the first error (no backoff wait in the test).
+	k, repo, ag := setupScript(t, step, model)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	// The consumed generate metric was folded onto the terminal Process (#5).
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+}
+
+func TestE7_LimiterMetricsFoldNoBypass(t *testing.T) {
+	ctx := context.Background()
+	model, count := mockLLM(textResponse("x"))
+	// A strategy that would loop forever generating.
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision{}, err
+		}
+		return st, agentkit.Continue(), nil
+	}
+	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) error {
+		if m[agentkit.MetricLLMCalls] >= 1 {
+			return gollemErr("llm cap reached")
+		}
+		return nil
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureLimitExceeded)
+	// #5: the one Generate's metric was folded (committed), so the limiter sees
+	// llm_calls==1 at the next boundary and stops. No bypass, no re-call.
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+	gt.Value(t, *count).Equal(1)
+}
+
+func TestE8_SuspendWithoutAwait(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		return st, agentkit.Suspend(), nil // no awaits, none pre-open -> transition error
+	}
+	k, repo, ag := setupScript(t, step, model)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+}
+
+func TestE9_DoneNilOutput(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		return st, agentkit.Done(nil), nil // nil output -> transition error
+	}
+	k, repo, ag := setupScript(t, step, model)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+}
+
+func TestTimerFires(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Suspend(agentkit.Timer("t:1", sys.Now().Add(10*time.Millisecond))), nil
+		}
+		aw, ok := sys.Await("t:1")
+		if !ok || !aw.Fired {
+			return st, agentkit.Decision{}, gollemErr("timer not fired")
+		}
+		return st, agentkit.Done([]byte("fired")), nil
+	}
+	k, repo, ag := setupScript(t, step, model)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("fired")
+}
+
+func TestQuestionRoundtrip(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Suspend(agentkit.Question("q:1", []byte("confirm?"))), nil
+		}
+		aw, ok := sys.Await("q:1")
+		if !ok || aw.Status != agentkit.AwaitResponded {
+			return st, agentkit.Decision{}, gollemErr("no answer")
+		}
+		return st, agentkit.Done(aw.Response), nil
+	}
+	k, repo, ag := setupScript(t, step, model)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+
+	// Run until the Process is waiting on the question.
+	serveUntil(t, k, repo, pid, 3*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+	events, _ := repo.ListEvents(ctx, pid)
+	gt.Bool(t, hasEvent(events, agentkit.EventAwaitCreated)).True()
+
+	gt.NoError(t, k.Respond(ctx, pid, "q:1", []byte("yes"), agentkit.WithRespondedBy("slack:U1")))
+
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("yes")
+}
+
+func TestChildrenWakeup(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+			return st, agentkit.Done([]byte(st.Seed)), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		if st.N == 0 {
+			id1, e1 := child.SpawnChild(c, sys, scriptInput{Seed: "r1"})
+			if e1 != nil {
+				return st, agentkit.Decision{}, e1
+			}
+			id2, e2 := child.SpawnChild(c, sys, scriptInput{Seed: "r2"})
+			if e2 != nil {
+				return st, agentkit.Decision{}, e2
+			}
+			st.N = 1
+			return st, agentkit.Suspend(agentkit.WaitChildren("kids", id1, id2)), nil
+		}
+		aw, ok := sys.Await("kids")
+		if !ok || aw.Status != agentkit.AwaitResponded {
+			return st, agentkit.Decision{}, gollemErr("children not ready")
+		}
+		succeeded := 0
+		for _, r := range aw.Results {
+			if r.Status == agentkit.ProcessSucceeded {
+				succeeded++
+			}
+		}
+		return st, agentkit.Done([]byte(itoa(succeeded))), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
+	gt.NoError(t, err)
+
+	// WithConcurrency(4) so the two children run in parallel, exercising the
+	// #3 sibling-finalize serialization and #4 buffered-child overlay.
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithConcurrency(4))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("2") // both children succeeded and were collected.
+}
+
+// hookRepo wraps a Repository so a test can force a precise interleaving: onApply
+// fires just before each Apply; onGet can fail a GetProcess.
+type hookRepo struct {
+	agentkit.Repository
+	mu      sync.Mutex
+	onApply func(cs agentkit.ChangeSet)
+	onGet   func(pid agentkit.ProcessID) error
+}
+
+func (h *hookRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	h.mu.Lock()
+	fn := h.onApply
+	h.mu.Unlock()
+	if fn != nil {
+		fn(cs)
+	}
+	return h.Repository.Apply(ctx, cs)
+}
+
+func (h *hookRepo) GetProcess(ctx context.Context, pid agentkit.ProcessID) (*agentkit.Process, error) {
+	h.mu.Lock()
+	fn := h.onGet
+	h.mu.Unlock()
+	if fn != nil {
+		if err := fn(pid); err != nil {
+			return nil, err
+		}
+	}
+	return h.Repository.GetProcess(ctx, pid)
+}
+
+func (h *hookRepo) setApply(fn func(agentkit.ChangeSet)) { h.mu.Lock(); h.onApply = fn; h.mu.Unlock() }
+
+// #1: a Cancel racing a claim must NOT be lost. Between Cancel's read (pending)
+// and its finalize Apply, a worker claims the Process (running, new LeaseToken).
+// The fix makes Cancel re-read and set CancelRequested instead of abandoning.
+func TestCancelClaimRaceNotLost(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	hr := &hookRepo{Repository: base}
+	reg := agentkit.NewRegistry()
+	ag, _ := agentkit.Register(reg, "a", 1, &scriptStrategy{step: doneStep()})
+	model, _ := mockLLM(textResponse("x"))
+	k, _ := agentkit.New(hr, model, reg)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+
+	var once sync.Once
+	hr.setApply(func(cs agentkit.ChangeSet) {
+		for _, p := range cs.Processes {
+			if p.ID == pid && p.Status == agentkit.ProcessCancelled {
+				// Simulate a worker claiming P between Cancel's read and its Apply.
+				once.Do(func() {
+					_, _ = base.ClaimNextProcess(ctx, "worker-B", time.Now().Add(time.Hour), time.Now())
+				})
+			}
+		}
+	})
+
+	gt.NoError(t, k.Cancel(ctx, pid, "abort"))
+
+	p, err := base.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	// The cancel was not lost: it landed as CancelRequested on the now-running Process.
+	gt.Bool(t, p.CancelRequested).True()
+	gt.Value(t, p.Status).Equal(agentkit.ProcessRunning)
+}
+
+// #3: after MaxStepsPerClaim is consumed, release must re-read so the Process is
+// actually returned to pending (a stale-Rev release would leave it running with
+// a live lease, unclaimable until the lease expired).
+func TestReleaseAfterMaxStepsReclaims(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Continue(), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, _ := agentkit.Register(reg, "a", 1, &scriptStrategy{step: step})
+	model, _ := mockLLM(textResponse("x"))
+	k, _ := agentkit.New(repo, model, reg)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+
+	// MaxStepsPerClaim=1 forces a release after the first Continue commit. A long
+	// lease means the stale-Rev bug would strand the Process (running, leased) and
+	// time out; the fix re-reads and releases to pending so it re-claims and finishes.
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal,
+		agentkit.WithMaxStepsPerClaim(1), agentkit.WithLease(30*time.Second))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+}
+
+// #4: WaitChildren must reject an id that is not a direct child.
+func TestWaitChildrenRejectsNonChild(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	// An unrelated existing Process (no ParentID).
+	stranger := agentkit.ProcessID("stranger-" + randSuffix())
+	gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{
+		Processes: []*agentkit.Process{{ID: stranger, Agent: "x", Status: agentkit.ProcessSucceeded, RootID: stranger, Output: []byte("secret")}},
+	}))
+
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		return st, agentkit.Suspend(agentkit.WaitChildren("k", stranger)), nil
+	}
+	ag, _ := agentkit.Register(reg, "a", 1, &scriptStrategy{step: step})
+	model, _ := mockLLM(textResponse("x"))
+	k, _ := agentkit.New(repo, model, reg)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+
+	// The transition errors (ErrInvalidRequest); with MaxStepAttempts=0 it fails fast.
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	// The stranger must not have been waited on / read into a ChildResult.
+	aws, _ := repo.ListAwaits(ctx, pid)
+	gt.Array(t, aws).Length(0)
+}
+
+// #2: a transient sibling-read failure during a child's finalize must NOT let
+// the child commit terminal and lose the parent wakeup. With the fix the child's
+// finalize aborts and retries (via lease expiry) until the read recovers, so the
+// parent still wakes and succeeds; the swallowing bug would hang the parent.
+func TestParentWakeupSurvivesTransientReadError(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	hr := &hookRepo{Repository: base}
+	reg := agentkit.NewRegistry()
+
+	child, _ := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+			return st, agentkit.Done([]byte(st.Seed)), nil
+		},
+	})
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		if st.N == 0 {
+			id1, e := child.SpawnChild(c, sys, scriptInput{Seed: "r1"})
+			if e != nil {
+				return st, agentkit.Decision{}, e
+			}
+			id2, e := child.SpawnChild(c, sys, scriptInput{Seed: "r2"})
+			if e != nil {
+				return st, agentkit.Decision{}, e
+			}
+			st.N = 1
+			return st, agentkit.Suspend(agentkit.WaitChildren("kids", id1, id2)), nil
+		}
+		aw, ok := sys.Await("kids")
+		if !ok || aw.Status != agentkit.AwaitResponded {
+			return st, agentkit.Decision{}, gollemErr("children not ready")
+		}
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	parent, _ := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	model, _ := mockLLM(textResponse("x"))
+	k, _ := agentkit.New(hr, model, reg)
+	pid, _ := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
+
+	// Fail reads of an already-terminal child (i.e. a sibling read during the
+	// other child's finalize) a couple of times, then let it succeed.
+	var failsLeft int32 = 2
+	hr.mu.Lock()
+	hr.onGet = func(id agentkit.ProcessID) error {
+		if p, err := base.GetProcess(ctx, id); err == nil && p.ParentID != nil && p.Status.Terminal() {
+			if atomic.AddInt32(&failsLeft, -1) >= 0 {
+				return gollemErr("transient read failure")
+			}
+		}
+		return nil
+	}
+	hr.mu.Unlock()
+
+	// Short lease so an aborted finalize retries quickly.
+	p := serveUntil(t, k, hr, pid, 5*time.Second, isTerminal,
+		agentkit.WithLease(30*time.Millisecond), agentkit.WithConcurrency(2))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("ok")
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
+}
