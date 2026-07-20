@@ -17,25 +17,26 @@ func TestDecisionConstructors(t *testing.T) {
 	t.Run("Continue", func(t *testing.T) {
 		v := agentkit.ViewDecision(agentkit.Continue[decOut]())
 		gt.Value(t, v.Kind).Equal(agentkit.DecisionContinue)
-		gt.Nil(t, v.Typed)
+		gt.Bool(t, v.HasOut).False()
 	})
 	t.Run("Done carries the typed output", func(t *testing.T) {
 		v := agentkit.ViewDecision(agentkit.Done(decOut{Text: "result"}))
 		gt.Value(t, v.Kind).Equal(agentkit.DecisionDone)
-		gt.Value(t, v.Typed).Equal(decOut{Text: "result"})
+		gt.Value(t, v.Typed).Equal(agentkit.WrapOutputForTest(decOut{Text: "result"}))
+		gt.Bool(t, v.HasOut).True()
 	})
 	t.Run("Fail carries code and message", func(t *testing.T) {
 		v := agentkit.ViewDecision(agentkit.Fail[decOut](agentkit.FailureStrategyError, "nope"))
 		gt.Value(t, v.Kind).Equal(agentkit.DecisionFail)
 		gt.Value(t, v.Failure.Code).Equal(agentkit.FailureStrategyError)
 		gt.Value(t, v.Failure.Message).Equal("nope")
-		gt.Nil(t, v.Typed)
+		gt.Bool(t, v.HasOut).False()
 	})
 	t.Run("Suspend collects specs", func(t *testing.T) {
 		v := agentkit.ViewDecision(agentkit.Suspend[decOut](agentkit.Timer("t:1", time.Unix(1, 0))))
 		gt.Value(t, v.Kind).Equal(agentkit.DecisionSuspend)
 		gt.Array(t, v.Awaits).Length(1)
-		gt.Nil(t, v.Typed)
+		gt.Bool(t, v.HasOut).False()
 	})
 	t.Run("Suspend with no specs is legal (already-open case)", func(t *testing.T) {
 		v := agentkit.ViewDecision(agentkit.Suspend[decOut]())
@@ -45,7 +46,8 @@ func TestDecisionConstructors(t *testing.T) {
 	t.Run("Done of a zero output is still a Done", func(t *testing.T) {
 		v := agentkit.ViewDecision(agentkit.Done(decOut{}))
 		gt.Value(t, v.Kind).Equal(agentkit.DecisionDone)
-		gt.Value(t, v.Typed).Equal(decOut{})
+		gt.Value(t, v.Typed).Equal(agentkit.WrapOutputForTest(decOut{}))
+		gt.Bool(t, v.HasOut).True()
 	})
 }
 

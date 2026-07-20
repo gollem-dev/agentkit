@@ -754,41 +754,6 @@ func TestFinishHandlerPanicDoesNotKillWorker(t *testing.T) {
 	gt.Value(t, calls.Load()).Equal(int32(2))
 }
 
-// A worker draining on a cancelled context must still deliver the notification:
-// fireFinish detaches cancellation from the handler's context.
-func TestFinishHandlerRunsWhenServeContextIsCancelled(t *testing.T) {
-	ctx := context.Background()
-	released := make(chan struct{})
-	var sawErr atomic.Bool
-	h := func(hctx context.Context, _ agentkit.ProcessID, _ agentkit.FinishResult[finishOut]) error {
-		if hctx.Err() != nil {
-			sawErr.Store(true)
-		}
-		close(released)
-		return nil
-	}
-	k, repo, ag := setupFinish(t, finishDoneStep("ok"), h)
-	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
-
-	serveCtx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		_ = k.Serve(serveCtx, agentkit.WithPollInterval(2*time.Millisecond), agentkit.WithLease(2*time.Second))
-		close(done)
-	}()
-	select {
-	case <-released:
-	case <-time.After(3 * time.Second):
-		t.Fatal("handler was not called")
-	}
-	cancel()
-	<-done
-
-	gt.Bool(t, sawErr.Load()).False()
-	p, _ := repo.GetProcess(ctx, pid)
-	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
-}
-
 // The handler runs synchronously inside commitFinal, so a blocked handler must
 // hold the terminal commit open rather than letting the worker move on.
 func TestFinishHandlerIsSynchronous(t *testing.T) {
@@ -850,8 +815,9 @@ func TestFinishHandlerAbsentForUnknownAgent(t *testing.T) {
 	gt.Value(t, calls).Equal(0)
 }
 
-// Concurrent workers race for every claim, but only the one whose terminal
-// Apply lands reaches fireFinish. Each Process must notify exactly once.
+// Many processes drained by several workers yield exactly one notification
+// each. A claim is exclusive, so this does NOT exercise two workers racing the
+// same terminal Apply — see the deterministic tests below for that.
 func TestFinishHandlerFiresOncePerProcessUnderConcurrency(t *testing.T) {
 	ctx := context.Background()
 	const n = 12
@@ -939,4 +905,205 @@ func TestEncodeOutputErrorFailsTheTransition(t *testing.T) {
 	for _, res := range results {
 		gt.Value(t, res.Status).NotEqual(agentkit.ProcessSucceeded)
 	}
+}
+
+// --- fireFinish's committed-once property, forced deterministically ---
+//
+// The concurrency test above shows N processes yield N notifications, but a
+// claim is exclusive, so it does not actually make two workers race the same
+// terminal Apply. These do, by driving the Repository directly.
+
+func setupFinishOn(t *testing.T, repo agentkit.Repository, h agentkit.FinishHandler[finishOut]) (*agentkit.Kernel, agentkit.Agent[scriptInput]) {
+	t.Helper()
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &finishStrategy{step: finishDoneStep("ok")},
+		agentkit.WithOnFinish(h))
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+	return k, ag
+}
+
+// A conflict the worker still owns the lease for is rebuilt and retried inside
+// commitFinal. The retry must not notify twice.
+func TestFinishHandlerFiresOnceAcrossACommitRetry(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	hr := &hookRepo{Repository: base}
+	var rec finishRecorder
+	k, ag := setupFinishOn(t, hr, rec.handler)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+
+	var applies atomic.Int32
+	var once sync.Once
+	hr.setFailApply(func(cs agentkit.ChangeSet) error {
+		for _, p := range cs.Processes {
+			if p.ID == pid && p.Status == agentkit.ProcessSucceeded {
+				applies.Add(1)
+				var reject bool
+				once.Do(func() { reject = true })
+				if reject {
+					return agentkit.ErrConflict
+				}
+			}
+		}
+		return nil
+	})
+
+	p := serveUntil(t, k, hr, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	// The terminal Apply really was attempted twice...
+	gt.Number(t, applies.Load()).GreaterOrEqual(int32(2))
+	// ...and the handler still fired exactly once.
+	calls, results := rec.snapshot()
+	gt.Value(t, calls).Equal(1)
+	gt.Value(t, results[0].Status).Equal(agentkit.ProcessSucceeded)
+}
+
+// A worker that lost its lease abandons the finalize instead of rebasing, so it
+// must not notify: the winner will.
+func TestFinishHandlerDoesNotFireWhenTheLeaseWasLost(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	hr := &hookRepo{Repository: base}
+	var rec finishRecorder
+	k, ag := setupFinishOn(t, hr, rec.handler)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+
+	var once sync.Once
+	hr.setFailApply(func(cs agentkit.ChangeSet) error {
+		var steal bool
+		for _, p := range cs.Processes {
+			if p.ID == pid && p.Status == agentkit.ProcessSucceeded {
+				once.Do(func() { steal = true })
+			}
+		}
+		if !steal {
+			return nil
+		}
+		// Hand the lease to someone else behind the worker's back, then reject
+		// its commit. On the re-read it finds a token that is not its own.
+		cur, err := base.GetProcess(ctx, pid)
+		if err != nil {
+			return err
+		}
+		cur.LeaseToken = "another-worker"
+		if aerr := base.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{cur}}); aerr != nil {
+			return aerr
+		}
+		return agentkit.ErrConflict
+	})
+
+	serveCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = k.Serve(serveCtx, agentkit.WithPollInterval(2*time.Millisecond), agentkit.WithLease(2*time.Second))
+		close(done)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	calls, _ := rec.snapshot()
+	gt.Value(t, calls).Equal(0)
+	p, err := base.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.Value(t, p.Status).NotEqual(agentkit.ProcessSucceeded)
+}
+
+// Cancel commits from the caller's own goroutine. When it races a claim it is
+// converted into CancelRequested and the worker finalizes instead, so exactly
+// one of the two paths notifies.
+func TestFinishHandlerFiresOnceWhenCancelRacesAClaim(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	hr := &hookRepo{Repository: base}
+	var rec finishRecorder
+	k, ag := setupFinishOn(t, hr, rec.handler)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+
+	var once sync.Once
+	hr.setApply(func(cs agentkit.ChangeSet) {
+		for _, p := range cs.Processes {
+			if p.ID == pid && p.Status == agentkit.ProcessCancelled {
+				// A short lease so this stand-in worker gets out of the way and a
+				// real one can pick the Process up again.
+				once.Do(func() {
+					_, _ = base.ClaimNextProcess(ctx, "worker-B",
+						time.Now().Add(20*time.Millisecond), time.Now())
+				})
+			}
+		}
+	})
+
+	// Cancel loses the race and lands as CancelRequested: no terminal commit
+	// happened here, so nothing fired.
+	gt.NoError(t, k.Cancel(ctx, pid, "abort"))
+	calls, _ := rec.snapshot()
+	gt.Value(t, calls).Equal(0)
+
+	// Once that lease lapses a worker observes CancelRequested and finalizes.
+	hr.setApply(nil)
+	p := serveUntil(t, k, hr, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessCancelled)
+
+	calls, results := rec.snapshot()
+	gt.Value(t, calls).Equal(1)
+	gt.Value(t, results[0].Status).Equal(agentkit.ProcessCancelled)
+	gt.Nil(t, results[0].Output)
+}
+
+// The worker's context is already cancelled by the time fireFinish runs, which
+// is the case context.WithoutCancel exists for.
+func TestFinishHandlerRunsWithAContextCancelledBeforeItWasCalled(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	hr := &hookRepo{Repository: base}
+
+	var handlerCtxErr atomic.Value
+	handlerCtxErr.Store("not-called")
+	released := make(chan struct{})
+	k, ag := setupFinishOn(t, hr, func(hctx context.Context, _ agentkit.ProcessID, _ agentkit.FinishResult[finishOut]) error {
+		if err := hctx.Err(); err != nil {
+			handlerCtxErr.Store(err.Error())
+		} else {
+			handlerCtxErr.Store("")
+		}
+		close(released)
+		return nil
+	})
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+
+	serveCtx, cancel := context.WithCancel(context.Background())
+	// Cancel the worker's context on the way into the terminal Apply, so it is
+	// already cancelled when fireFinish is reached.
+	var once sync.Once
+	hr.setApply(func(cs agentkit.ChangeSet) {
+		for _, p := range cs.Processes {
+			if p.ID == pid && p.Status == agentkit.ProcessSucceeded {
+				once.Do(cancel)
+			}
+		}
+	})
+
+	done := make(chan struct{})
+	go func() {
+		_ = k.Serve(serveCtx, agentkit.WithPollInterval(2*time.Millisecond), agentkit.WithLease(2*time.Second))
+		close(done)
+	}()
+	select {
+	case <-released:
+	case <-time.After(3 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("handler was not called")
+	}
+	<-done
+
+	// It ran, and it ran with cancellation detached.
+	gt.Value(t, handlerCtxErr.Load()).Equal("")
+	p, err := base.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 }

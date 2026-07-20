@@ -94,6 +94,33 @@ func (s outStrat) EncodeOutput(out bindOut) ([]byte, error) {
 	}
 	return json.Marshal(out)
 }
+
+// anyOutStrat's output type is the interface `any`, the case where erasing a
+// bare value would lose a nil.
+type anyOutStrat struct {
+	step     func(bindState) (agentkit.Decision[any], error)
+	onEncode func(any)
+}
+
+func (anyOutStrat) Version() int                         { return 1 }
+func (anyOutStrat) Init(in bindInput) (bindState, error) { return bindState(in), nil }
+func (s anyOutStrat) Step(_ context.Context, _ agentkit.Syscalls, st bindState) (bindState, agentkit.Decision[any], error) {
+	d, err := s.step(st)
+	return st, d, err
+}
+func (s anyOutStrat) EncodeOutput(out any) ([]byte, error) {
+	if s.onEncode != nil {
+		s.onEncode(out)
+	}
+	return json.Marshal(out)
+}
+func (anyOutStrat) EncodeState(st bindState) ([]byte, error) { return json.Marshal(st) }
+func (anyOutStrat) DecodeState(_ int, raw []byte) (bindState, error) {
+	var st bindState
+	err := json.Unmarshal(raw, &st)
+	return st, err
+}
+
 func (outStrat) EncodeState(st bindState) ([]byte, error) { return json.Marshal(st) }
 func (outStrat) DecodeState(_ int, raw []byte) (bindState, error) {
 	var st bindState
@@ -118,7 +145,8 @@ func TestBindStrategyStepErasesDecision(t *testing.T) {
 		_, d, err := b.StepForTest(ctx, nil, bindState{V: 1})
 		gt.NoError(t, err)
 		gt.Value(t, d.Kind).Equal(agentkit.DecisionDone)
-		gt.Value(t, d.Typed).Equal(bindOut{Text: "hi"})
+		gt.Bool(t, d.HasOut).True()
+		gt.Value(t, d.Typed).Equal(agentkit.WrapOutputForTest(bindOut{Text: "hi"}))
 		gt.Nil(t, d.Output)
 		gt.Value(t, calls).Equal(0)
 	})
@@ -133,7 +161,7 @@ func TestBindStrategyStepErasesDecision(t *testing.T) {
 		gt.NoError(t, err)
 		gt.Value(t, d.Kind).Equal(agentkit.DecisionContinue)
 		gt.Nil(t, d.Output)
-		gt.Nil(t, d.Typed)
+		gt.Bool(t, d.HasOut).False()
 	})
 
 	t.Run("a state of the wrong type is a discriminable error", func(t *testing.T) {
@@ -151,7 +179,7 @@ func TestBindStrategyEncodeOutput(t *testing.T) {
 	t.Run("encodes the typed output", func(t *testing.T) {
 		calls := 0
 		b := agentkit.BindStrategy(outStrat{encodeCalls: &calls})
-		raw, err := b.EncodeOutputForTest(bindOut{Text: "hi"})
+		raw, err := b.EncodeOutputForTest(agentkit.WrapOutputForTest(bindOut{Text: "hi"}))
 		gt.NoError(t, err)
 		gt.Value(t, string(raw)).Equal(`{"text":"hi"}`)
 		gt.Value(t, calls).Equal(1)
@@ -159,7 +187,7 @@ func TestBindStrategyEncodeOutput(t *testing.T) {
 
 	t.Run("propagates the strategy's error", func(t *testing.T) {
 		b := agentkit.BindStrategy(outStrat{encodeErr: gollemErr("boom")})
-		_, err := b.EncodeOutputForTest(bindOut{Text: "hi"})
+		_, err := b.EncodeOutputForTest(agentkit.WrapOutputForTest(bindOut{Text: "hi"}))
 		gt.Error(t, err)
 	})
 
@@ -167,8 +195,52 @@ func TestBindStrategyEncodeOutput(t *testing.T) {
 		// Reachable because a Step middleware can swap in another agent's
 		// Decision; it must not surface as a panic.
 		b := agentkit.BindStrategy(outStrat{})
-		_, err := b.EncodeOutputForTest("not a bindOut")
+		_, err := b.EncodeOutputForTest(agentkit.WrapOutputForTest("not a bindOut"))
 		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
+	})
+}
+
+// A nil value of an interface-typed O must survive erasure. Stored bare in an
+// `any` it would become a nil interface and assert back to nothing, so a
+// legitimate Done(nil) would look like an output-type mismatch.
+func TestNilInterfaceOutputSurvivesErasure(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("O = any, Done(nil) reaches EncodeOutput", func(t *testing.T) {
+		var got any = "unset"
+		b := agentkit.BindStrategy(anyOutStrat{
+			onEncode: func(o any) { got = o },
+			step: func(bindState) (agentkit.Decision[any], error) {
+				return agentkit.Done[any](nil), nil
+			},
+		})
+		_, d, err := b.StepForTest(ctx, nil, bindState{V: 1})
+		gt.NoError(t, err)
+		gt.Bool(t, d.HasOut).True()
+
+		raw, err := b.EncodeOutputForTest(d.Typed)
+		gt.NoError(t, err)
+		gt.Value(t, string(raw)).Equal("null")
+		gt.Nil(t, got)
+	})
+
+	t.Run("O = any, Done(nil) reaches the finish handler", func(t *testing.T) {
+		var got agentkit.FinishResult[any]
+		called := false
+		b := agentkit.BindStrategy(anyOutStrat{
+			step: func(bindState) (agentkit.Decision[any], error) {
+				return agentkit.Done[any](nil), nil
+			},
+		}, agentkit.WithOnFinish(func(_ context.Context, _ agentkit.ProcessID, res agentkit.FinishResult[any]) error {
+			got, called = res, true
+			return nil
+		}))
+		_, d, err := b.StepForTest(ctx, nil, bindState{V: 1})
+		gt.NoError(t, err)
+		gt.NoError(t, b.FinishForTest(ctx, "p-nil", agentkit.ProcessSucceeded, d.Typed, nil))
+		gt.Bool(t, called).True()
+		gt.NotNil(t, got.Output)
+		gt.Nil(t, *got.Output)
 	})
 }
 
@@ -189,7 +261,7 @@ func TestBindStrategyFinish(t *testing.T) {
 			return nil
 		})
 		gt.Bool(t, b.HasFinishForTest()).True()
-		err := b.FinishForTest(ctx, "p-1", agentkit.ProcessSucceeded, bindOut{Text: "hi"}, nil)
+		err := b.FinishForTest(ctx, "p-1", agentkit.ProcessSucceeded, agentkit.WrapOutputForTest(bindOut{Text: "hi"}), nil)
 		gt.NoError(t, err)
 		gt.Value(t, got.Status).Equal(agentkit.ProcessSucceeded)
 		gt.NotNil(t, got.Output)
@@ -230,7 +302,7 @@ func TestBindStrategyFinish(t *testing.T) {
 			called = true
 			return nil
 		})
-		err := b.FinishForTest(ctx, "p-4", agentkit.ProcessSucceeded, "not a bindOut", nil)
+		err := b.FinishForTest(ctx, "p-4", agentkit.ProcessSucceeded, agentkit.WrapOutputForTest("not a bindOut"), nil)
 		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
 		gt.Bool(t, called).False()
 	})
@@ -239,6 +311,6 @@ func TestBindStrategyFinish(t *testing.T) {
 		b := bindWith(func(_ context.Context, _ agentkit.ProcessID, _ agentkit.FinishResult[bindOut]) error {
 			return gollemErr("handler failed")
 		})
-		gt.Error(t, b.FinishForTest(ctx, "p-5", agentkit.ProcessSucceeded, bindOut{}, nil))
+		gt.Error(t, b.FinishForTest(ctx, "p-5", agentkit.ProcessSucceeded, agentkit.WrapOutputForTest(bindOut{}), nil))
 	})
 }

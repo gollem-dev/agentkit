@@ -147,9 +147,12 @@ must be durable *before* the action, record it inside the tool's `Run`.
 
 **A kernel middleware runs across all agents, so it does not know any
 strategy's input, state or output type.** The type-erased payloads are read with
-`InitInput[I]` / `StepState[S]` / `SpawnInput[I]` / `ResultDecision[O]` and
+`InitInput[I]` / `StepState[S]` / `SpawnInput[I]` / `ResultState[S]` and
 replaced by deriving a new request (`NewInitRequest` and friends); `ok == false`
-just means "another agent's Process — pass it through". Passing `any` as the type argument always
+just means "another agent's Process — pass it through". A Decision is the one
+payload with no `[any]` shortcut — it carries a type witness so a nil interface
+output survives erasure, so `ResultDecision[O]` needs the exact `O`; use
+`DecisionKindOf` to branch without naming it. Passing `any` as the type argument always
 succeeds and is the intended form for generic logging. Nothing here is checked
 by the compiler: a wrong type surfaces as `ErrInvalidRequest` at run time. That
 is the nature of a cross-cutting layer, and it is why typed manipulation of a

@@ -35,34 +35,32 @@ of anything ([ADR-0011](adr/0011-kernel-has-no-tenancy.md)).
 
 Your state machine, and the only code agentkit runs on your behalf.
 
-```go
-type Strategy[S, I, O any] interface {
-    Version() int
-    Init(input I) (S, error)
-    Step(ctx context.Context, sys Syscalls, state S) (S, Decision[O], error)
-    EncodeState(state S) ([]byte, error)
-    DecodeState(version int, raw []byte) (S, error)
-    EncodeOutput(out O) ([]byte, error)
-}
-```
+`Strategy` is generic over three types. Choosing them well is the design work;
+read the method signatures off the type itself.
 
-Three types: `S` is what you checkpoint, `I` is what launches a run, `O` is what
-a finished run produces.
+- **`S`, the state** — everything that must survive a crash. `Step` is called
+  from the top every time, including after one, so whatever is not in `S` is
+  gone.
+- **`I`, the launch input** — what `Spawn` takes. `Init` turns it into the first
+  `S` and receives no context and no syscalls, so a *strategy author* has
+  structurally no path to an effect there — whoever configures the `Kernel` can
+  still wrap it with `InitMiddleware`, which does receive a `ctx`
+  ([observability.md](observability.md)). `Init` runs synchronously inside
+  `Spawn`, so a bad input is an error the caller sees immediately rather than an
+  asynchronous failure later.
+- **`O`, the output** — what a finished run produces, handed to `Done`.
 
-- **`Init`** builds the initial state, purely. It receives no context and no
-  syscalls, so a *strategy author* has structurally no path to an effect here
-  — whoever configures the `Kernel` can still wrap it with `InitMiddleware`,
-  which does receive a `ctx` ([observability.md](observability.md)). `Init`
-  runs synchronously inside `Spawn`, so a bad input is an error the caller sees
-  immediately rather than an asynchronous failure later.
-- **`Step`** runs one transition and returns a `Decision[O]`. It is called from
-  the top every time, including after a crash.
-- **`EncodeState` / `DecodeState`** own serialization entirely. The format is
-  yours; agentkit stores bytes. `DecodeState` receives the version that wrote
-  them, so migration is ordinary code inside it.
-- **`EncodeOutput`** turns what you pass to `Done` into the bytes stored on the
-  Process. There is no `DecodeOutput`: a completion handler receives the value
-  you passed, and a parent reads a child's output as bytes.
+Serialization is yours in both directions the kernel needs it: `EncodeState` /
+`DecodeState` own the state format entirely (JSON, gob, protobuf — agentkit
+stores bytes), and `DecodeState` receives the version that wrote them, so
+migration is ordinary code inside it. `EncodeOutput` does the same for the
+output of a finished run.
+
+There is deliberately no `DecodeOutput`, because nothing reads those bytes back
+as `O`: a completion handler is handed the value you passed to `Done`, and a
+parent waiting on children reads a child's output as opaque bytes. The output is
+persisted so it can reach a parent that wakes later, on another machine — not so
+the kernel can hand it back to you typed.
 
 Register with `Register[S, I, O]`, which returns a typed `Agent[I]` — the only
 way to spawn, so the input type is checked at compile time and `any` never

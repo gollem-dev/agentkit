@@ -100,11 +100,11 @@ func BindStrategy[S, I, O any](s Strategy[S, I, O], opts ...RegisterOption[O]) S
 			return s.EncodeState(typed)
 		},
 		encodeOutput: func(out any) ([]byte, error) {
-			typed, ok := out.(O)
+			env, ok := out.(typedOutput[O])
 			if !ok {
 				return nil, goerr.Wrap(ErrInvalidRequest, "step output type mismatch")
 			}
-			return s.EncodeOutput(typed)
+			return s.EncodeOutput(env.value)
 		},
 		decode: func(v int, raw []byte) (any, error) { return s.DecodeState(v, raw) },
 	}
@@ -113,12 +113,12 @@ func BindStrategy[S, I, O any](s Strategy[S, I, O], opts ...RegisterOption[O]) S
 			res := FinishResult[O]{Status: status}
 			switch status {
 			case ProcessSucceeded:
-				out, ok := typedOut.(O)
+				env, ok := typedOut.(typedOutput[O])
 				if !ok {
 					return goerr.Wrap(ErrInvalidRequest, "finish output type mismatch",
 						goerr.V("process", pid))
 				}
-				res.Output = &out
+				res.Output = &env.value
 			case ProcessFailed:
 				res.Failure = f
 			}

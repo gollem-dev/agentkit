@@ -178,10 +178,14 @@ func ResultState[S any](res *StepResult) (S, bool) {
 	return v, ok
 }
 
-// ResultDecision reads the Decision as Decision[O]. As with ResultState,
-// ok == false means the result belongs to an agent whose output type is not O.
-// Passing any as O always succeeds and is the form for generic logging, but the
-// resulting Decision cannot be inspected beyond its kind.
+// ResultDecision reads the Decision as Decision[O]. ok == false means the
+// result belongs to an agent whose output type is not O — for every kind, not
+// only for a Done.
+//
+// Unlike StepState and friends, O must be the agent's exact output type:
+// Decision carries its own type witness, so ResultDecision[any] does NOT match
+// an agent whose O is something else. To branch on what a transition decided
+// without naming O, use DecisionKindOf.
 func ResultDecision[O any](res *StepResult) (Decision[O], bool) {
 	return restore[O](res.dec)
 }

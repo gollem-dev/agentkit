@@ -52,42 +52,57 @@ func Suspend[O any](specs ...AwaitSpec) Decision[O] {
 	return Decision[O]{kind: DecisionSuspend, awaits: specs}
 }
 
+// typedOutput carries O across the erasure boundary.
+//
+// Storing the value bare in an `any` would not do. When O is an interface type
+// and the value is nil, `any(d.out)` is a nil interface, which asserts back to
+// nothing — not even to `any` — so a legitimate Done(nil) would become an
+// output-type mismatch. A bare value also leaves a Decision that carries no
+// output with no witness of O at all, which would make restore's "belongs to
+// another O" answer unknowable. The envelope fixes both: it is always present,
+// and its own type is the witness.
+type typedOutput[O any] struct{ value O }
+
 // decision is the type-erased form of Decision[O], carried through the worker
-// and the Step middleware chain, which know nothing of O. typed is the value
+// and the Step middleware chain, which know nothing of O. typed holds the value
 // Done received; the worker turns it into output via the binding's
 // encodeOutput once the chain has settled on a Decision, and hands the same
-// typed value to a completion handler so no decode is needed.
+// value to a completion handler so no decode is needed.
 type decision struct {
 	kind    DecisionKind
 	output  []byte
-	typed   any
-	hasOut  bool // true only for Done; typed alone cannot say so for a nil-able O.
+	typed   any  // always a typedOutput[O]; the zero decision has none.
+	hasOut  bool // true only for Done; typed is present either way.
 	failure *Failure
 	awaits  []AwaitSpec
 }
 
 // erase drops O so the worker and the middleware chain can carry the Decision.
 func (d Decision[O]) erase() decision {
-	e := decision{kind: d.kind, failure: d.failure, awaits: d.awaits, hasOut: d.hasOut}
-	if d.hasOut {
-		e.typed = d.out
+	return decision{
+		kind:    d.kind,
+		failure: d.failure,
+		awaits:  d.awaits,
+		hasOut:  d.hasOut,
+		typed:   typedOutput[O]{value: d.out},
 	}
-	return e
 }
 
 // restore is erase's inverse, for a middleware reading the Decision back out.
-// ok is false when the erased Decision was produced for a different O.
+// ok is false when the erased Decision was produced for a different O — for
+// every kind, not only for Done.
 func restore[O any](e decision) (Decision[O], bool) {
-	d := Decision[O]{kind: e.kind, failure: e.failure, awaits: e.awaits}
-	if !e.hasOut {
-		return d, true
-	}
-	out, ok := e.typed.(O)
+	env, ok := e.typed.(typedOutput[O])
 	if !ok {
 		return Decision[O]{}, false
 	}
-	d.out, d.hasOut = out, true
-	return d, true
+	return Decision[O]{
+		kind:    e.kind,
+		failure: e.failure,
+		awaits:  e.awaits,
+		out:     env.value,
+		hasOut:  e.hasOut,
+	}, true
 }
 
 // AwaitSpec is a declared wait. It can only be built via the constructors
