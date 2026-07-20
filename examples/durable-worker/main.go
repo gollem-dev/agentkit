@@ -304,6 +304,12 @@ func runStatus(ctx context.Context, w io.Writer, dir string, pid agentkit.Proces
 	fmt.Fprintf(w, "status:        %s\n", proc.Status)
 	fmt.Fprintf(w, "committed seq: %d\n", proc.StateSeq)
 	fmt.Fprintf(w, "step attempts: %d\n", proc.StepAttempts)
+	// The simulated crash above leaves the row running with a lease nobody
+	// renews, so the next claim takes it over and counts it here. Errors and
+	// crashes are counted separately because they say different things: an
+	// error tells you how far the last attempt got, a vanished claim tells you
+	// nothing at all.
+	fmt.Fprintf(w, "unclean rec.:  %d\n", proc.UncleanReclaims)
 	fmt.Fprintf(w, "metrics:       %v\n", proc.Metrics)
 	if proc.Failure != nil {
 		fmt.Fprintf(w, "failure:       %s %s\n", proc.Failure.Code, proc.Failure.Message)

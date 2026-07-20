@@ -17,12 +17,13 @@ import (
 type ServeOption func(*serveConfig)
 
 type serveConfig struct {
-	workerID         string
-	lease            time.Duration
-	pollInterval     time.Duration
-	maxStepsPerClaim int
-	maxStepAttempts  int
-	concurrency      int
+	workerID           string
+	lease              time.Duration
+	pollInterval       time.Duration
+	maxStepsPerClaim   int
+	maxStepAttempts    int
+	maxUncleanReclaims int
+	concurrency        int
 }
 
 // WithWorkerID sets the worker id (diagnostic). Default: hostname + "/" + uuid v7.
@@ -39,8 +40,28 @@ func WithPollInterval(d time.Duration) ServeOption {
 // WithMaxStepsPerClaim sets how many transitions one claim runs. Default: 16.
 func WithMaxStepsPerClaim(n int) ServeOption { return func(c *serveConfig) { c.maxStepsPerClaim = n } }
 
-// WithMaxStepAttempts sets the step retry limit. Default: 3.
+// WithMaxStepAttempts sets the step retry limit. Default: 3. This bounds
+// attempts that ended in an ERROR; a claim that died mid-transition is bounded
+// separately by WithMaxUncleanReclaims.
 func WithMaxStepAttempts(n int) ServeOption { return func(c *serveConfig) { c.maxStepAttempts = n } }
+
+// WithMaxUncleanReclaims bounds how many times a Process may be taken over
+// after a claim died mid-transition. Default: 3. Exceeding it terminates the
+// Process as failed with FailureUncleanReclaim.
+//
+// This is deliberately separate from WithMaxStepAttempts: an error tells the
+// strategy how far the previous attempt got, whereas a vanished claim tells it
+// nothing — the transition may have run every effect and died before its
+// commit, and a lease-expiry reclaim may overlap a predecessor that is still
+// running. Callers that cannot tolerate duplicated side effects set this to 0.
+//
+// The bound is compared as `UncleanReclaims > n`, matching the
+// `StepAttempts+1 > n` convention: n permits n further attempts after the
+// first. n=0 therefore finalizes the Process on the first unclean reclaim,
+// without running Step at all.
+func WithMaxUncleanReclaims(n int) ServeOption {
+	return func(c *serveConfig) { c.maxUncleanReclaims = n }
+}
 
 // WithConcurrency sets the number of parallel claim loops. Default: 1.
 func WithConcurrency(n int) ServeOption { return func(c *serveConfig) { c.concurrency = n } }
@@ -48,12 +69,13 @@ func WithConcurrency(n int) ServeOption { return func(c *serveConfig) { c.concur
 func newServeConfig(opts []ServeOption) serveConfig {
 	host, _ := os.Hostname()
 	cfg := serveConfig{
-		workerID:         host + "/" + uuid.Must(uuid.NewV7()).String(),
-		lease:            60 * time.Second,
-		pollInterval:     500 * time.Millisecond,
-		maxStepsPerClaim: 16,
-		maxStepAttempts:  3,
-		concurrency:      1,
+		workerID:           host + "/" + uuid.Must(uuid.NewV7()).String(),
+		lease:              60 * time.Second,
+		pollInterval:       500 * time.Millisecond,
+		maxStepsPerClaim:   16,
+		maxStepAttempts:    3,
+		maxUncleanReclaims: 3,
+		concurrency:        1,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -137,6 +159,20 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			return
 		}
 		proc = fresh
+		// Bounded before Step rather than after a failure, because an unclean
+		// reclaim is already counted by the time the Process is claimed: the
+		// previous attempt may have run every effect and died before its commit.
+		// Deciding here is what lets maxUncleanReclaims=0 mean "do not re-run at
+		// all". In practice this only fires on the first iteration of a claim
+		// that took over a dead one — a successful commit resets the counter, so
+		// every later iteration reads 0.
+		if proc.UncleanReclaims > cfg.maxUncleanReclaims {
+			cause := goerr.New("unclean reclaim limit exceeded",
+				goerr.V("unclean_reclaims", proc.UncleanReclaims),
+				goerr.V("limit", cfg.maxUncleanReclaims))
+			_ = k.finalize(ctx, proc, failWith(FailureUncleanReclaim, cause), claimToken, nil)
+			return
+		}
 		if k.limiter != nil {
 			if lerr := k.limiter(ctx, proc, proc.Metrics); lerr != nil {
 				_ = k.finalize(ctx, proc, failWith(FailureLimitExceeded, lerr), claimToken, nil)
@@ -307,6 +343,7 @@ func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte
 	p.StateVersion = version
 	p.StateSeq = seq
 	p.StepAttempts = 0
+	p.UncleanReclaims = 0
 	p.Metrics = addMetrics(p.Metrics, sys.runMetrics)
 	p.Metrics = addMetrics(p.Metrics, Metrics{MetricSteps: 1})
 	p.UpdatedAt = now
@@ -479,6 +516,7 @@ func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []b
 		p.StateVersion = version
 		p.StateSeq = seq
 		p.StepAttempts = 0
+		p.UncleanReclaims = 0
 		p.Metrics = addMetrics(p.Metrics, sys.runMetrics)
 		p.Metrics = addMetrics(p.Metrics, Metrics{MetricSteps: 1})
 		if dec.kind == DecisionDone {

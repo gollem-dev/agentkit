@@ -31,6 +31,10 @@ type Syscalls interface {
 	ParentID() (ProcessID, bool)
 	Agent() AgentName
 	Now() time.Time // current time (the Kernel's clock; testable via WithClock). Not deterministic.
+	// Attempt reports prior attempts at THIS transition that did not commit, so
+	// a strategy can tell a replay from a first run before acting. A zero value
+	// means this is the first attempt.
+	Attempt() AttemptInfo
 
 	// --- LLM (via gollem; Limiter before, Metrics after) ---
 	Tools() []gollem.Tool // the tools the ToolFactory built (to declare to the LLM).
@@ -241,8 +245,13 @@ func (s *syscalls) notifySpawnDone(err error) {
 	s.pendingSpawnDone = nil
 }
 
+func (s *syscalls) Attempt() AttemptInfo {
+	return AttemptInfo{Errors: s.proc.StepAttempts, UncleanReclaims: s.proc.UncleanReclaims}
+}
+
 func (s *syscalls) ec() EffectContext {
-	return EffectContext{ProcessID: s.proc.ID, RootID: s.proc.RootID, Agent: s.proc.Agent, StateSeq: s.seq}
+	return EffectContext{ProcessID: s.proc.ID, RootID: s.proc.RootID, Agent: s.proc.Agent,
+		StateSeq: s.seq, Attempt: s.Attempt()}
 }
 
 // checkLimit runs the Limiter with the live snapshot (committed + this run).

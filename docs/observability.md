@@ -54,6 +54,14 @@ every transition boundary.** Nil means continue; non-nil means stop:
 
 No `Limiter` means unlimited.
 
+A `Limiter` is not the only thing that ends a run without the strategy deciding
+to. A process whose claims keep dying mid-transition finalizes as `failed` with
+`FailureUncleanReclaim` once it exceeds `WithMaxUncleanReclaims`. Read that code
+as a signal about your workers rather than about the strategy: `retry_exhausted`
+means a strategy kept returning errors, whereas `unclean_reclaim` means the
+worker running it kept disappearing
+([ADR-0015](adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
+
 Because it is a closure and not a table, policies that a static limit table
 cannot express are ordinary code — per-agent caps from `proc.Agent`, tree-wide
 budgets from `proc.RootID` plus your own store, rate limits from your own

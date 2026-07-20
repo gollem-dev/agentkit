@@ -1107,3 +1107,182 @@ func TestFinishHandlerRunsWithAContextCancelledBeforeItWasCalled(t *testing.T) {
 	gt.NoError(t, err)
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 }
+
+// --- unclean reclaims -------------------------------------------------------
+
+// forceUncleanReclaimable rewrites pid's row into the state a worker leaves
+// behind when it dies mid-transition: still running, with a lease nobody will
+// ever renew. The next claim therefore takes it over as an unclean reclaim.
+func forceUncleanReclaimable(t *testing.T, repo agentkit.Repository, pid agentkit.ProcessID) {
+	t.Helper()
+	p, err := repo.GetProcess(context.Background(), pid)
+	gt.NoError(t, err)
+	p.Status = agentkit.ProcessRunning
+	p.LeaseOwner = "dead-worker"
+	p.LeaseToken = "dead-token"
+	past := time.Now().Add(-time.Hour)
+	p.LeaseUntil = &past
+	gt.NoError(t, repo.Apply(context.Background(), agentkit.ChangeSet{
+		Processes: []*agentkit.Process{p},
+	}))
+}
+
+// countingStep wraps a step and records how many times it ran.
+func countingStep(calls *atomic.Int32, inner stepFn) stepFn {
+	return func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		calls.Add(1)
+		return inner(c, sys, st)
+	}
+}
+
+// With the bound at 0, taking over a dead claim must not re-run Step at all —
+// the previous attempt may already have run every effect and died before its
+// commit.
+func TestUncleanReclaimZeroDoesNotRerunStep(t *testing.T) {
+	ctx := context.Background()
+	var calls atomic.Int32
+	step := countingStep(&calls, func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("done")), nil
+	})
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	forceUncleanReclaimable(t, repo, pid)
+
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxUncleanReclaims(0))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureUncleanReclaim)
+	gt.Value(t, calls.Load()).Equal(int32(0))
+}
+
+// The default posture is still "a crash resumes". Only the unbounded part goes.
+func TestUncleanReclaimWithinBoundStillRuns(t *testing.T) {
+	ctx := context.Background()
+	var calls atomic.Int32
+	step := countingStep(&calls, func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("done")), nil
+	})
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model)
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	forceUncleanReclaimable(t, repo, pid)
+
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxUncleanReclaims(3))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("done")
+	gt.Value(t, calls.Load()).Equal(int32(1))
+}
+
+// The point of two counters: an error budget and a crash budget are independent.
+// With crashes forbidden outright, error retries must still get their three.
+func TestUncleanReclaimBoundIsIndependentOfStepAttempts(t *testing.T) {
+	ctx := context.Background()
+	var calls atomic.Int32
+	step := countingStep(&calls, func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Decision[[]byte]{}, gollemErr("boom")
+	})
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model)
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal,
+		agentkit.WithMaxUncleanReclaims(0), agentkit.WithMaxStepAttempts(3))
+
+	// Terminated by the error budget, not the crash budget.
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	// StepAttempts+1 > 3 finalizes on the fourth attempt.
+	gt.Value(t, calls.Load()).Equal(int32(4))
+	// requeue moves the Process to pending, so no claim here was unclean.
+	gt.Value(t, p.UncleanReclaims).Equal(0)
+}
+
+// A committed transition clears both counters, so a later unclean reclaim
+// starts from zero rather than inheriting the earlier one.
+func TestUncleanReclaimResetOnCommit(t *testing.T) {
+	ctx := context.Background()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model)
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	forceUncleanReclaimable(t, repo, pid)
+
+	// maxUncleanReclaims=0 would fire on the first iteration; 1 lets it through
+	// so the commit can prove it clears the counter.
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxUncleanReclaims(1))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, p.UncleanReclaims).Equal(0)
+	gt.Value(t, p.StepAttempts).Equal(0)
+}
+
+func TestAttemptInfoReportsBothOrigins(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("first attempt is not a replay", func(t *testing.T) {
+		var got agentkit.AttemptInfo
+		step := func(_ context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			got = sys.Attempt()
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, repo, ag := setupScript(t, step, model)
+		pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+		gt.Value(t, got).Equal(agentkit.AttemptInfo{})
+		gt.Bool(t, got.IsReplay()).False()
+	})
+
+	t.Run("an error-driven retry reports Errors", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []agentkit.AttemptInfo
+		step := func(_ context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			mu.Lock()
+			seen = append(seen, sys.Attempt())
+			n := len(seen)
+			mu.Unlock()
+			if n == 1 {
+				return st, agentkit.Decision[[]byte]{}, gollemErr("boom")
+			}
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, repo, ag := setupScript(t, step, model)
+		pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+		mu.Lock()
+		defer mu.Unlock()
+		gt.Array(t, seen).Length(2)
+		gt.Value(t, seen[0]).Equal(agentkit.AttemptInfo{})
+		gt.Value(t, seen[1]).Equal(agentkit.AttemptInfo{Errors: 1})
+		gt.Bool(t, seen[1].IsReplay()).True()
+	})
+
+	t.Run("a crash-driven reclaim reports UncleanReclaims", func(t *testing.T) {
+		var got agentkit.AttemptInfo
+		step := func(_ context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			got = sys.Attempt()
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, repo, ag := setupScript(t, step, model)
+		pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		forceUncleanReclaimable(t, repo, pid)
+		serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxUncleanReclaims(3))
+
+		gt.Value(t, got).Equal(agentkit.AttemptInfo{UncleanReclaims: 1})
+		gt.Bool(t, got.IsReplay()).True()
+	})
+}

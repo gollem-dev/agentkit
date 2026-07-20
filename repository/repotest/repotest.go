@@ -336,6 +336,93 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		gt.Bool(t, c1.LeaseToken != c2.LeaseToken).True() // fresh token every claim.
 	})
 
+	// Contract 4: a claim that takes over a running row — i.e. one whose previous
+	// claim died mid-transition — increments UncleanReclaims. This is what bounds
+	// re-execution after a crash, so an implementation that skips it degrades to
+	// unbounded replay.
+	t.Run("ClaimUncleanReclaimCounts", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mkProc(pid)}}))
+
+		now1 := time.Now()
+		// A first claim from pending: clean, so nothing is counted.
+		c1, err := repo.ClaimNextProcess(ctx, "w", now1.Add(-time.Second), now1)
+		gt.NoError(t, err)
+		gt.NotNil(t, c1)
+		gt.Value(t, c1.UncleanReclaims).Equal(0)
+
+		// Taking over the running row counts once.
+		now2 := now1.Add(time.Second)
+		c2, err := repo.ClaimNextProcess(ctx, "w", now2.Add(-time.Second), now2)
+		gt.NoError(t, err)
+		gt.NotNil(t, c2)
+		gt.Value(t, c2.UncleanReclaims).Equal(1)
+		gt.Value(t, c2.StepAttempts).Equal(0) // never touched by a claim.
+
+		// And again, cumulatively.
+		now3 := now2.Add(time.Second)
+		c3, err := repo.ClaimNextProcess(ctx, "w", now3.Add(time.Hour), now3)
+		gt.NoError(t, err)
+		gt.NotNil(t, c3)
+		gt.Value(t, c3.UncleanReclaims).Equal(2)
+		gt.Value(t, c3.StepAttempts).Equal(0)
+	})
+
+	t.Run("ClaimCleanDoesNotCountUnclean", func(t *testing.T) {
+		repo := factory(t)
+		now := time.Now()
+
+		// pending -> clean.
+		pend := newPID()
+		// waiting with a due WakeAt -> also clean.
+		wait := newPID()
+		pWait := mkProc(wait)
+		pWait.Status = agentkit.ProcessWaiting
+		past := now.Add(-time.Minute)
+		pWait.WakeAt = &past
+		// A stored StepAttempts must survive a claim untouched.
+		pWait.StepAttempts = 2
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{
+			Processes: []*agentkit.Process{mkProc(pend), pWait},
+		}))
+
+		for range 2 {
+			claimed, err := repo.ClaimNextProcess(ctx, "w", now.Add(time.Hour), now)
+			gt.NoError(t, err)
+			gt.NotNil(t, claimed)
+			gt.Value(t, claimed.UncleanReclaims).Equal(0)
+			if claimed.ID == wait {
+				gt.Value(t, claimed.StepAttempts).Equal(2)
+			}
+		}
+	})
+
+	// Both counters are ordinary persisted fields: the worker clears them on a
+	// successful commit, so a Repository must round-trip whatever it is given.
+	t.Run("AttemptCountersRoundTrip", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		p := mkProc(pid)
+		p.StepAttempts = 3
+		p.UncleanReclaims = 2
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{p}}))
+
+		got, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, got.StepAttempts).Equal(3)
+		gt.Value(t, got.UncleanReclaims).Equal(2)
+
+		got.StepAttempts = 0
+		got.UncleanReclaims = 0
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{got}}))
+
+		back, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, back.StepAttempts).Equal(0)
+		gt.Value(t, back.UncleanReclaims).Equal(0)
+	})
+
 	t.Run("ClaimLiveLeaseNotClaimed", func(t *testing.T) {
 		repo := factory(t)
 		pid := newPID()

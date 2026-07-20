@@ -38,7 +38,28 @@ const (
 	FailureLimitExceeded FailureCode = "limit_exceeded"
 	// FailureRetryExhausted: step retry limit exceeded.
 	FailureRetryExhausted FailureCode = "retry_exhausted"
+	// FailureUncleanReclaim: too many claims died mid-transition. This is a
+	// worker-health signal rather than a strategy bug, which is why it is
+	// distinct from FailureRetryExhausted — the cause and the remedy differ.
+	FailureUncleanReclaim FailureCode = "unclean_reclaim"
 )
+
+// AttemptInfo reports prior attempts at the current transition that did not
+// commit. A zero value means this is the first attempt.
+type AttemptInfo struct {
+	// Errors is the number of previous attempts that returned an error.
+	// Effects up to the error point may have fired.
+	Errors int
+	// UncleanReclaims is the number of previous claims that died
+	// mid-transition. Nothing is known about how far they got: the transition
+	// may have completed every effect and died before commit, and a
+	// lease-expiry reclaim may overlap a still-running predecessor.
+	UncleanReclaims int
+}
+
+// IsReplay reports whether a previous attempt at this transition may have
+// executed effects.
+func (a AttemptInfo) IsReplay() bool { return a.Errors > 0 || a.UncleanReclaims > 0 }
 
 // Failure describes a failed Process.
 type Failure struct {
@@ -62,13 +83,18 @@ type Process struct {
 	// process scope (e.g. "tenant"->"acme") for ToolFactory. The kernel does not
 	// interpret it, and it is NOT strategy input. It is not a credential
 	// (WithMetadata callers must derive it server-side from a validated principal).
-	Output          []byte   // non-nil when succeeded. Consumed by the parent's children Await and GetProcess.
-	Failure         *Failure // non-nil when failed.
-	State           []byte   // EncodeState output, stored verbatim (the kernel never converts it).
-	StateVersion    int      // strategy version that wrote State (the first arg to DecodeState).
-	StateSeq        int      // number of committed transitions. 0 = first Step not yet committed.
-	StepAttempts    int      // failure count of the current transition (reset to 0 on a successful commit).
-	Metrics         Metrics  // committed cumulative usage.
+	Output       []byte   // non-nil when succeeded. Consumed by the parent's children Await and GetProcess.
+	Failure      *Failure // non-nil when failed.
+	State        []byte   // EncodeState output, stored verbatim (the kernel never converts it).
+	StateVersion int      // strategy version that wrote State (the first arg to DecodeState).
+	StateSeq     int      // number of committed transitions. 0 = first Step not yet committed.
+	StepAttempts int      // failure count of the current transition (reset to 0 on a successful commit).
+	// UncleanReclaims counts claims that took over this Process after its
+	// previous claim died mid-transition. Same reset scope as StepAttempts.
+	// Maintained by ClaimNextProcess (see the Repository contract), never by the
+	// worker — the worker only reads it to bound re-execution.
+	UncleanReclaims int
+	Metrics         Metrics // committed cumulative usage.
 	ParentID        *ProcessID
 	RootID          ProcessID // self if no parent.
 	Subject         *SubjectRef

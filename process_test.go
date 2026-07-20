@@ -58,3 +58,21 @@ func TestProcessClone(t *testing.T) {
 		gt.Nil(t, agentkit.CloneProcess(nil))
 	})
 }
+
+func TestAttemptInfoIsReplay(t *testing.T) {
+	cases := []struct {
+		name string
+		info agentkit.AttemptInfo
+		want bool
+	}{
+		{"zero value is the first attempt", agentkit.AttemptInfo{}, false},
+		{"a previous error may have fired effects", agentkit.AttemptInfo{Errors: 1}, true},
+		{"a vanished claim may have fired effects", agentkit.AttemptInfo{UncleanReclaims: 1}, true},
+		{"both origins", agentkit.AttemptInfo{Errors: 2, UncleanReclaims: 1}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gt.Value(t, tc.info.IsReplay()).Equal(tc.want)
+		})
+	}
+}
