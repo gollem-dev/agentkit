@@ -24,10 +24,14 @@ jobs:
       # would let a finding through a required check. Let gosec's exit code fail
       # the job instead, and still ship the report via the upload below. This is
       # also what keeps a fork's PR gated, since it cannot upload SARIF at all.
+      # -exclude-dir=examples: gosec expands ./... by walking directories rather
+      # than by asking the go tool, so it descends into the nested examples
+      # module and fails trying to load packages that are not part of this one.
+      # The examples job below scans them from inside their own module.
       - name: Run Gosec Security Scanner
         uses: securego/gosec@5e5517beec77b8228ba43ec8d7cc22d82ed31924 # v2.25.0
         with:
-          args: "-fmt sarif -exclude-generated -out results.sarif ./..."
+          args: "-fmt sarif -exclude-generated -exclude-dir=examples -out results.sarif ./..."
       - name: Upload SARIF file
         # always(): the scan step fails on findings, and those are exactly the
         # runs whose report is worth having in the Security tab.
@@ -64,9 +68,10 @@ jobs:
           go-version-file: "go.mod"
           cache: true
           cache-dependency-path: go.sum
-      # Kept at the version the action's pinned image reports.
+      # Pinned to the version the action's image above actually runs, so the two
+      # halves of the repository are held to the same ruleset.
       - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.24.7
       # No SARIF upload here: the exit code is what gates the merge, and the
       # examples are teaching material rather than shipped library code, so
       # routing their findings into the Security tab would only add noise.
