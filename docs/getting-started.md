@@ -1,0 +1,172 @@
+# Getting started
+
+## Requirements
+
+- Go 1.26 or later
+- A [gollem](https://github.com/gollem-dev/gollem) LLM client
+
+```bash
+go get github.com/gollem-dev/agentkit
+```
+
+## The smallest working program
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+
+	"github.com/gollem-dev/agentkit"
+	"github.com/gollem-dev/agentkit/repository/memory"
+	"github.com/gollem-dev/agentkit/strategy/simple"
+	"github.com/gollem-dev/gollem/llm/claude"
+)
+
+func main() {
+	ctx := context.Background()
+
+	client, err := claude.New(ctx, "...api key...")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 1. Register the agents. Register returns a typed handle.
+	reg := agentkit.NewRegistry()
+	assistant, err := simple.Register(reg, "assistant", 1)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 2. Build the kernel: repository, default model, registry.
+	kernel, err := agentkit.New(memory.New(), client, reg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 3. Spawn. This writes a pending Process and returns immediately.
+	pid, err := assistant.Spawn(ctx, kernel, simple.Input{Prompt: "Summarize the news"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("spawned", pid)
+
+	// 4. Serve. Run this in as many processes as you like.
+	if err := kernel.Serve(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+Four steps, always in this order: **register → construct → spawn → serve.**
+
+`Register` must complete before any `Spawn` or `Serve`; afterwards the
+`Registry` is read-only.
+
+## Spawning is asynchronous
+
+`Spawn` runs the strategy's `Init` synchronously (so a bad input is an error you
+get right there), writes a `pending` process row, and returns its ID. Nothing
+executes until a `Serve` worker claims it.
+
+That separation is the point: the process that accepts a request and the process
+that runs the agent do not have to be the same one, or even be alive at the same
+time.
+
+## Reading results
+
+```go
+proc, err := kernel.GetProcess(ctx, pid)
+// proc.Status  — pending / running / waiting / succeeded / failed / cancelled
+// proc.Output  — the strategy's Done output, when succeeded
+// proc.Failure — the code and message, when failed
+```
+
+`Output` is whatever bytes the strategy passed to `Done` — agentkit never parses
+it (see [ADR-0007](adr/0007-kernel-neutral-to-serialization.md)). The bundled
+strategies use JSON:
+
+```go
+var out simple.Output
+if err := json.Unmarshal(proc.Output, &out); err != nil { ... }
+```
+
+## Answering a question
+
+A strategy that suspends on a question parks the process in `waiting`. Find the
+open awaits and respond:
+
+```go
+awaits, err := kernel.ListAwaits(ctx, pid)
+for _, aw := range awaits {
+    if aw.Status == agentkit.AwaitOpen && aw.Kind == agentkit.AwaitQuestion {
+        log.Println("asked:", string(aw.Question))
+    }
+}
+
+err = kernel.Respond(ctx, pid, "confirm", []byte("yes"),
+    agentkit.WithRespondedBy("user:alice"))
+```
+
+`Respond` flips the process back to `pending` so a worker picks it up. Only an
+open await accepts a response — the second responder gets `ErrAwaitClosed`.
+
+## Adding tools
+
+Tools are plain `gollem.Tool`s, built per claim by a `ToolFactory`:
+
+```go
+kernel, err := agentkit.New(memory.New(), client, reg,
+    agentkit.WithToolFactory(func(ctx context.Context, proc *agentkit.Process) ([]gollem.Tool, error) {
+        return []gollem.Tool{searchTool, weatherTool}, nil
+    }),
+)
+```
+
+The factory receives the `*Process`, so it can vary tools by `proc.Agent` or
+`proc.Metadata`. Read [tools.md](tools.md) before wiring anything with side
+effects — replay makes idempotency your responsibility.
+
+## Choosing storage
+
+| Implementation | Use it for |
+|---|---|
+| `repository/memory` | tests, development, one-shot runs |
+| `repository/filesystem` | a single local process that should survive a restart |
+| your own | anything with more than one host |
+
+```go
+repo, err := filesystem.New("/var/lib/myagent")
+defer repo.Close()
+```
+
+`filesystem` holds an exclusive lock on its directory, so only one process may
+open it. Neither bundled implementation is meant for multi-host workers — see
+[persistence.md](persistence.md) to write your own, and verify it with
+`repotest`.
+
+## Running workers
+
+```go
+err := kernel.Serve(ctx,
+    agentkit.WithWorkerID("worker-1"),
+    agentkit.WithConcurrency(4),
+    agentkit.WithPollInterval(200*time.Millisecond),
+    agentkit.WithLease(30*time.Second),
+)
+```
+
+`Serve` blocks until the context is cancelled. Run it in as many processes as
+you like — claims are exclusive, and a worker that dies has its processes picked
+up once the lease expires.
+
+An application that only submits work simply never calls `Serve`.
+
+## Next
+
+- [Execution model](execution-model.md) — **read this before shipping anything
+  with side effects.**
+- [Concepts](concepts.md) — the vocabulary.
+- [Writing a strategy](writing-strategies.md) — when the bundled ones are not
+  enough.
