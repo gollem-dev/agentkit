@@ -14,6 +14,9 @@ worker after a crash.
 3. **[Concepts](concepts.md)** — `Process`, `Strategy`, `Syscalls`, `Await`,
    `Kernel`, `Repository`, and how they relate.
 
+Prefer reading code? [examples/](../examples/) has five runnable programs, one
+per idea, and they run offline.
+
 ## Guides
 
 - **[Writing a strategy](writing-strategies.md)** — implementing

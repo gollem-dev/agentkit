@@ -71,6 +71,8 @@ agentkit/                  root package: kernel + every port definition
   repository/filesystem/   reference impl (single process, one snapshot file)
   repository/repotest/     the Repository contract, executable
   repository/internal/store/  shared state machine behind the two references
+  examples/                runnable programs, one per idea
+  examples/internal/demo/  live-or-stub model, and a Process poll helper
 ```
 
 The root package is flat on purpose — a layered split creates an import cycle

@@ -1,0 +1,150 @@
+# Examples
+
+Five programs you can run. Each one is a complete `main` package, and each one
+is about a single thing agentkit does.
+
+| Example | What it shows |
+|---|---|
+| [`quickstart`](quickstart) | register → construct → spawn → serve, and nothing else |
+| [`tools`](tools) | supplying tools, and the idempotency and authorization they oblige you to |
+| [`human-in-the-loop`](human-in-the-loop) | a strategy that suspends on a question and resumes from the answer |
+| [`durable-worker`](durable-worker) | submitting and executing in separate processes, and surviving a crash |
+| [`fanout`](fanout) | a planner that runs its tasks as parallel child processes |
+
+## Running them
+
+```bash
+go run ./examples/quickstart
+```
+
+**They work offline.** With no model configured, the LLM is a stub replaying a
+script, so every example completes without network access, without credentials,
+and with the same output every time. The stub is what the tests use, and its
+output is the one described below.
+
+To run against a real model, point them at Vertex AI:
+
+```bash
+gcloud auth application-default login
+export GEMINI_PROJECT_ID=your-project
+export GEMINI_LOCATION=us-central1
+go run ./examples/quickstart
+```
+
+Both variables are required, and the caller needs `roles/aiplatform.user` (or
+equivalent) on the project. Setting only one is an error rather than a silent
+fall back to the stub, because "I thought I was running live" is an expensive
+thing to be wrong about.
+
+gollem's Gemini client is Vertex-only and authenticates through Application
+Default Credentials; there is no API-key mode. To use a different provider,
+replace the `gemini.New` call in [`internal/demo`](internal/demo/demo.go) with
+`claude.New` or `openai.New` — nothing else in the examples depends on it.
+
+With a live model the output stops being deterministic: the model may call a
+tool the script did not anticipate, or word an answer differently. The
+descriptions below are of the offline run.
+
+## quickstart
+
+The four steps, always in this order: register, construct, spawn, serve.
+
+Worth noticing that `Spawn` returns before anything executes. It writes a
+pending `Process` and stops there; work begins when a `Serve` worker claims it.
+The example runs the worker in a goroutine only so that one program can show
+both halves.
+
+## tools
+
+The model is told to ship a release. It tries production first, the policy
+refuses it inside `Run`, the error goes back to the model as a function
+response, and it retries against staging.
+
+Two obligations are on display:
+
+- **Idempotency.** `deployTool` derives a key from the meaning of its
+  arguments, because a transition can run more than once and agentkit does not
+  hand out a key that would survive a non-deterministic replay.
+- **Authorization.** `guardedTool` refuses before the inner tool can act.
+  `Run` is the only path to the effect, so it is the only place a refusal
+  cannot be routed around.
+
+The output reports two tool calls but only one deployment: the kernel meters the
+attempt, not the outcome. A tool's error is returned to the strategy, not fatal
+to the Process.
+
+See [tools.md](../docs/tools.md).
+
+## human-in-the-loop
+
+A hand-written `Strategy` that suspends on a question, and an operator that
+answers it.
+
+```bash
+go run ./examples/human-in-the-loop -answer no
+```
+
+The Process parks in `waiting` with a durable question on it. Nothing is kept in
+memory in the meantime — the answer could arrive minutes later, from another
+process, and a different worker could resume the work. Refusing skips the action
+entirely, which the metrics confirm: no LLM call happens at all.
+
+This is a *confirmation, not a security gate*. Nothing prevents a strategy from
+calling a tool without asking first. When you need a decision that cannot be
+bypassed, put it in the tool, as `tools` does.
+
+See [ADR-0008](../docs/adr/0008-three-await-kinds-confirmation-is-a-question.md).
+
+## durable-worker
+
+The one example with more than one command, because the point is that the
+process submitting work and the process doing it are different.
+
+```bash
+go run ./examples/durable-worker submit -topic durability -rounds 4
+go run ./examples/durable-worker work -pid <id> -crash-after 2   # exits mid-round
+go run ./examples/durable-worker status -pid <id>                # partial progress
+go run ./examples/durable-worker work -pid <id>                  # resumes, finishes
+```
+
+The simulated crash exits after the LLM call but before the transition commits,
+so that round runs again on resume — the committed sequence number after the
+crash shows one fewer round than the LLM was asked for. That is at-least-once
+execution, and it is the reason a side-effecting tool has to be idempotent.
+
+The first resume waits a few seconds: a Process left `running` by a dead worker
+only becomes claimable once its lease expires. The lease here is shortened to 5
+seconds for the demo; a real deployment sets it well above how long one
+transition takes.
+
+The store is `repository/filesystem`, which holds an exclusive lock on its
+directory, so these commands run one at a time. It is a single-process reference
+implementation — real workers on more than one host need a `Repository` of your
+own, verified with `repotest`. See [persistence.md](../docs/persistence.md).
+
+## fanout
+
+A planner decomposes the goal, each task runs as its own child `Process`, and a
+summarizer folds the results back together.
+
+The children are inserted as part of the parent's transition commit, so a crash
+between "decided to fan out" and "children exist" is not possible — either both
+happened or neither did.
+
+The planner, the summarizer and the task workers are separate model roles, which
+is how you point a stronger model at planning and a cheaper one at the tasks.
+Offline it also keeps the run deterministic, since children execute in parallel.
+
+Note what the budget in this example does **not** do: a `Limiter` sees one
+Process's metrics, so it caps the planner and each child separately, not the
+tree as a whole. A tree-wide budget needs your own accounting keyed by
+`proc.RootID`.
+
+See [bundled-strategies.md](../docs/bundled-strategies.md) and
+[observability.md](../docs/observability.md).
+
+## Where to go next
+
+The examples show the API in use; the guides explain the model behind it. Start
+with [execution-model.md](../docs/execution-model.md) before shipping anything
+that touches the outside world.

@@ -171,6 +171,8 @@ func TestMyRepo(t *testing.T) {
 
 ## Documentation
 
+- [examples/](./examples/) — five runnable programs, one per idea. They work
+  offline, so `go run ./examples/quickstart` needs no credentials.
 - [docs/](./docs/) — guides: execution model, getting started, concepts,
   writing strategies, tools, persistence, observability.
 - [docs/design/](./docs/design/) — architecture, process lifecycle, consistency
