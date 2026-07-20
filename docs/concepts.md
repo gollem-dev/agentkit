@@ -36,28 +36,37 @@ of anything ([ADR-0011](adr/0011-kernel-has-no-tenancy.md)).
 Your state machine, and the only code agentkit runs on your behalf.
 
 ```go
-type Strategy[S, I any] interface {
+type Strategy[S, I, O any] interface {
     Version() int
     Init(input I) (S, error)
-    Step(ctx context.Context, sys Syscalls, state S) (S, Decision, error)
+    Step(ctx context.Context, sys Syscalls, state S) (S, Decision[O], error)
     EncodeState(state S) ([]byte, error)
     DecodeState(version int, raw []byte) (S, error)
+    EncodeOutput(out O) ([]byte, error)
 }
 ```
+
+Three types: `S` is what you checkpoint, `I` is what launches a run, `O` is what
+a finished run produces.
 
 - **`Init`** builds the initial state, purely. It receives no context and no
   syscalls — structurally, there is no path to an effect — and runs
   synchronously inside `Spawn`, so a bad input is an error the caller sees
   immediately rather than an asynchronous failure later.
-- **`Step`** runs one transition and returns a `Decision`. It is called from the
-  top every time, including after a crash.
+- **`Step`** runs one transition and returns a `Decision[O]`. It is called from
+  the top every time, including after a crash.
 - **`EncodeState` / `DecodeState`** own serialization entirely. The format is
   yours; agentkit stores bytes. `DecodeState` receives the version that wrote
   them, so migration is ordinary code inside it.
+- **`EncodeOutput`** turns what you pass to `Done` into the bytes stored on the
+  Process. There is no `DecodeOutput`: a completion handler receives the value
+  you passed, and a parent reads a child's output as bytes.
 
-Register with `Register[S, I]`, which returns a typed `Agent[I]` — the only way
-to spawn, so the input type is checked at compile time and `any` never appears
-in the public API ([ADR-0006](adr/0006-typed-handles-from-register.md)).
+Register with `Register[S, I, O]`, which returns a typed `Agent[I]` — the only
+way to spawn, so the input type is checked at compile time and `any` never
+appears in the public API ([ADR-0006](adr/0006-typed-handles-from-register.md)).
+All three types are inferred from the strategy, so the call site writes none of
+them.
 
 ## Decision
 
@@ -65,10 +74,14 @@ What one transition returns.
 
 | Decision | Meaning |
 |---|---|
-| `Continue()` | commit and run the next transition |
-| `Suspend(specs...)` | commit and park until an await resolves |
+| `Continue[O]()` | commit and run the next transition |
+| `Suspend[O](specs...)` | commit and park until an await resolves |
 | `Done(output)` | finish successfully with this output |
-| `Fail(code, msg)` | finish as failed |
+| `Fail[O](code, msg)` | finish as failed |
+
+`Done` infers `O` from its argument. The other three take no argument that
+mentions `O`, and Go does not infer a type argument from the return context, so
+they need it written out: `agentkit.Continue[MyOutput]()`.
 
 `Suspend` that leaves no open await is rejected (`ErrSuspendWithoutAwait`) —
 that combination would park the process with nothing able to wake it.

@@ -69,13 +69,15 @@ execution begins when a `Serve` worker claims it.
 - **Process** — one execution unit. Its full state (`State` bytes, status,
   metrics, lease, ...) lives in the `Repository`. It moves through
   `pending → running → waiting/succeeded/failed/cancelled`.
-- **Strategy[S, I]** — a checkpointable typed state machine you implement.
+- **Strategy[S, I, O]** — a checkpointable typed state machine you implement.
   `Init(I) (S, error)` builds the initial state purely (inside `Spawn`); `Step`
-  runs one transition and returns a `Decision` (`Continue` / `Suspend` /
-  `Done` / `Fail`); `EncodeState`/`DecodeState` own serialization (the kernel
-  only stores bytes). Register with `Register[S, I]`, which returns a typed
-  `Agent[I]` — the only way to spawn, so the input type is compile-time-checked
-  and `any` never appears in the public API.
+  runs one transition and returns a `Decision[O]` (`Continue` / `Suspend` /
+  `Done` / `Fail`); `EncodeState`/`DecodeState` own state serialization and
+  `EncodeOutput` the output's (the kernel only stores bytes). Register with
+  `Register[S, I, O]`, which returns a typed `Agent[I]` — the only way to spawn,
+  so the input type is compile-time-checked and `any` never appears in the
+  public API. `WithOnFinish` wires a best-effort completion handler that
+  receives the typed output.
 - **Syscalls** — the one path a strategy uses to touch the world: `Generate`
   (LLM), `CallTool`, `SpawnChild` (via the typed handle), `Await` (read a wait),
   `Emit` (event), `Metrics`, `Now`. It meters usage and runs the `Limiter`.

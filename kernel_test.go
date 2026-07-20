@@ -10,8 +10,8 @@ import (
 	"github.com/m-mizutani/gt"
 )
 
-func doneStep() func(context.Context, agentkit.Syscalls, scriptState) (scriptState, agentkit.Decision, error) {
-	return func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+func doneStep() func(context.Context, agentkit.Syscalls, scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+	return func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		return st, agentkit.Done([]byte(`"ok"`)), nil
 	}
 }
@@ -187,4 +187,33 @@ func hasEvent(events []*agentkit.Event, typ agentkit.EventType) bool {
 
 func randSuffix() string {
 	return time.Now().Format("150405.000000000")
+}
+
+func TestCancelFiresFinishHandler(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	var rec recorder
+	ag, err := agentkit.Register(reg, "a", 1, &finishStrategy{step: finishDoneStep("unused")},
+		agentkit.WithOnFinish(rec.handler))
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	// Cancel commits from the caller's own process, so the handler runs here.
+	gt.NoError(t, k.Cancel(ctx, pid, "user aborted"))
+
+	calls, results := rec.snapshot()
+	gt.Value(t, calls).Equal(1)
+	gt.Value(t, results[0].Status).Equal(agentkit.ProcessCancelled)
+	gt.Nil(t, results[0].Output)
+	gt.Nil(t, results[0].Failure)
+
+	// A second Cancel is rejected before any commit, so nothing fires again.
+	gt.Error(t, k.Cancel(ctx, pid, "again")).Is(agentkit.ErrProcessFinished)
+	calls, _ = rec.snapshot()
+	gt.Value(t, calls).Equal(1)
 }

@@ -33,12 +33,12 @@ func TestObserverHooks(t *testing.T) {
 	tf := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
 		return []gollem.Tool{mockTool("t", map[string]any{"ok": true})}, nil
 	}
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		if _, err := sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "t", Arguments: map[string]any{}}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("ok")), nil
 	}

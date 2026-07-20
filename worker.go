@@ -157,7 +157,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			return
 		}
 
-		if dec.Kind == DecisionDone || dec.Kind == DecisionFail {
+		if dec.kind == DecisionDone || dec.kind == DecisionFail {
 			// commitTerminal fires the spawn observers itself (nil on commit, err on abandon).
 			_ = k.commitTerminal(ctx, proc, rawState, b.version, sys.seq, dec, sys, claimToken)
 			return
@@ -205,7 +205,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 
 // runTransition decodes state, runs Step, and encodes the result. Panics are
 // recovered as errors (E6).
-func (k *Kernel) runTransition(ctx context.Context, sys *syscalls, b StrategyBinding, proc *Process) (raw []byte, dec Decision, err error) {
+func (k *Kernel) runTransition(ctx context.Context, sys *syscalls, b StrategyBinding, proc *Process) (raw []byte, dec decision, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = goerr.New("strategy panic", goerr.V("panic", fmt.Sprint(r)))
@@ -213,18 +213,20 @@ func (k *Kernel) runTransition(ctx context.Context, sys *syscalls, b StrategyBin
 	}()
 	st, err := b.decode(proc.StateVersion, proc.State)
 	if err != nil {
-		return nil, Decision{}, goerr.Wrap(err, "decode state")
+		return nil, decision{}, goerr.Wrap(err, "decode state")
 	}
 	st, dec, err = b.step(ctx, sys, st)
 	if err != nil {
-		return nil, Decision{}, err
+		return nil, decision{}, err
 	}
 	raw, err = b.encode(st)
 	if err != nil {
-		return nil, Decision{}, goerr.Wrap(err, "encode state")
+		return nil, decision{}, goerr.Wrap(err, "encode state")
 	}
-	if dec.Kind == DecisionDone && dec.Output == nil {
-		return nil, Decision{}, goerr.New("Done with nil output")
+	// EncodeOutput ran inside b.step; a nil result is the one thing the kernel
+	// can meaningfully check about caller data (ADR-0007).
+	if dec.kind == DecisionDone && dec.output == nil {
+		return nil, decision{}, goerr.New("Done with nil output")
 	}
 	return raw, dec, nil
 }
@@ -250,7 +252,7 @@ type commitResult struct {
 // buildCommit builds the Continue/Suspend commit ChangeSet. WaitChildren specs
 // are resolved against "Repository snapshot + pending buffered children" and
 // elided when all children are already terminal (D46/#4).
-func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte, version, seq int, dec Decision, sys *syscalls, cfg serveConfig) (commitResult, error) {
+func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte, version, seq int, dec decision, sys *syscalls, cfg serveConfig) (commitResult, error) {
 	now := k.clock()
 	p := proc.clone()
 	p.State = rawState
@@ -266,7 +268,7 @@ func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte
 	cs.Processes = append(cs.Processes, sys.pendingChildren...)
 	cs.Events = append(cs.Events, sys.pendingEvents...)
 
-	if dec.Kind == DecisionContinue {
+	if dec.kind == DecisionContinue {
 		p.Status = ProcessRunning
 		p.WakeAt = nil
 		lease := now.Add(cfg.lease)
@@ -279,7 +281,7 @@ func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte
 	var wakeCandidates []time.Time
 	openAwaits := 0
 	elided := 0
-	for _, spec := range dec.Awaits {
+	for _, spec := range dec.awaits {
 		if ex, ok := sys.awaits[spec.key]; ok && ex.Status != AwaitOpen {
 			continue // responded/expired/cancelled key -> no-op re-declaration.
 		}
@@ -423,7 +425,7 @@ func minTime(ts []time.Time) *time.Time {
 
 // commitTerminal commits a Done/Fail transition and its finalize in a single
 // Apply (#3/D47). It carries the transition state and folds this run's metrics.
-func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []byte, version, seq int, dec Decision, sys *syscalls, fenceToken string) error {
+func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []byte, version, seq int, dec decision, sys *syscalls, fenceToken string) error {
 	return k.commitFinal(ctx, proc, fenceToken, func(p *Process) {
 		p.State = rawState
 		p.StateVersion = version
@@ -431,14 +433,14 @@ func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []b
 		p.StepAttempts = 0
 		p.Metrics = addMetrics(p.Metrics, sys.runMetrics)
 		p.Metrics = addMetrics(p.Metrics, Metrics{MetricSteps: 1})
-		if dec.Kind == DecisionDone {
+		if dec.kind == DecisionDone {
 			p.Status = ProcessSucceeded
-			p.Output = dec.Output
+			p.Output = dec.output
 		} else {
 			p.Status = ProcessFailed
-			p.Failure = dec.Failure
+			p.Failure = dec.failure
 		}
-	}, sys)
+	}, sys, dec.typed)
 }
 
 // finalize commits an external termination (unknown agent / cancel / limit /
@@ -450,7 +452,7 @@ func (k *Kernel) finalize(ctx context.Context, proc *Process, mut terminalMutato
 		if foldMetrics != nil {
 			p.Metrics = addMetrics(p.Metrics, foldMetrics)
 		}
-	}, nil)
+	}, nil, nil)
 }
 
 // commitFinal commits a terminal Process plus its finalize (open awaits
@@ -466,12 +468,15 @@ func (k *Kernel) finalize(ctx context.Context, proc *Process, mut terminalMutato
 //     propagated as ErrConflict so the caller re-reads and re-decides — it must
 //     NOT be silently abandoned (#1).
 //
+// typedOut is the value Done received, forwarded to the completion handler
+// after the commit (nil for every non-Done termination).
+//
 // A required read failure while building the finalize ChangeSet (own awaits,
 // parent, siblings) aborts the whole commit and returns the error, leaving the
 // Process non-terminal for lease-expiry retry (#2) — never a partial finalize.
 const externalFence = ""
 
-func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken string, mutate func(*Process), sys *syscalls) error {
+func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken string, mutate func(*Process), sys *syscalls, typedOut any) error {
 	for {
 		now := k.clock()
 		p := proc.clone()
@@ -525,7 +530,34 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 		if sys != nil {
 			sys.notifySpawnDone(nil)
 		}
+		k.fireFinish(ctx, p, typedOut)
 		return nil
+	}
+}
+
+// fireFinish invokes the agent's completion handler after a terminal commit has
+// been persisted. Best-effort by construction: it cannot fire twice (a losing
+// racer abandons before reaching here), but a crash between the Apply and this
+// call loses the notification and there is no retry (ADR-0014). Neither an
+// error nor a panic from the handler changes the committed Process.
+func (k *Kernel) fireFinish(ctx context.Context, p *Process, typedOut any) {
+	b, err := k.agents.binding(p.Agent)
+	if err != nil || b.finish == nil {
+		return
+	}
+	// The worker's ctx is cancelled on shutdown, which would otherwise drop the
+	// notification for every Process finishing during a drain. The handler owns
+	// its own deadline.
+	hctx := context.WithoutCancel(ctx)
+	defer func() {
+		if r := recover(); r != nil {
+			k.logger.Error("finish handler panicked",
+				"process", p.ID, "agent", p.Agent, "panic", fmt.Sprint(r))
+		}
+	}()
+	if ferr := b.finish(hctx, p.ID, p.Status, typedOut, p.Failure); ferr != nil {
+		k.logger.Error("finish handler failed",
+			"process", p.ID, "agent", p.Agent, "error", ferr)
 	}
 }
 

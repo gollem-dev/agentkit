@@ -8,31 +8,44 @@ import (
 	"github.com/m-mizutani/gt"
 )
 
+// decOut is the output type used by the decision constructor tests.
+type decOut struct {
+	Text string `json:"text"`
+}
+
 func TestDecisionConstructors(t *testing.T) {
 	t.Run("Continue", func(t *testing.T) {
-		d := agentkit.Continue()
-		gt.Value(t, d.Kind).Equal(agentkit.DecisionContinue)
+		v := agentkit.ViewDecision(agentkit.Continue[decOut]())
+		gt.Value(t, v.Kind).Equal(agentkit.DecisionContinue)
+		gt.Nil(t, v.Typed)
 	})
-	t.Run("Done carries output", func(t *testing.T) {
-		d := agentkit.Done([]byte("result"))
-		gt.Value(t, d.Kind).Equal(agentkit.DecisionDone)
-		gt.Value(t, string(d.Output)).Equal("result")
+	t.Run("Done carries the typed output", func(t *testing.T) {
+		v := agentkit.ViewDecision(agentkit.Done(decOut{Text: "result"}))
+		gt.Value(t, v.Kind).Equal(agentkit.DecisionDone)
+		gt.Value(t, v.Typed).Equal(decOut{Text: "result"})
 	})
 	t.Run("Fail carries code and message", func(t *testing.T) {
-		d := agentkit.Fail(agentkit.FailureStrategyError, "nope")
-		gt.Value(t, d.Kind).Equal(agentkit.DecisionFail)
-		gt.Value(t, d.Failure.Code).Equal(agentkit.FailureStrategyError)
-		gt.Value(t, d.Failure.Message).Equal("nope")
+		v := agentkit.ViewDecision(agentkit.Fail[decOut](agentkit.FailureStrategyError, "nope"))
+		gt.Value(t, v.Kind).Equal(agentkit.DecisionFail)
+		gt.Value(t, v.Failure.Code).Equal(agentkit.FailureStrategyError)
+		gt.Value(t, v.Failure.Message).Equal("nope")
+		gt.Nil(t, v.Typed)
 	})
 	t.Run("Suspend collects specs", func(t *testing.T) {
-		d := agentkit.Suspend(agentkit.Timer("t:1", time.Unix(1, 0)))
-		gt.Value(t, d.Kind).Equal(agentkit.DecisionSuspend)
-		gt.Array(t, d.Awaits).Length(1)
+		v := agentkit.ViewDecision(agentkit.Suspend[decOut](agentkit.Timer("t:1", time.Unix(1, 0))))
+		gt.Value(t, v.Kind).Equal(agentkit.DecisionSuspend)
+		gt.Array(t, v.Awaits).Length(1)
+		gt.Nil(t, v.Typed)
 	})
 	t.Run("Suspend with no specs is legal (already-open case)", func(t *testing.T) {
-		d := agentkit.Suspend()
-		gt.Value(t, d.Kind).Equal(agentkit.DecisionSuspend)
-		gt.Array(t, d.Awaits).Length(0)
+		v := agentkit.ViewDecision(agentkit.Suspend[decOut]())
+		gt.Value(t, v.Kind).Equal(agentkit.DecisionSuspend)
+		gt.Array(t, v.Awaits).Length(0)
+	})
+	t.Run("Done of a zero output is still a Done", func(t *testing.T) {
+		v := agentkit.ViewDecision(agentkit.Done(decOut{}))
+		gt.Value(t, v.Kind).Equal(agentkit.DecisionDone)
+		gt.Value(t, v.Typed).Equal(decOut{})
 	})
 }
 

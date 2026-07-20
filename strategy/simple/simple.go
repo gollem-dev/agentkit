@@ -31,6 +31,7 @@ type config struct {
 	role          agentkit.ModelRole
 	systemPrompt  string
 	maxIterations int
+	registerOpts  []agentkit.RegisterOption[Output]
 }
 
 // WithRole sets the model role. Default: nil (the default model).
@@ -42,6 +43,14 @@ func WithSystemPrompt(p string) Option { return func(c *config) { c.systemPrompt
 // WithMaxIterations caps the number of LLM rounds. Default: 32. Exceeding it
 // finalizes as Fail(strategy_error).
 func WithMaxIterations(n int) Option { return func(c *config) { c.maxIterations = n } }
+
+// WithOnFinish wires a completion handler for this agent. Delivery is
+// best-effort; see agentkit.WithOnFinish.
+func WithOnFinish(h agentkit.FinishHandler[Output]) Option {
+	return func(c *config) {
+		c.registerOpts = append(c.registerOpts, agentkit.WithOnFinish(h))
+	}
+}
 
 // Register builds and registers the simple strategy, returning a typed handle
 // (the state type is hidden).
@@ -55,7 +64,7 @@ func Register(r *agentkit.Registry, name agentkit.AgentName, version int, opts .
 		role:          cfg.role,
 		systemPrompt:  cfg.systemPrompt,
 		maxIterations: cfg.maxIterations,
-	})
+	}, cfg.registerOpts...)
 }
 
 // state is the checkpointed strategy state. It stores only serializable data
@@ -91,7 +100,7 @@ func (s *strategy) Init(in Input) (state, error) {
 	return state{Prompt: in.Prompt}, nil
 }
 
-func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision, error) {
+func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[Output], error) {
 	// Tools phase: execute the pending tool calls, then Continue to the next
 	// Generate. Doing tools in their own transition keeps one Generate per step.
 	if len(st.Pending) > 0 {
@@ -105,12 +114,12 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 			st.Responses = append(st.Responses, tr)
 		}
 		st.Pending = nil
-		return st, agentkit.Continue(), nil
+		return st, agentkit.Continue[Output](), nil
 	}
 
 	// Generate phase.
 	if st.Iteration >= s.maxIterations {
-		return st, agentkit.Fail(agentkit.FailureStrategyError, "max iterations exceeded"), nil
+		return st, agentkit.Fail[Output](agentkit.FailureStrategyError, "max iterations exceeded"), nil
 	}
 
 	var input []gollem.Input
@@ -139,7 +148,7 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 	}
 	res, err := sys.Generate(ctx, input, opts...)
 	if err != nil {
-		return st, agentkit.Decision{}, err
+		return st, agentkit.Decision[Output]{}, err
 	}
 	st.History = res.History
 	st.Iteration++
@@ -149,17 +158,15 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 		for _, fc := range res.FunctionCalls {
 			st.Pending = append(st.Pending, *fc)
 		}
-		return st, agentkit.Continue(), nil
+		return st, agentkit.Continue[Output](), nil
 	}
 
-	raw, err := json.Marshal(Output{Texts: res.Texts})
-	if err != nil {
-		return st, agentkit.Decision{}, goerr.Wrap(err, "marshal output")
-	}
-	return st, agentkit.Done(raw), nil
+	return st, agentkit.Done(Output{Texts: res.Texts}), nil
 }
 
 func (s *strategy) EncodeState(st state) ([]byte, error) { return json.Marshal(st) }
+
+func (s *strategy) EncodeOutput(out Output) ([]byte, error) { return json.Marshal(out) }
 
 func (s *strategy) DecodeState(_ int, raw []byte) (state, error) {
 	var st state

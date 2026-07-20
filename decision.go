@@ -12,25 +12,34 @@ const (
 	DecisionFail     DecisionKind = "fail"
 )
 
-// Decision is the result of one transition. The kernel only nil-checks the
-// user data (Output); it never touches the content.
-type Decision struct {
-	Kind    DecisionKind
-	Output  []byte      // Done: the output (encoding is the strategy author's).
-	Failure *Failure    // Fail.
-	Awaits  []AwaitSpec // Suspend: the declared waits.
+// Decision is the result of one transition, carrying the strategy's output
+// type O. Its fields are unexported: it can only be built by Continue,
+// Suspend, Fail or Done, so a Done without an output cannot be constructed.
+//
+// Go infers a type argument from a call's arguments only, never from the
+// return or assignment context. Done therefore infers O from its argument,
+// while Continue/Suspend/Fail need it written out: agentkit.Continue[MyOut]().
+type Decision[O any] struct {
+	kind    DecisionKind
+	out     O           // Done: the typed output.
+	hasOut  bool        // true only for Done.
+	failure *Failure    // Fail.
+	awaits  []AwaitSpec // Suspend: the declared waits.
 }
 
 // Continue advances to the next transition.
-func Continue() Decision { return Decision{Kind: DecisionContinue} }
+func Continue[O any]() Decision[O] { return Decision[O]{kind: DecisionContinue} }
 
-// Done finalizes the Process as succeeded with the given output. The kernel
-// only checks that output is non-nil (E9); the format is the author's.
-func Done(output []byte) Decision { return Decision{Kind: DecisionDone, Output: output} }
+// Done finalizes the Process as succeeded with the given output. The value is
+// turned into the persisted bytes by the strategy's EncodeOutput, and the same
+// value is handed to a completion handler without a round trip (ADR-0014).
+func Done[O any](output O) Decision[O] {
+	return Decision[O]{kind: DecisionDone, out: output, hasOut: true}
+}
 
 // Fail finalizes the Process as failed.
-func Fail(code FailureCode, message string) Decision {
-	return Decision{Kind: DecisionFail, Failure: &Failure{Code: code, Message: message}}
+func Fail[O any](code FailureCode, message string) Decision[O] {
+	return Decision[O]{kind: DecisionFail, failure: &Failure{Code: code, Message: message}}
 }
 
 // Suspend is a checkpoint that declares waits. specs are upserted on the
@@ -39,8 +48,19 @@ func Fail(code FailureCode, message string) Decision {
 // time and no WaitChildren elision applies, the transition errors with
 // ErrSuspendWithoutAwait. Re-declaring a non-open key is a no-op (idempotent
 // re-execution after a restart).
-func Suspend(specs ...AwaitSpec) Decision {
-	return Decision{Kind: DecisionSuspend, Awaits: specs}
+func Suspend[O any](specs ...AwaitSpec) Decision[O] {
+	return Decision[O]{kind: DecisionSuspend, awaits: specs}
+}
+
+// decision is the type-erased form of Decision[O], carried through the worker.
+// output is what gets persisted to Process.Output; typed is the same value
+// before encoding, handed to the finish handler so no decode is needed.
+type decision struct {
+	kind    DecisionKind
+	output  []byte
+	typed   any // non-nil only when kind == DecisionDone.
+	failure *Failure
+	awaits  []AwaitSpec
 }
 
 // AwaitSpec is a declared wait. It can only be built via the constructors
