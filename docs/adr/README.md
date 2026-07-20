@@ -24,7 +24,7 @@ change.
 | [0009](0009-child-processes-committed-atomically.md) | Child processes commit atomically with the transition |
 | [0010](0010-limiter-is-one-function.md) | Execution limits are one Limiter function |
 | [0011](0011-kernel-has-no-tenancy.md) | The kernel has no tenancy concept |
-| [0012](0012-observer-is-best-effort-observation.md) | Observer is best-effort observation, not control |
+| [0012](0012-kernel-hooks-are-composable-middleware.md) | Kernel hooks are composable middleware |
 | [0013](0013-os-metaphor-naming.md) | OS-metaphor naming |
 
 ## How to write one

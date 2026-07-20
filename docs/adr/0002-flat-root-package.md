@@ -20,8 +20,9 @@ package that every layer imports, which is layering in name only.
 ## Decision
 
 One package, `agentkit`, holds the kernel (`Kernel`, worker loop, transition
-commit) and all four extension points (`Repository`, `Strategy`, `ToolFactory`,
-`Limiter`/`Observer`). A caller writes one import to use the runtime.
+commit) and every extension point (`Repository`, `Strategy`, `ToolFactory`,
+`Limiter`, and the middleware chains of ADR-0012). A caller writes one import to
+use the runtime.
 
 `repository/internal/store` is the one `internal/` package in the tree. It
 exists because the boundary genuinely spans two sibling packages (`memory` and

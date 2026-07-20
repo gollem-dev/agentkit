@@ -21,7 +21,11 @@ type Kernel struct {
 	agents       *Registry
 	toolFactory  ToolFactory
 	limiter      Limiter
-	observer     Observer
+	initMW       []InitMiddleware
+	stepMW       []StepMiddleware
+	generateMW   []GenerateMiddleware
+	toolCallMW   []ToolCallMiddleware
+	spawnMW      []SpawnMiddleware
 	logger       *slog.Logger
 	clock        func() time.Time
 }
@@ -30,7 +34,11 @@ type kernelConfig struct {
 	roleBindings []roleBinding
 	toolFactory  ToolFactory
 	limiter      Limiter
-	observer     Observer
+	initMW       []InitMiddleware
+	stepMW       []StepMiddleware
+	generateMW   []GenerateMiddleware
+	toolCallMW   []ToolCallMiddleware
+	spawnMW      []SpawnMiddleware
 	logger       *slog.Logger
 	clock        func() time.Time
 }
@@ -61,11 +69,6 @@ func WithLimiter(f Limiter) KernelOption {
 	return func(c *kernelConfig) { c.limiter = f }
 }
 
-// WithObserver sets the observation hook (audit/tracing). Default: none.
-func WithObserver(o Observer) KernelOption {
-	return func(c *kernelConfig) { c.observer = o }
-}
-
 // WithLogger sets the logger. Default: slog.Default().
 func WithLogger(l *slog.Logger) KernelOption {
 	return func(c *kernelConfig) { c.logger = l }
@@ -94,6 +97,31 @@ func New(repo Repository, model gollem.LLMClient, agents *Registry, opts ...Kern
 	for _, o := range opts {
 		o(&cfg)
 	}
+	for i, mw := range cfg.initMW {
+		if mw == nil {
+			return nil, goerr.Wrap(ErrInvalidConfig, "nil init middleware", goerr.V("index", i))
+		}
+	}
+	for i, mw := range cfg.stepMW {
+		if mw == nil {
+			return nil, goerr.Wrap(ErrInvalidConfig, "nil step middleware", goerr.V("index", i))
+		}
+	}
+	for i, mw := range cfg.generateMW {
+		if mw == nil {
+			return nil, goerr.Wrap(ErrInvalidConfig, "nil generate middleware", goerr.V("index", i))
+		}
+	}
+	for i, mw := range cfg.toolCallMW {
+		if mw == nil {
+			return nil, goerr.Wrap(ErrInvalidConfig, "nil tool call middleware", goerr.V("index", i))
+		}
+	}
+	for i, mw := range cfg.spawnMW {
+		if mw == nil {
+			return nil, goerr.Wrap(ErrInvalidConfig, "nil spawn middleware", goerr.V("index", i))
+		}
+	}
 	models := make(map[ModelRole]gollem.LLMClient, len(cfg.roleBindings))
 	for _, rb := range cfg.roleBindings {
 		if rb.role == nil {
@@ -111,10 +139,41 @@ func New(repo Repository, model gollem.LLMClient, agents *Registry, opts ...Kern
 		agents:       agents,
 		toolFactory:  cfg.toolFactory,
 		limiter:      cfg.limiter,
-		observer:     cfg.observer,
+		initMW:       cfg.initMW,
+		stepMW:       cfg.stepMW,
+		generateMW:   cfg.generateMW,
+		toolCallMW:   cfg.toolCallMW,
+		spawnMW:      cfg.spawnMW,
 		logger:       cfg.logger,
 		clock:        cfg.clock,
 	}, nil
+}
+
+// runInit builds a Process's initial state through the Init middleware chain.
+// It is shared by the application entry point (spawnFromApp) and the child one
+// (syscalls.spawnBase). The kernel is in-package, so it reads and writes the
+// request's type-erased payload directly; the generic helpers exist for callers
+// outside it.
+func (k *Kernel) runInit(ctx context.Context, b StrategyBinding, req *InitRequest) (any, error) {
+	base := func(_ context.Context, r *InitRequest) (*InitResult, error) {
+		st, err := b.init(r.input)
+		if err != nil {
+			return nil, err
+		}
+		return &InitResult{state: st}, nil
+	}
+	h := chainInit(k.initMW, base)
+	if h == nil {
+		return nil, goerr.Wrap(ErrInvalidConfig, "init middleware returned a nil handler")
+	}
+	res, err := h(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		return nil, goerr.Wrap(ErrInvalidConfig, "init middleware returned a nil result")
+	}
+	return res.state, nil
 }
 
 // resolveModel resolves a role to a client: (1) an individual WithModelRole
@@ -131,16 +190,30 @@ func (k *Kernel) resolveModel(role ModelRole) gollem.LLMClient {
 }
 
 // spawnFromApp is the shared body of Agent[I].Spawn (application launch). It runs
-// Init purely, encodes the initial state, applies idempotency/subject, then
-// inserts the Process with a process.created event. Init/encode errors return
-// synchronously.
+// Init (through the Init middleware chain), encodes the initial state, applies
+// idempotency/subject, then inserts the Process with a process.created event.
+// Init/encode errors return synchronously.
+//
+// Init runs before the idempotency lookup, so an idempotent Spawn that ends up
+// returning an existing Process still runs Init and its middleware, and the id
+// minted for this call is discarded.
 func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, opts ...SpawnOption) (ProcessID, error) {
 	cfg := newSpawnConfig(opts)
 	b, err := k.agents.binding(name)
 	if err != nil {
 		return "", err
 	}
-	st, err := b.init(input)
+	// The id is minted before Init so an Init middleware can correlate its
+	// record with the Process about to be created. A failed Init just discards
+	// it — nothing is persisted yet. This also matches ADR-0009, which already
+	// describes minting before running the child's Init.
+	pid := ProcessID(uuid.Must(uuid.NewV7()).String())
+	st, err := k.runInit(ctx, b, &InitRequest{
+		ProcessID: pid,
+		Agent:     name,
+		Parent:    nil, // application entry point.
+		input:     input,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -168,7 +241,6 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 	}
 
 	now := k.clock()
-	pid := ProcessID(uuid.Must(uuid.NewV7()).String())
 	proc := &Process{
 		ID:             pid,
 		Agent:          name,

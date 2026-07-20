@@ -15,10 +15,15 @@ type Strategy[S, I any] interface {
 	// Init builds the initial state, purely. Input is received typed (Spawn
 	// passes the typed value through as any and BindStrategy's closure
 	// type-checks it — no serialization runs). Init receives no Syscalls and no
-	// ctx, so there is structurally no path to effects. It runs inside
-	// Agent[I].Spawn / SpawnChild and the initial state is persisted with the
-	// Process insert (never on the transition machine, so free of at-least-once
-	// re-execution). Its error is returned synchronously by Spawn.
+	// ctx, so a STRATEGY AUTHOR has structurally no path to effects here.
+	//
+	// That guarantee is about this signature, not about the surrounding call.
+	// Whoever configures the Kernel can wrap Init with InitMiddleware, which does
+	// receive a ctx and can perform effects around it. Init still runs inside
+	// Agent[I].Spawn / SpawnChild and never on the transition machine, so unlike
+	// Step it is free of at-least-once re-execution — which makes it the safer
+	// of the two places for such an effect. Its error is returned synchronously
+	// by Spawn.
 	Init(input I) (S, error)
 	// Step runs one transition. It always receives the DecodeState-restored
 	// state (the first transition too, since Init's result was persisted at
@@ -52,11 +57,24 @@ func BindStrategy[S, I any](s Strategy[S, I]) StrategyBinding {
 			}
 			return s.Init(typed)
 		},
+		// step and encode assert with comma-ok rather than bare: a Step
+		// middleware can replace the state with a value of another type, so this
+		// is reachable and must be an error a caller can discriminate, not a
+		// panic reported as "strategy panic".
 		step: func(ctx context.Context, sys Syscalls, st any) (any, Decision, error) {
-			state, dec, err := s.Step(ctx, sys, st.(S))
-			return state, dec, err
+			typed, ok := st.(S)
+			if !ok {
+				return nil, Decision{}, goerr.Wrap(ErrInvalidRequest, "step state type mismatch")
+			}
+			return s.Step(ctx, sys, typed)
 		},
-		encode: func(st any) ([]byte, error) { return s.EncodeState(st.(S)) },
+		encode: func(st any) ([]byte, error) {
+			typed, ok := st.(S)
+			if !ok {
+				return nil, goerr.Wrap(ErrInvalidRequest, "encode state type mismatch")
+			}
+			return s.EncodeState(typed)
+		},
 		decode: func(v int, raw []byte) (any, error) { return s.DecodeState(v, raw) },
 	}
 }
