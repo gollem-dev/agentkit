@@ -138,6 +138,10 @@ The non-negotiable parts:
 - `Apply` is genuinely all-or-nothing across every row and guard in the set.
 - `Rev` CAS is checked before any write, and a violation writes nothing.
 - `ClaimNextProcess` never double-claims and always mints a fresh `LeaseToken`.
+- `ClaimNextProcess` increments `unclean_reclaims` when — and only when — the row
+  it claimed was `running`. That is the store's job because only the atomic claim
+  can still see which state the row was in
+  ([ADR-0015](../adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
 - Uniqueness holds on `idempotency_key`, on an open process's `Subject`, and on
   `(process_id, await_key)`.
 - `ListEvents` preserves append order.

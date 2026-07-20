@@ -52,7 +52,13 @@ the contract against a shared store.
    atomically — `pending`, or `waiting` with `WakeAt` in the past, or `running`
    with an expired lease — and mints a **fresh `LeaseToken` on every claim**,
    including a re-claim by the same worker. No candidate means `(nil, nil)`, not
-   an error.
+   an error. When the row it took was `running`, it also **increments
+   `unclean_reclaims`**: that case means the previous claim died mid-transition,
+   and the counter is what bounds how often the work is replayed
+   ([ADR-0015](adr/0015-unclean-reclaims-are-counted-and-bounded.md)). A claim
+   from `pending` or `waiting` leaves it alone, and a claim never writes
+   `step_attempts`. Skipping this does not break the kernel — it silently
+   restores unbounded replay after a crash.
 5. **Uniqueness holds** on `idempotency_key`, on an open process's `Subject`, and
    on `(process_id, await_key)`. A violation writes nothing and returns
    `ErrConflict`.
@@ -91,6 +97,8 @@ The factory must return a fresh, empty repository each call. The suite covers:
 - claim eligibility for each of the three claimable conditions, and that a live
   lease is not claimable
 - a fresh `LeaseToken` on every claim, including re-claims
+- `unclean_reclaims` counted on a `running` takeover and left alone otherwise,
+  and both attempt counters round-tripping through `Apply`
 - no double-claim, with 100 processes and 100 concurrent claimers
 - deep-copy-on-read for processes, awaits and events
 

@@ -39,7 +39,12 @@ Firestore, DynamoDB, an in-memory map.
 4. `ClaimNextProcess` atomically claims one runnable process and never
    double-claims across concurrent workers. Every claim mints a fresh
    `LeaseToken` (a uuid v7), including a re-claim by the same worker. That token
-   is the fence identity.
+   is the fence identity. When the claimed row was `running` — an expired or
+   absent lease, meaning the previous claim died mid-transition — the claim also
+   increments `unclean_reclaims`; a claim from `pending` or `waiting` leaves it
+   alone, and a claim never writes `step_attempts`. Only the atomic claim can
+   observe which of the two it was, which is why this is the store's job and not
+   the worker's (see ADR-0015).
 5. Uniqueness is maintained on `idempotency_key`, on an open process's
    `Subject`, and on `(process_id, await_key)`. A violation writes nothing and
    returns `ErrConflict`.
@@ -47,6 +52,12 @@ Firestore, DynamoDB, an in-memory map.
 
 Reads deep-copy on the way out: a caller mutating a returned `*Process` must not
 be able to reach stored state.
+
+Every item above is executable as `repository/repotest`, which is the actual
+statement of the contract — an implementation that passes it conforms, and one
+that does not, does not. Item 4's counting rule is covered there by
+`ClaimUncleanReclaimCounts`, `ClaimCleanDoesNotCountUnclean` and
+`AttemptCountersRoundTrip`.
 
 How that is realized is free — an RDB transaction, a Firestore transaction, a
 conditional write, or a mutex around an immutable snapshot.
@@ -68,11 +79,15 @@ conditional write, or a mutex around an immutable snapshot.
   executable form of the list above — `repotest.Run(t, factory)` covers Rev
   increment, cross-row atomicity, guards, both uniqueness domains, await upsert,
   event ordering, claim eligibility (pending / waiting past `WakeAt` / expired
-  lease), fresh-token-per-claim, no-double-claim under 100-way concurrency, and
-  deep-copy-on-read. **Run it against any new implementation.**
+  lease), fresh-token-per-claim, unclean-reclaim counting, attempt-counter
+  round-trip, no-double-claim under 100-way concurrency, and deep-copy-on-read.
+  **Run it against any new implementation.**
 - The kernel must handle `ErrConflict` everywhere it writes. It does, with
-  re-read-and-re-decide loops in `Respond`, `Cancel`, `commitFinal` and the
-  worker's commit path.
+  re-read-and-re-decide loops in `Respond`, `Cancel`, `commitFinal`, the worker's
+  commit path, and the two orderly exits from a claim (`requeue` and `release`).
+  Those last two matter more than they look: a conflict shrugged off there leaves
+  the row `running`, and the next claim would charge the takeover as an unclean
+  reclaim (ADR-0015) even though the worker exited normally.
 - Bundled reference implementations: `repository/memory` (mutex + copy-on-write
   snapshot) and `repository/filesystem` (the same snapshot, persisted by
   temp-file → fsync → rename → directory fsync, single process only, enforced by
@@ -85,3 +100,4 @@ conditional write, or a mutex around an immutable snapshot.
 | Date | Change |
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D3, D34). |
+| 2026-07-21 | Contract item 4 gained the `unclean_reclaims` counting rule (ADR-0015). It belongs here rather than only in ADR-0015 because this is the contract a third-party `Repository` author implements against; without it they could conform to the letter and still leave crash replay unbounded. |

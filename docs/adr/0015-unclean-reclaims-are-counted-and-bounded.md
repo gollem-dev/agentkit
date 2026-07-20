@@ -48,9 +48,18 @@ took it" as part of the claim itself.
 In the reference store, `claimable` became `claimKindOf`, returning
 `notClaimable` / `cleanClaim` / `uncleanClaim`. Naming the reason where it is
 decided keeps a future claimable status from being silently counted as clean.
-That `running` implies "the previous claim vanished" is not an assumption: every
-orderly exit from a claim — suspend, terminate, requeue, release — clears the
-lease as it moves the Process off `running`.
+
+The counting is only meaningful because `running` really does imply "the previous
+claim vanished", and that is a property the worker has to *maintain*, not one it
+gets for free. Every orderly exit from a claim — suspend, terminate, requeue,
+release — must move the Process off `running` and clear the lease. The two that
+happen outside a commit, `requeue` and `release`, therefore retry their `Apply`
+on `ErrConflict` from a fresh read and abandon only when the lease token has
+changed. Letting a conflict there go by would leave the row `running`, and the
+next claim would bill an orderly exit as a crash: an error the worker actually
+observed would be charged to the wrong budget, and `StepAttempts` would never
+record it. That is not a hypothetical — a concurrent `Respond` or a sibling
+finalize advancing `Rev` mid-transition is enough to produce it.
 
 The bound is checked in `runClaim` **before** `Step`, unlike the `StepAttempts`
 bound which is checked after a failure. An unclean reclaim is already counted by
@@ -64,6 +73,12 @@ first.
 different responses: `retry_exhausted` says a strategy kept erroring and someone
 should read its code, while `unclean_reclaim` says workers keep dying and
 someone should look at the workers.
+
+`AttemptInfo.Errors` counts attempts in which `Step` itself failed. A fault
+before `Step` — a `ToolFactory` that could not build the tools, say — requeues
+without consuming an attempt, because nothing the strategy could have done ran,
+and reporting it as a replay would tell a strategy that effects may have fired
+when none could have.
 
 ## Alternatives rejected
 

@@ -140,7 +140,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 	if k.toolFactory != nil {
 		toolList, err = k.toolFactory(ctx, proc)
 		if err != nil {
-			k.requeue(ctx, cfg, proc, goerr.Wrap(err, "tool factory"), nil)
+			k.requeueInfra(ctx, cfg, proc, claimToken, goerr.Wrap(err, "tool factory"))
 			return
 		}
 	}
@@ -188,7 +188,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			if proc.StepAttempts+1 > cfg.maxStepAttempts {
 				_ = k.finalize(ctx, proc, failWith(FailureRetryExhausted, terr), claimToken, sys.runMetrics)
 			} else {
-				k.requeue(ctx, cfg, proc, terr, sys.runMetrics)
+				k.requeueTransition(ctx, cfg, proc, claimToken, terr, sys.runMetrics)
 			}
 			return
 		}
@@ -206,7 +206,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			if proc.StepAttempts+1 > cfg.maxStepAttempts {
 				_ = k.finalize(ctx, proc, failWith(FailureRetryExhausted, cerr), claimToken, sys.runMetrics)
 			} else {
-				k.requeue(ctx, cfg, proc, cerr, sys.runMetrics)
+				k.requeueTransition(ctx, cfg, proc, claimToken, cerr, sys.runMetrics)
 			}
 			return
 		}
@@ -733,30 +733,73 @@ func containsID(ids []ProcessID, id ProcessID) bool {
 	return false
 }
 
+// requeueTransition puts the Process back after a transition that failed,
+// consuming one step attempt.
+func (k *Kernel) requeueTransition(ctx context.Context, cfg serveConfig, proc *Process, fenceToken string, cause error, foldMetrics Metrics) {
+	k.requeue(ctx, cfg, proc, fenceToken, cause, foldMetrics, true)
+}
+
+// requeueInfra puts the Process back after a fault that is not the strategy's
+// (a ToolFactory failure, say), leaving the attempt counter alone. Charging an
+// attempt here would also make the next transition look like a replay through
+// Syscalls.Attempt(), which it is not: Step never ran.
+func (k *Kernel) requeueInfra(ctx context.Context, cfg serveConfig, proc *Process, fenceToken string, cause error) {
+	k.requeue(ctx, cfg, proc, fenceToken, cause, nil, false)
+}
+
 // requeue puts the Process back to pending with a backoff, folding this run's
 // metrics on the successful Apply (#5).
-func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, cause error, foldMetrics Metrics) {
-	now := k.clock()
-	p := proc.clone()
-	p.Status = ProcessPending
-	p.StepAttempts = proc.StepAttempts + 1
-	// max(0, ...) keeps the shift count non-negative: the uint conversion this
-	// replaces was what previously made a bogus stored StepAttempts harmless,
-	// and a negative shift count panics at runtime.
-	attempts := max(0, minInt(p.StepAttempts, 6))
-	backoff := time.Duration(1<<attempts) * time.Second
-	if backoff > 60*time.Second {
-		backoff = 60 * time.Second
-	}
-	wake := now.Add(backoff)
-	p.WakeAt = &wake
-	p.LeaseUntil = nil
-	p.UpdatedAt = now
-	if foldMetrics != nil {
-		p.Metrics = addMetrics(p.Metrics, foldMetrics)
-	}
-	if err := k.repo.Apply(ctx, ChangeSet{Processes: []*Process{p}}); err != nil {
-		k.logger.Error("requeue failed", "process", proc.ID, "cause", cause, "error", err)
+//
+// A conflict here must not be shrugged off. Leaving the row `running` would let
+// the lease lapse and the next claim would count the takeover as an unclean
+// reclaim (ADR-0015) — turning an error the worker actually observed into a
+// phantom crash, and charging the wrong budget. So a conflict is re-read and
+// rebuilt against fresh state, exactly like a terminal commit, and abandoned
+// only when the lease is genuinely gone.
+func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, fenceToken string, cause error, foldMetrics Metrics, consumeAttempt bool) {
+	for {
+		now := k.clock()
+		p := proc.clone()
+		p.Status = ProcessPending
+		if consumeAttempt {
+			p.StepAttempts = proc.StepAttempts + 1
+		}
+		// max(0, ...) keeps the shift count non-negative: the uint conversion this
+		// replaces was what previously made a bogus stored StepAttempts harmless,
+		// and a negative shift count panics at runtime.
+		attempts := max(0, minInt(p.StepAttempts, 6))
+		backoff := time.Duration(1<<attempts) * time.Second
+		if backoff > 60*time.Second {
+			backoff = 60 * time.Second
+		}
+		wake := now.Add(backoff)
+		p.WakeAt = &wake
+		p.LeaseUntil = nil
+		p.UpdatedAt = now
+		if foldMetrics != nil {
+			p.Metrics = addMetrics(p.Metrics, foldMetrics)
+		}
+		err := k.repo.Apply(ctx, ChangeSet{Processes: []*Process{p}})
+		if errors.Is(err, ErrConflict) {
+			fresh, gerr := k.repo.GetProcess(ctx, proc.ID)
+			if gerr != nil || fresh == nil {
+				k.logger.Error("requeue re-read failed", "process", proc.ID, "cause", cause, "error", gerr)
+				return
+			}
+			if fresh.Status.Terminal() {
+				return // another path finalized it; nothing to put back.
+			}
+			if fresh.LeaseToken != fenceToken {
+				return // lost the lease -> abandon (never rebase, D50).
+			}
+			// The metrics were not folded, so they are still owed to the retry.
+			proc = fresh
+			continue
+		}
+		if err != nil {
+			k.logger.Error("requeue failed", "process", proc.ID, "cause", cause, "error", err)
+		}
+		return
 	}
 }
 
@@ -764,20 +807,31 @@ func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, ca
 // re-reads first: after the last transition commit, the caller's proc holds the
 // pre-commit Rev, so a CAS from that stale value would always conflict and leave
 // the Process stuck running until the lease expires (#3).
+// A conflict is retried from a fresh read rather than logged and dropped: the
+// row would otherwise stay `running` with a lease nobody renews, and the next
+// claim would charge the takeover as an unclean reclaim (ADR-0015) even though
+// this worker exited in an orderly way.
 func (k *Kernel) release(ctx context.Context, proc *Process, fenceToken string) {
-	fresh, err := k.repo.GetProcess(ctx, proc.ID)
-	if err != nil || fresh == nil {
+	for {
+		fresh, err := k.repo.GetProcess(ctx, proc.ID)
+		if err != nil || fresh == nil {
+			return
+		}
+		if fresh.LeaseToken != fenceToken || fresh.Status != ProcessRunning {
+			return // lease lost, or already moved off running by another path.
+		}
+		p := fresh.clone()
+		p.Status = ProcessPending
+		p.LeaseUntil = nil
+		p.UpdatedAt = k.clock()
+		err = k.repo.Apply(ctx, ChangeSet{Processes: []*Process{p}})
+		if errors.Is(err, ErrConflict) {
+			continue // someone moved the row; re-read and decide again.
+		}
+		if err != nil {
+			k.logger.Error("release failed", "process", proc.ID, "error", err)
+		}
 		return
-	}
-	if fresh.LeaseToken != fenceToken || fresh.Status != ProcessRunning {
-		return // lease lost, or already moved off running by another path.
-	}
-	p := fresh.clone()
-	p.Status = ProcessPending
-	p.LeaseUntil = nil
-	p.UpdatedAt = k.clock()
-	if err := k.repo.Apply(ctx, ChangeSet{Processes: []*Process{p}}); err != nil {
-		k.logger.Error("release failed", "process", proc.ID, "error", err)
 	}
 }
 
