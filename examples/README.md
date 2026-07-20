@@ -1,6 +1,6 @@
 # Examples
 
-Five programs you can run. Each one is a complete `main` package, and each one
+Six programs you can run. Each one is a complete `main` package, and each one
 is about a single thing agentkit does.
 
 > These live in their own Go module. Running them pulls in a Vertex AI client
@@ -15,6 +15,7 @@ is about a single thing agentkit does.
 | [`human-in-the-loop`](human-in-the-loop) | a strategy that suspends on a question and resumes from the answer |
 | [`durable-worker`](durable-worker) | submitting and executing in separate processes, and surviving a crash |
 | [`fanout`](fanout) | a planner that runs its tasks as parallel child processes |
+| [`middleware`](middleware) | wrapping all five kernel hooks with one registration each |
 
 ## Running them
 
@@ -177,6 +178,51 @@ that only shows up once someone relies on the number.
 
 See [bundled-strategies.md](../docs/bundled-strategies.md) and
 [observability.md](../docs/observability.md).
+
+## middleware
+
+A `next`-chain on each of the five points where the kernel calls out: `Init` and
+`Step` at the strategy boundary, and `Generate`, `CallTool` and `SpawnChild` for
+the effects. The program's output is the trail they wrote.
+
+```
+audit trail
+  init      coordinator (left alone)
+  generate  coordinator role=middleware.coordinator tokens=64/16
+  tool      coordinator lookup ok
+  tool      coordinator purge DENIED by policy
+  step      coordinator seq=1 -> continue (state readable: true)
+  init      reporter    prompt prefixed with the house style
+  step      coordinator seq=2 -> suspend (state readable: true)
+  spawn     reporter    persisted with the transition
+  ...
+```
+
+Four things that trail is showing:
+
+- **Refusing.** The tool policy returns without calling `next`, so the tool
+  never runs. Effect middleware is the *outermost* layer of its syscall — it
+  wraps the `Limiter` check, tool resolution and argument validation — so it
+  stops a call before any of those, and still sees a call refused deeper in.
+- **Rewriting.** The `Init` middleware prefixes a house style onto the prompt.
+  It runs for every agent and cannot know any one strategy's input type:
+  `InitInput` reporting `ok == false` means "another agent's Process, pass it
+  through", which is what happens to the coordinator's own input.
+- **Whether a child really exists.** `SpawnChild` only buffers a child into the
+  transition's commit, so the returned id is not proof of anything yet.
+  `req.OnCommit` reports the transition's outcome — note that the two "persisted"
+  lines appear *after* the `seq=2 -> suspend` that committed them.
+- **What `Step` middleware can see.** It observes the Step call, not the commit;
+  a transition that fails to commit is re-run and traced again. It must call
+  `next` at most once, because a Step's buffered effects accumulate per
+  transition rather than per call.
+
+Refusing a call is not an authorization gate. This is a real chokepoint for
+calls made through `Syscalls.CallTool`, but a strategy holding a `gollem.Tool`
+value can call `Run` on it directly — which is why `tools` puts the enforcement
+inside `Run`.
+
+See [ADR-0012](../docs/adr/0012-kernel-hooks-are-composable-middleware.md).
 
 ## Where to go next
 
