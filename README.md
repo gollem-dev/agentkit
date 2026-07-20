@@ -169,6 +169,15 @@ func TestMyRepo(t *testing.T) {
 }
 ```
 
+## Documentation
+
+- [docs/](./docs/) — guides: execution model, getting started, concepts,
+  writing strategies, tools, persistence, observability.
+- [docs/design/](./docs/design/) — architecture, process lifecycle, consistency
+  model, responsibility boundaries.
+- [docs/adr/](./docs/adr/) — the decisions behind the design, and what was
+  rejected.
+
 ## Requirements
 
 - Go 1.26+
