@@ -1,0 +1,38 @@
+name: test
+
+# Branch pushes are covered via pull_request, so push is limited to main.
+# Listing both unrestricted would run every branch commit twice once a PR is
+# open. pull_request (not pull_request_target) is what lets a fork's PR be
+# checked here at all, and it keeps the fork's code away from write tokens.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  testing:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: cicd-sensor
+        uses: cicd-sensor/cicd-sensor-action@6ee257338e68af2b279b321b3346fe5f385aa498 # v0.0.29
+      # No `ref:` override -- the default checks out the event's own commit. A
+      # `ref: github.head_ref` would resolve against this repository and fail
+      # outright for a fork's PR, whose branch does not exist here.
+      - name: Checkout upstream repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: "go.mod"
+          cache: true
+          cache-dependency-path: go.sum
+      # `go test` tolerates a go.mod/go.sum carrying stale or surplus entries,
+      # so tidiness needs its own gate.
+      - name: Check go.mod tidiness
+        run: go mod tidy -diff
+      # -race is enabled here (unlike the sibling repos) because this module is a
+      # concurrent runtime: the kernel and workers hand state across goroutines,
+      # so a data race is a product defect rather than a test-only artifact.
+      - run: go test -race ./...

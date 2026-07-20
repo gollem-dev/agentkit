@@ -1,0 +1,68 @@
+name: trivy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: cicd-sensor
+        uses: cicd-sensor/cicd-sensor-action@6ee257338e68af2b279b321b3346fe5f385aa498 # v0.0.29
+      # No `ref:` override -- see the note in test.yml; a fork's PR branch does
+      # not exist in this repository.
+      - name: Checkout upstream repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # SARIF is produced unconditionally (exit-code: 0) and uploaded on every
+      # run, including clean ones. Code Scanning closes a resolved alert only
+      # when a later SARIF arrives without it, so uploading solely on failure
+      # would leave fixed vulnerabilities showing as open forever.
+      - id: scan-sarif
+        name: Run Trivy vulnerability scanner (SARIF output)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0 (known-safe SHA after tag compromise incident)
+        with:
+          scan-type: "fs"
+          ignore-unfixed: true
+          format: "sarif"
+          output: "trivy-results.sarif"
+          exit-code: 0
+        env:
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db
+          TRIVY_JAVA_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-java-db
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        # A fork's pull_request gets a read-only GITHUB_TOKEN, so the upload
+        # would fail even though the scan itself is meaningful there.
+        if: >-
+          always() && hashFiles('trivy-results.sarif') != '' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@7fc1baf373eb073c686865bd453d412d506a05a2 # v3.35.1
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      # Failing the job is this step's only responsibility; it runs last so the
+      # SARIF above is always uploaded first. This is also what gates a fork's
+      # PR, which never reaches the upload step.
+      - id: scan-table
+        name: Run Trivy vulnerability scanner (table output)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0 (known-safe SHA after tag compromise incident)
+        with:
+          scan-type: "fs"
+          ignore-unfixed: true
+          format: "table"
+          exit-code: 1
+        env:
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db
+          TRIVY_JAVA_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-java-db

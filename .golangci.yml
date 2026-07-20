@@ -1,0 +1,10 @@
+version: "2"
+
+# Declared explicitly rather than left to the default: `golangci-lint formatters`
+# reports an empty enabled set when this block is absent, even though `fmt` still
+# applies gofmt. Naming them keeps the CI fmt gate from depending on that
+# undocumented fallback.
+formatters:
+  enable:
+    - gofmt
+    - goimports
