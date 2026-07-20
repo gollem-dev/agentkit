@@ -76,8 +76,9 @@ decision before performing it.
 - Strategies must treat "have I already done this?" as *state*. Across a
   `Suspend`, a strategy records that a step happened in its own checkpointed
   state; the framework will not remember for it.
-- `Observer` fires on every execution including re-runs, which is what an audit
-  trail wants — it records what actually happened (see ADR-0012).
+- Middleware fires on every execution including re-runs, which is what an audit
+  trail wants — it records what actually happened (see ADR-0012). It also means
+  a middleware must tolerate duplicates: one call is not one logical operation.
 - The bundled strategies keep at most one `Generate` per transition, so a crash
   costs at most one LLM round. `planexec`'s plan phase is the sole exception: an
   in-transition correction retry on malformed plan JSON.

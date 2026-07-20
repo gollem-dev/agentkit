@@ -64,7 +64,7 @@ agentkit/                  root package: kernel + every port definition
   kernel.go                lifecycle API (Spawn/Respond/Cancel/Get/List)
   worker.go                Serve, claims, transitions, commits
   syscalls.go              the effect gateway
-  strategy.go repository.go tool.go observer.go              the ports
+  strategy.go repository.go tool.go middleware.go             the ports
   strategy/simple/         LLM loop
   strategy/planexec/       plan -> children -> replan -> finalize
   repository/memory/       reference impl (in-process)

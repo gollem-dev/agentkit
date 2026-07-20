@@ -353,20 +353,27 @@ func TestChildrenWakeup(t *testing.T) {
 }
 
 // hookRepo wraps a Repository so a test can force a precise interleaving: onApply
-// fires just before each Apply; onGet can fail a GetProcess.
+// fires just before each Apply; failApply can reject one outright; onGet can fail
+// a GetProcess.
 type hookRepo struct {
 	agentkit.Repository
-	mu      sync.Mutex
-	onApply func(cs agentkit.ChangeSet)
-	onGet   func(pid agentkit.ProcessID) error
+	mu        sync.Mutex
+	onApply   func(cs agentkit.ChangeSet)
+	failApply func(cs agentkit.ChangeSet) error
+	onGet     func(pid agentkit.ProcessID) error
 }
 
 func (h *hookRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
 	h.mu.Lock()
-	fn := h.onApply
+	fn, fail := h.onApply, h.failApply
 	h.mu.Unlock()
 	if fn != nil {
 		fn(cs)
+	}
+	if fail != nil {
+		if err := fail(cs); err != nil {
+			return err
+		}
 	}
 	return h.Repository.Apply(ctx, cs)
 }
@@ -384,6 +391,12 @@ func (h *hookRepo) GetProcess(ctx context.Context, pid agentkit.ProcessID) (*age
 }
 
 func (h *hookRepo) setApply(fn func(agentkit.ChangeSet)) { h.mu.Lock(); h.onApply = fn; h.mu.Unlock() }
+
+func (h *hookRepo) setFailApply(fn func(agentkit.ChangeSet) error) {
+	h.mu.Lock()
+	h.failApply = fn
+	h.mu.Unlock()
+}
 
 // #1: a Cancel racing a claim must NOT be lost. Between Cancel's read (pending)
 // and its finalize Apply, a worker claims the Process (running, new LeaseToken).

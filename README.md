@@ -79,6 +79,8 @@ execution begins when a `Serve` worker claims it.
 - **Syscalls** — the one path a strategy uses to touch the world: `Generate`
   (LLM), `CallTool`, `SpawnChild` (via the typed handle), `Await` (read a wait),
   `Emit` (event), `Metrics`, `Now`. It meters usage and runs the `Limiter`.
+- **Middleware** — a `next`-chain around `Init`, `Step`, `Generate`, `CallTool`
+  and `SpawnChild`, registered on the `Kernel`, for cross-cutting concerns.
 - **Await** — a durable "wait": `Question` (a human answer — confirmation is a
   yes/no question), `Timer`, or `WaitChildren` (child processes). Declared via
   `Suspend(...)`, answered via `Kernel.Respond`.
@@ -101,23 +103,58 @@ if !st.Confirmed {
 > action". If you need a hard allow/deny gate, wrap the tools your `ToolFactory`
 > returns so an unauthorized call is refused inside `Run`.
 
-## Auditing & tracing (Observer)
+## Middleware
 
-`agentkit` does not persist effects, but it exposes observation points for audit
-trails and tracing via `WithObserver`. Each hook is a span (start with the
-intent, end with the result); it is best-effort (never persisted, never blocks
-execution, panics are recovered) and fires on every execution including re-runs:
+Five points where the kernel calls out are wrapped by a `next`-chain, registered
+on the `Kernel`: `Init` and `Step` (the strategy boundary) and `Generate`,
+`CallTool` and `SpawnChild` (the effects). One registration covers every agent,
+which makes this the place for audit, tracing, redaction, retry and tool policy.
+
+An effect middleware is the outermost layer of its syscall — it wraps the
+`Limiter` check, tool resolution and argument validation — so a refused call is
+visible to it too, and returning without calling `next` stops the call before
+any of them:
 
 ```go
-kernel, _ := agentkit.New(repo, client, reg, agentkit.WithObserver(agentkit.Observer{
-	ToolCall: func(ctx context.Context, ec agentkit.EffectContext, call gollem.FunctionCall) func(map[string]any, error) {
-		auditStart(ec, call) // record intent
-		return func(res map[string]any, err error) { auditEnd(ec, res, err) }
-	},
-}))
+kernel, _ := agentkit.New(repo, client, reg,
+	agentkit.WithToolCallMiddleware(func(next agentkit.ToolCallHandler) agentkit.ToolCallHandler {
+		return func(ctx context.Context, req *agentkit.ToolCallRequest) (map[string]any, error) {
+			if !allowed[req.Call.Name] {
+				audit(req.Effect, req.Call, "denied")
+				return nil, errDenied // next is never called: the tool does not run.
+			}
+			out, err := next(ctx, req)
+			audit(req.Effect, req.Call, err) // ErrLimitExceeded reaches here too.
+			return out, err
+		}
+	}),
+)
 ```
 
-For an audit that must be durable *before* the action, wrap the tool instead.
+Effects run at least once, so a middleware fires on every execution including
+re-runs. Nothing it records is persisted by the framework; for an audit that
+must be durable *before* the action, record it inside the tool's `Run`.
+
+> Refusing a call is not an authorization gate. A middleware is a real
+> chokepoint for calls made through `Syscalls.CallTool`, but a strategy holding
+> a `gollem.Tool` value can call `Run` on it directly. Enforcement belongs
+> inside `Run`.
+
+`SpawnChild` is buffered into the transition commit, so its middleware gets
+`req.OnCommit(fn)` to learn whether the child was actually persisted.
+
+**A kernel middleware runs across all agents, so it does not know any
+strategy's input or state type.** The type-erased payloads are read with
+`InitInput[I]` / `StepState[S]` / `SpawnInput[I]` and replaced by deriving a new
+request (`NewInitRequest` and friends); `ok == false` just means "another
+agent's Process — pass it through". Passing `any` as the type argument always
+succeeds and is the intended form for generic logging. Nothing here is checked
+by the compiler: a wrong type surfaces as `ErrInvalidRequest` at run time. That
+is the nature of a cross-cutting layer, and it is why typed manipulation of a
+payload is better placed in the strategy's own `Init`.
+
+See [ADR-0012](docs/adr/0012-kernel-hooks-are-composable-middleware.md) for why
+this replaced the observation-only `Observer` hooks.
 
 ## Isolated external effects
 

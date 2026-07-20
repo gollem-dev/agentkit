@@ -25,7 +25,7 @@ also a silent behaviour change for existing callers.
 
 agentkit has genuinely mandatory dependencies (a `Repository`, a default LLM
 client, a `Registry`) and a long tail of optional ones (extra model roles, a
-tool factory, a limiter, an observer, a logger, a clock).
+tool factory, a limiter, middleware, a logger, a clock).
 
 ## Decision
 
