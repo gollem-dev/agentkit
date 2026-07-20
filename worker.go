@@ -702,7 +702,11 @@ func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, ca
 	p := proc.clone()
 	p.Status = ProcessPending
 	p.StepAttempts = proc.StepAttempts + 1
-	backoff := time.Duration(1<<uint(minInt(p.StepAttempts, 6))) * time.Second
+	// max(0, ...) keeps the shift count non-negative: the uint conversion this
+	// replaces was what previously made a bogus stored StepAttempts harmless,
+	// and a negative shift count panics at runtime.
+	attempts := max(0, minInt(p.StepAttempts, 6))
+	backoff := time.Duration(1<<attempts) * time.Second
 	if backoff > 60*time.Second {
 		backoff = 60 * time.Second
 	}

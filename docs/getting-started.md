@@ -200,6 +200,9 @@ An application that only submits work simply never calls `Serve`.
 
 ## Next
 
+- [examples/](../examples/) — the same shape as a program you can run, plus one
+  each for tools, human confirmation, crash recovery, child processes and
+  middleware. They are a separate module: `cd examples && go run ./quickstart`.
 - [Execution model](execution-model.md) — **read this before shipping anything
   with side effects.**
 - [Concepts](concepts.md) — the vocabulary.
