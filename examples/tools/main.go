@@ -142,6 +142,12 @@ func (t *deployTool) Run(ctx context.Context, args map[string]any) (map[string]a
 // human first, but that is a confirmation: nothing stops a buggy or manipulated
 // strategy from calling the tool without asking. Run is the only path to the
 // effect, so it is the only place a refusal cannot be routed around.
+//
+// A ToolCallMiddleware can refuse a call too, and being registered once for
+// every agent it is the better home for a policy that spans them. It is still a
+// chokepoint rather than a gate: it sees calls made through Syscalls.CallTool,
+// and a strategy holding a gollem.Tool value can call Run on it directly. What
+// must not be bypassable stays here.
 type guardedTool struct {
 	inner gollem.Tool
 	allow func(name string, args map[string]any) error

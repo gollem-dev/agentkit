@@ -76,7 +76,9 @@ Two obligations are on display:
   hand out a key that would survive a non-deterministic replay.
 - **Authorization.** `guardedTool` refuses before the inner tool can act.
   `Run` is the only path to the effect, so it is the only place a refusal
-  cannot be routed around.
+  cannot be routed around. A `ToolCallMiddleware` can refuse a call as well,
+  and one registration covers every agent — but it is a chokepoint for calls
+  made through `Syscalls.CallTool`, not a gate, so enforcement stays in `Run`.
 
 Only half of the first one is shown here, and the example says so: the key is
 the part a tool author writes, but the store that key is checked against has to
