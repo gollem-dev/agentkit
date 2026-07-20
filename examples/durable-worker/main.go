@@ -1,10 +1,11 @@
 // Command durable-worker separates submitting work from doing it, and survives
-// the worker dying in the middle.
+// the worker dying in the middle. Run it from the examples module:
 //
-//	go run ./examples/durable-worker submit -topic "durability"
-//	go run ./examples/durable-worker work -pid <id> -crash-after 2   # dies
-//	go run ./examples/durable-worker status -pid <id>                # partial progress
-//	go run ./examples/durable-worker work -pid <id>                  # resumes, finishes
+//	cd examples
+//	go run ./durable-worker submit -topic "durability"
+//	go run ./durable-worker work -pid <id> -crash-after 2   # dies
+//	go run ./durable-worker status -pid <id>                # partial progress
+//	go run ./durable-worker work -pid <id>                  # resumes, finishes
 //
 // The crash happens after the LLM call but before the transition commits, so
 // that round runs again on resume. That is what at-least-once means in

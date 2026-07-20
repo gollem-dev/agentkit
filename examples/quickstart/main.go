@@ -1,8 +1,8 @@
 // Command quickstart is the shortest useful agentkit program: register an
 // agent, build a kernel, spawn a Process, and run a worker until it finishes.
 //
-// Run it with `go run ./examples/quickstart`. Without Vertex AI configured it
-// answers from a script, so it works offline.
+// Run it from the examples module: `cd examples && go run ./quickstart`.
+// Without Vertex AI configured it answers from a script, so it works offline.
 package main
 
 import (

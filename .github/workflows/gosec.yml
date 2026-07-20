@@ -42,3 +42,34 @@ jobs:
         with:
           # Path to SARIF file relative to the root of the repository
           sarif_file: results.sarif
+
+  # examples/ is a nested module and the job above cannot reach it. The reusable
+  # action runs gosec in a container rooted at the workspace, with no way to
+  # change directory, and gosec resolves packages within a single module: aimed
+  # at ./examples/... from the root it walks the directories, scans zero files
+  # and exits 0. A green check that inspected nothing is worse than no check, so
+  # the same version is installed and run inside the module instead.
+  examples:
+    name: gosec (examples)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: cicd-sensor
+        uses: cicd-sensor/cicd-sensor-action@6ee257338e68af2b279b321b3346fe5f385aa498 # v0.0.29
+      - name: Checkout Source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: "go.mod"
+          cache: true
+          cache-dependency-path: go.sum
+      # Kept at the version the action's pinned image reports.
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+      # No SARIF upload here: the exit code is what gates the merge, and the
+      # examples are teaching material rather than shipped library code, so
+      # routing their findings into the Security tab would only add noise.
+      - name: Run Gosec Security Scanner
+        run: gosec -exclude-generated ./...
+        working-directory: examples

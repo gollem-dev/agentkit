@@ -3,6 +3,11 @@
 Five programs you can run. Each one is a complete `main` package, and each one
 is about a single thing agentkit does.
 
+> These live in their own Go module. Running them pulls in a Vertex AI client
+> and its transitive dependencies, and none of that belongs in the dependency
+> graph of anyone who merely imports agentkit. **Run every command below from
+> this directory**, not from the repository root.
+
 | Example | What it shows |
 |---|---|
 | [`quickstart`](quickstart) | register → construct → spawn → serve, and nothing else |
@@ -14,8 +19,12 @@ is about a single thing agentkit does.
 ## Running them
 
 ```bash
-go run ./examples/quickstart
+cd examples
+go run ./quickstart
 ```
+
+The module has a `replace` pointing at `../`, so the examples always exercise
+the agentkit in this working tree rather than a published version of it.
 
 **They work offline.** With no model configured, the LLM is a stub replaying a
 script, so every example completes without network access, without credentials,
@@ -28,7 +37,7 @@ To run against a real model, point them at Vertex AI:
 gcloud auth application-default login
 export GEMINI_PROJECT_ID=your-project
 export GEMINI_LOCATION=us-central1
-go run ./examples/quickstart
+go run ./quickstart
 ```
 
 Both variables are required, and the caller needs `roles/aiplatform.user` (or
@@ -88,7 +97,7 @@ A hand-written `Strategy` that suspends on a question, and an operator that
 answers it.
 
 ```bash
-go run ./examples/human-in-the-loop -answer no
+go run ./human-in-the-loop -answer no
 ```
 
 The Process parks in `waiting` and the question goes into the Repository. The
@@ -117,10 +126,10 @@ The one example with more than one command, because the point is that the
 process submitting work and the process doing it are different.
 
 ```bash
-go run ./examples/durable-worker submit -topic durability -rounds 4
-go run ./examples/durable-worker work -pid <id> -crash-after 2   # exits mid-round
-go run ./examples/durable-worker status -pid <id>                # partial progress
-go run ./examples/durable-worker work -pid <id>                  # resumes, finishes
+go run ./durable-worker submit -topic durability -rounds 4
+go run ./durable-worker work -pid <id> -crash-after 2   # exits mid-round
+go run ./durable-worker status -pid <id>                # partial progress
+go run ./durable-worker work -pid <id>                  # resumes, finishes
 ```
 
 The simulated crash exits after the LLM call but before the transition commits,

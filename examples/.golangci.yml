@@ -1,0 +1,24 @@
+version: "2"
+
+# The examples are their own module, so golangci-lint runs here separately and
+# reads this file instead of the repository root's. It mirrors the root config,
+# plus the one exclusion the examples need.
+linters:
+  exclusions:
+    rules:
+      # The examples print their results to stdout; that output *is* the
+      # program. Checking every Fprintf would bury what each example exists to
+      # show under error handling that has nothing to do with agentkit. The
+      # library's own module has no such exclusion -- code someone imports has
+      # no business ignoring a write error.
+      - linters: [errcheck]
+        source: ^\s*fmt\.Fprint
+
+# Declared explicitly rather than left to the default: `golangci-lint formatters`
+# reports an empty enabled set when this block is absent, even though `fmt` still
+# applies gofmt. Naming them keeps the CI fmt gate from depending on that
+# undocumented fallback.
+formatters:
+  enable:
+    - gofmt
+    - goimports

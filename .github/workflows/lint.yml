@@ -32,3 +32,12 @@ jobs:
       # action above calls core.addPath on its install directory.
       - name: golangci-lint fmt
         run: golangci-lint fmt --diff
+      # examples/ is its own module and `./...` does not cross a module
+      # boundary, so it needs its own invocation. It carries its own
+      # .golangci.yml, which golangci-lint picks up from the working directory.
+      - name: golangci-lint (examples)
+        run: golangci-lint run --timeout 10m ./...
+        working-directory: examples
+      - name: golangci-lint fmt (examples)
+        run: golangci-lint fmt --diff
+        working-directory: examples

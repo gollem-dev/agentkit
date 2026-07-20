@@ -11,7 +11,7 @@
 // key lives in memory here, so a replay from a different process would deploy
 // twice. See the deployments interface below.
 //
-// Run it with `go run ./examples/tools`.
+// Run it from the examples module: `cd examples && go run ./tools`.
 package main
 
 import (

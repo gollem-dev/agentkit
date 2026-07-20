@@ -171,8 +171,10 @@ func TestMyRepo(t *testing.T) {
 
 ## Documentation
 
-- [examples/](./examples/) — five runnable programs, one per idea. They work
-  offline, so `go run ./examples/quickstart` needs no credentials.
+- [examples/](./examples/) — five runnable programs, one per idea. They are a
+  separate module, so the LLM SDK they need stays out of this one's dependency
+  graph, and they work offline: `cd examples && go run ./quickstart` needs no
+  credentials.
 - [docs/](./docs/) — guides: execution model, getting started, concepts,
   writing strategies, tools, persistence, observability.
 - [docs/design/](./docs/design/) — architecture, process lifecycle, consistency

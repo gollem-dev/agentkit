@@ -17,7 +17,8 @@
 // from calling a tool without asking first -- a hard allow/deny decision has to
 // live inside the tool's Run, where there is no path around it.
 //
-// Run it with `go run ./examples/human-in-the-loop`, or with `-answer no`.
+// Run it from the examples module: `cd examples && go run ./human-in-the-loop`,
+// or with `-answer no`.
 package main
 
 import (

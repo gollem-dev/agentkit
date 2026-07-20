@@ -7,7 +7,7 @@
 // workers use the kernel's default model, which is how you point a stronger
 // model at planning and a cheaper one at the tasks.
 //
-// Run it with `go run ./examples/fanout`.
+// Run it from the examples module: `cd examples && go run ./fanout`.
 package main
 
 import (

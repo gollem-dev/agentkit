@@ -1,17 +1,5 @@
 version: "2"
 
-linters:
-  exclusions:
-    rules:
-      # The examples print their results to stdout; that output *is* the
-      # program. Checking every Fprintf would bury what each example exists to
-      # show under error handling that has nothing to do with agentkit. Scoped
-      # to examples/ and to fmt.Fprint* so the gate stays intact everywhere
-      # else -- library code has no business ignoring a write error.
-      - path: ^examples/
-        linters: [errcheck]
-        source: ^\s*fmt\.Fprint
-
 # Declared explicitly rather than left to the default: `golangci-lint formatters`
 # reports an empty enabled set when this block is absent, even though `fmt` still
 # applies gofmt. Naming them keeps the CI fmt gate from depending on that
