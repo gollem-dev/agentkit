@@ -193,7 +193,7 @@ func TestCancelFiresFinishHandler(t *testing.T) {
 	ctx := context.Background()
 	repo := memory.New()
 	reg := agentkit.NewRegistry()
-	var rec recorder
+	var rec finishRecorder
 	ag, err := agentkit.Register(reg, "a", 1, &finishStrategy{step: finishDoneStep("unused")},
 		agentkit.WithOnFinish(rec.handler))
 	gt.NoError(t, err)

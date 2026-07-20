@@ -15,10 +15,15 @@ type Strategy[S, I, O any] interface {
 	// Init builds the initial state, purely. Input is received typed (Spawn
 	// passes the typed value through as any and BindStrategy's closure
 	// type-checks it — no serialization runs). Init receives no Syscalls and no
-	// ctx, so there is structurally no path to effects. It runs inside
-	// Agent[I].Spawn / SpawnChild and the initial state is persisted with the
-	// Process insert (never on the transition machine, so free of at-least-once
-	// re-execution). Its error is returned synchronously by Spawn.
+	// ctx, so a STRATEGY AUTHOR has structurally no path to effects here.
+	//
+	// That guarantee is about this signature, not about the surrounding call.
+	// Whoever configures the Kernel can wrap Init with InitMiddleware, which does
+	// receive a ctx and can perform effects around it. Init still runs inside
+	// Agent[I].Spawn / SpawnChild and never on the transition machine, so unlike
+	// Step it is free of at-least-once re-execution — which makes it the safer
+	// of the two places for such an effect. Its error is returned synchronously
+	// by Spawn.
 	Init(input I) (S, error)
 	// Step runs one transition. It always receives the DecodeState-restored
 	// state (the first transition too, since Init's result was persisted at
@@ -45,6 +50,11 @@ type StrategyBinding struct {
 	step    func(ctx context.Context, sys Syscalls, state any) (any, decision, error)
 	encode  func(state any) ([]byte, error)
 	decode  func(version int, raw []byte) (any, error)
+	// encodeOutput runs after the Step middleware chain, not inside step: a
+	// StepMiddleware can replace the Decision (NewStepResult) and has no way to
+	// encode, so the erased decision carries the typed value and the worker
+	// encodes whichever Decision came out of the chain.
+	encodeOutput func(typedOut any) ([]byte, error)
 	// finish is nil unless WithOnFinish was given. typedOut is the value Done
 	// received (nil for failed/cancelled).
 	finish func(ctx context.Context, pid ProcessID, status ProcessStatus, typedOut any, f *Failure) error
@@ -67,22 +77,35 @@ func BindStrategy[S, I, O any](s Strategy[S, I, O], opts ...RegisterOption[O]) S
 			}
 			return s.Init(typed)
 		},
+		// step, encode and encodeOutput assert with comma-ok rather than bare: a
+		// Step middleware can replace the state or the Decision with a value of
+		// another type, so this is reachable and must be an error a caller can
+		// discriminate, not a panic reported as "strategy panic".
 		step: func(ctx context.Context, sys Syscalls, st any) (any, decision, error) {
-			state, d, err := s.Step(ctx, sys, st.(S))
+			typed, ok := st.(S)
+			if !ok {
+				return nil, decision{}, goerr.Wrap(ErrInvalidRequest, "step state type mismatch")
+			}
+			state, d, err := s.Step(ctx, sys, typed)
 			if err != nil {
 				return state, decision{}, err
 			}
-			ed := decision{kind: d.kind, failure: d.failure, awaits: d.awaits}
-			if d.hasOut {
-				raw, eerr := s.EncodeOutput(d.out)
-				if eerr != nil {
-					return state, decision{}, goerr.Wrap(eerr, "encode output")
-				}
-				ed.output, ed.typed = raw, d.out
-			}
-			return state, ed, nil
+			return state, d.erase(), nil
 		},
-		encode: func(st any) ([]byte, error) { return s.EncodeState(st.(S)) },
+		encode: func(st any) ([]byte, error) {
+			typed, ok := st.(S)
+			if !ok {
+				return nil, goerr.Wrap(ErrInvalidRequest, "encode state type mismatch")
+			}
+			return s.EncodeState(typed)
+		},
+		encodeOutput: func(out any) ([]byte, error) {
+			typed, ok := out.(O)
+			if !ok {
+				return nil, goerr.Wrap(ErrInvalidRequest, "step output type mismatch")
+			}
+			return s.EncodeOutput(typed)
+		},
 		decode: func(v int, raw []byte) (any, error) { return s.DecodeState(v, raw) },
 	}
 	if cfg.onFinish != nil {

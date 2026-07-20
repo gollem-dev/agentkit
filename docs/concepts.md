@@ -50,8 +50,10 @@ Three types: `S` is what you checkpoint, `I` is what launches a run, `O` is what
 a finished run produces.
 
 - **`Init`** builds the initial state, purely. It receives no context and no
-  syscalls — structurally, there is no path to an effect — and runs
-  synchronously inside `Spawn`, so a bad input is an error the caller sees
+  syscalls, so a *strategy author* has structurally no path to an effect here
+  — whoever configures the `Kernel` can still wrap it with `InitMiddleware`,
+  which does receive a `ctx` ([observability.md](observability.md)). `Init`
+  runs synchronously inside `Spawn`, so a bad input is an error the caller sees
   immediately rather than an asynchronous failure later.
 - **`Step`** runs one transition and returns a `Decision[O]`. It is called from
   the top every time, including after a crash.
@@ -160,7 +162,7 @@ kernel, err := agentkit.New(repo, defaultModel, registry,
     agentkit.WithModelRole(planexec.RolePlanner, strongModel),
     agentkit.WithToolFactory(factory),
     agentkit.WithLimiter(limiter),
-    agentkit.WithObserver(observer),
+    agentkit.WithToolCallMiddleware(toolAudit),
 )
 ```
 
@@ -187,7 +189,7 @@ or a conditional-write KV store ([ADR-0004](adr/0004-repository-changeset-rev-ca
 
 See [persistence.md](persistence.md).
 
-## Metrics, Limiter, Event, Observer
+## Metrics, Limiter, Event, Middleware
 
 - **`Metrics`** — counters the kernel maintains: input/output tokens, LLM calls,
   tool calls, steps, spawns.
@@ -196,7 +198,9 @@ See [persistence.md](persistence.md).
 - **`Event`** — an append-only record written durably inside the transition
   commit. Read per process with `ListEvents`; delivering them anywhere is your
   job.
-- **`Observer`** — best-effort span hooks for audit and tracing. Not persisted,
-  cannot stop execution, and fires on replays too.
+- **Middleware** — `next`-chain hooks at `Init`, `Step`, `Generate`, `CallTool`
+  and `SpawnChild`, registered on the `Kernel`. Unlike the others, a middleware
+  can rewrite the request or refuse the call outright; nothing is persisted by
+  the framework, and it fires on replays too.
 
 See [observability.md](observability.md).

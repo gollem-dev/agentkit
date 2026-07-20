@@ -31,9 +31,11 @@ Two properties are worth stating explicitly:
   `FailureLimitExceeded`, alongside `FailureStrategyError` and
   `FailureRetryExhausted` (ADR-0010).
 
-`Spawn` is asynchronous. It runs `Init` purely, encodes the initial state, and
-inserts a `pending` row. Nothing executes until a worker claims it — which is
-why the verb is *spawn* and not *start* (ADR-0013).
+`Spawn` is asynchronous. It mints the `ProcessID`, runs `Init` through its
+middleware chain, encodes the initial state, and inserts a `pending` row.
+Nothing executes until a worker claims it — which is why the verb is *spawn*
+and not *start* (ADR-0013). `SpawnChild` follows the same path
+([observability.md](../observability.md)).
 
 ## What a claim does
 
@@ -100,7 +102,8 @@ its wait would leave nobody to do the waking (ADR-0009).
 Errors split into three kinds by *where* they arise.
 
 **Transition errors** — a failure in `DecodeState`, `Step`, or `EncodeState`,
-including a recovered strategy panic. The process is requeued with an
+including a recovered panic from the strategy or its `StepMiddleware` chain.
+The process is requeued with an
 exponential backoff (doubling, capped at a minute) and an incremented attempt
 counter. When attempts exceed the limit, it terminates as `failed` with
 `FailureRetryExhausted`. Metrics consumed by the failed attempt are folded in
@@ -139,6 +142,21 @@ If any read needed to build that change set fails, the whole finalize is
 abandoned rather than committed partially. The process stays non-terminal and is
 retried after its lease expires — a delayed finalize is recoverable, a lost
 wakeup is not.
+
+A registered completion handler (`WithOnFinish`) runs immediately after that
+`Apply` succeeds, synchronously, on whichever instance committed. Everything
+above is inside the commit; the handler is outside it, and that asymmetry is the
+whole of its guarantee:
+
+- It cannot fire twice. Every terminal path funnels through one commit, and a
+  worker that loses the CAS race abandons before reaching the call.
+- **It can fire zero times.** A crash in the window between the `Apply` and the
+  call loses the notification, and nothing retries it — there is no journal to
+  retry from (ADR-0003).
+
+That window is the reason follow-up work which must not be lost belongs in a
+parent process waiting on `WaitChildren`, where it is part of a committed
+transition rather than a call after one ([ADR-0014](../adr/0014-completion-handlers-are-best-effort.md)).
 
 ## Cancellation
 

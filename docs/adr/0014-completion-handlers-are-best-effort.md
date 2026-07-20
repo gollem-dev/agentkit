@@ -19,15 +19,21 @@ change nothing about the committed Process.
 ## Context
 
 Before this, the only way to observe a finished Process from outside the kernel
-was to poll `Kernel.GetProcess`. `Observer` (ADR-0012) has hooks for `Generate`,
-`ToolCall` and `Spawn` but none for process completion, and the kernel-emitted
-`process.finished` event carries a nil payload, so it says a Process ended
-without saying what it produced.
+was to poll `Kernel.GetProcess`. The kernel-emitted `process.finished` event
+carries a nil payload, so it says a Process ended without saying what it
+produced.
 
-Two constraints shaped the answer. `Spawn` is asynchronous and the instance that
-spawns need not be the instance that runs the agent, so a closure captured at
-spawn time cannot be relied on to exist where the Process finishes. And ADR-0003
-declines an effect journal, so there is no durable record to drive a retry from.
+Kernel middleware (ADR-0012) does not cover this. Its five hooks wrap *calls*,
+and the one nearest the state machine is explicit that it stops short:
+`StepMiddleware` wraps the `Step` call between `DecodeState` and `EncodeState`,
+and "does not observe the transition's commit, which happens after the handler
+returns". A terminal state is exactly the thing that only exists after a commit.
+
+Two further constraints shaped the answer. `Spawn` is asynchronous and the
+instance that spawns need not be the instance that runs the agent, so a closure
+captured at spawn time cannot be relied on to exist where the Process finishes.
+And ADR-0003 declines an effect journal, so there is no durable record to drive
+a retry from.
 
 ## Decision
 
@@ -60,6 +66,12 @@ responsibility.
 `Cancel` is the one path that runs outside a worker: `Kernel.Cancel` commits from
 the calling application's own process, so a `cancelled` handler runs there.
 
+The shape is not new: `SpawnRequest.OnCommit` (ADR-0012) already registers a
+callback fired after the transition commits, outside the transition, with its
+panic recovered and logged because it would otherwise kill the worker. This
+handler follows that precedent rather than inventing a second convention for
+post-commit notification.
+
 Output reaching a parent is unaffected. `ChildResult.Output` stays `[]byte`: a
 parent may wait on children of different agents, so no single output type
 exists, and `Syscalls.Await` is an interface method, which Go does not allow to
@@ -67,10 +79,18 @@ be generic.
 
 ## Alternatives rejected
 
-- **A `Finish` hook on `Observer`.** The cheapest option, and it would have made
-  ADR-0012 untrue the first time someone put business logic in it. Observation
-  and a business callback differ in lifetime and in what a failure means; a
-  separate name keeps the option of strengthening one of them later.
+- **A sixth kernel middleware hook.** Middleware is a `next`-chain around a
+  call, and there is no call here to wrap: the handler fires *after* an `Apply`,
+  from inside `commitFinal`. ADR-0012 already declines the nearest thing —
+  wrapping a whole `runClaim` iteration to get a true transition span — because
+  the loop carries retry, lease loss and conflict rewind. Nothing about a
+  post-commit notification needs that machinery.
+- **Registering it on the `Kernel` rather than on the agent.** Kernel middleware
+  is right for cross-cutting concerns precisely because it knows no agent's
+  types, which is the opposite of what a handler receiving `O` needs. ADR-0012
+  rejected per-agent *middleware* while leaving room for a per-agent layer "in
+  addition to" it; this is that layer, scoped to one thing rather than to the
+  five hook points.
 - **A callback passed to `Spawn`.** A closure lives in one instance's memory.
   The worker that finishes the Process is frequently a different instance, so
   the callback would silently never run.

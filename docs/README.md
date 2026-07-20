@@ -24,8 +24,8 @@ worker after a crash.
   authorization obligations that come with them.
 - **[Persistence](persistence.md)** — implementing `Repository`, and verifying it
   with `repotest`.
-- **[Observability](observability.md)** — metrics, limits, events, and the
-  `Observer` hooks.
+- **[Observability](observability.md)** — metrics, limits, events, and
+  middleware.
 
 ## Design and decisions
 

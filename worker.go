@@ -158,7 +158,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 		}
 
 		if dec.kind == DecisionDone || dec.kind == DecisionFail {
-			// commitTerminal fires the spawn observers itself (nil on commit, err on abandon).
+			// commitTerminal fires the spawn OnCommit callbacks itself (nil on commit, err on abandon).
 			_ = k.commitTerminal(ctx, proc, rawState, b.version, sys.seq, dec, sys, claimToken)
 			return
 		}
@@ -188,7 +188,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			sys.notifySpawnDone(err)
 			return
 		}
-		// Committed: fire spawn observer completions (#5/#8).
+		// Committed: fire spawn OnCommit callbacks (#5/#8).
 		sys.notifySpawnDone(nil)
 		switch {
 		case cs.suspend:
@@ -215,16 +215,64 @@ func (k *Kernel) runTransition(ctx context.Context, sys *syscalls, b StrategyBin
 	if err != nil {
 		return nil, decision{}, goerr.Wrap(err, "decode state")
 	}
-	st, dec, err = b.step(ctx, sys, st)
+	// The Step middleware chain sits between decode and encode. It wraps the
+	// Step CALL only — the commit happens after this function returns, so a
+	// middleware never learns from here whether the transition was persisted.
+	//
+	// Unlike an effect handler, this one may run at most once per transition.
+	// Step's side effects (spawned children, emitted events, metrics) accumulate
+	// in `sys`, which is per-transition and not per-call, so a second attempt
+	// would commit the first attempt's buffered effects alongside its own state
+	// and Decision. Rather than let that happen silently, the second call is an
+	// error.
+	stepped := false
+	base := func(c context.Context, r *StepRequest) (*StepResult, error) {
+		if stepped {
+			return nil, goerr.Wrap(ErrInvalidRequest,
+				"step middleware called next more than once (effects buffer per transition, not per call)")
+		}
+		stepped = true
+		ns, d, serr := b.step(c, r.Sys, r.state)
+		if serr != nil {
+			return nil, serr
+		}
+		return &StepResult{dec: d, state: ns}, nil
+	}
+	h := chainStep(k.stepMW, base)
+	if h == nil {
+		return nil, decision{}, goerr.Wrap(ErrInvalidConfig, "step middleware returned a nil handler")
+	}
+	// The Process handed to middleware is a copy: `proc` is the row the commit is
+	// built from, so a middleware writing to it (Metadata, or Rev, which would
+	// make every Apply conflict) would corrupt durable state and fencing. The
+	// clone is only paid for when a Step middleware is actually registered.
+	view := proc
+	if len(k.stepMW) > 0 {
+		view = proc.clone()
+	}
+	res, err := h(ctx, &StepRequest{Effect: sys.ec(), Process: view, Sys: sys, state: st})
 	if err != nil {
 		return nil, decision{}, err
 	}
-	raw, err = b.encode(st)
+	if res == nil {
+		return nil, decision{}, goerr.Wrap(ErrInvalidConfig, "step middleware returned a nil result")
+	}
+	dec = res.dec
+	raw, err = b.encode(res.state)
 	if err != nil {
 		return nil, decision{}, goerr.Wrap(err, "encode state")
 	}
-	// EncodeOutput ran inside b.step; a nil result is the one thing the kernel
-	// can meaningfully check about caller data (ADR-0007).
+	// EncodeOutput runs here rather than inside b.step because a middleware may
+	// have replaced the Decision on the way out, and it has no way to encode.
+	if dec.hasOut {
+		out, oerr := b.encodeOutput(dec.typed)
+		if oerr != nil {
+			return nil, decision{}, goerr.Wrap(oerr, "encode output")
+		}
+		dec.output = out
+	}
+	// A nil output is the one thing the kernel can meaningfully check about
+	// caller data (ADR-0007).
 	if dec.kind == DecisionDone && dec.output == nil {
 		return nil, decision{}, goerr.New("Done with nil output")
 	}
@@ -459,7 +507,7 @@ func (k *Kernel) finalize(ctx context.Context, proc *Process, mut terminalMutato
 // cancelled, process.finished, parent wakeup) in a single Apply, retrying on
 // conflict by re-reading (and re-evaluating the parent). If the lease was lost
 // (LeaseToken changed) or the Process is already terminal, it stops. sys may be
-// nil for external terminations (no buffered children / spawn observers).
+// nil for external terminations (no buffered children / spawn OnCommit callbacks).
 // The fenceToken argument distinguishes two callers:
 //   - a worker's terminal commit passes its claim's LeaseToken (non-empty): a
 //     conflict whose stored token no longer matches means the lease was lost, so
@@ -561,8 +609,8 @@ func (k *Kernel) fireFinish(ctx context.Context, p *Process, typedOut any) {
 	}
 }
 
-// abortFinal notifies buffered spawn observers that the commit did not happen
-// and returns the (possibly nil) error unchanged.
+// abortFinal notifies buffered spawn OnCommit callbacks that the commit did not
+// happen and returns the (possibly nil) error unchanged.
 func (k *Kernel) abortFinal(sys *syscalls, err error) error {
 	if sys != nil {
 		cause := err

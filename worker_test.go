@@ -355,20 +355,27 @@ func TestChildrenWakeup(t *testing.T) {
 }
 
 // hookRepo wraps a Repository so a test can force a precise interleaving: onApply
-// fires just before each Apply; onGet can fail a GetProcess.
+// fires just before each Apply; failApply can reject one outright; onGet can fail
+// a GetProcess.
 type hookRepo struct {
 	agentkit.Repository
-	mu      sync.Mutex
-	onApply func(cs agentkit.ChangeSet)
-	onGet   func(pid agentkit.ProcessID) error
+	mu        sync.Mutex
+	onApply   func(cs agentkit.ChangeSet)
+	failApply func(cs agentkit.ChangeSet) error
+	onGet     func(pid agentkit.ProcessID) error
 }
 
 func (h *hookRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
 	h.mu.Lock()
-	fn := h.onApply
+	fn, fail := h.onApply, h.failApply
 	h.mu.Unlock()
 	if fn != nil {
 		fn(cs)
+	}
+	if fail != nil {
+		if err := fail(cs); err != nil {
+			return err
+		}
 	}
 	return h.Repository.Apply(ctx, cs)
 }
@@ -386,6 +393,12 @@ func (h *hookRepo) GetProcess(ctx context.Context, pid agentkit.ProcessID) (*age
 }
 
 func (h *hookRepo) setApply(fn func(agentkit.ChangeSet)) { h.mu.Lock(); h.onApply = fn; h.mu.Unlock() }
+
+func (h *hookRepo) setFailApply(fn func(agentkit.ChangeSet) error) {
+	h.mu.Lock()
+	h.failApply = fn
+	h.mu.Unlock()
+}
 
 // #1: a Cancel racing a claim must NOT be lost. Between Cancel's read (pending)
 // and its finalize Apply, a worker claims the Process (running, new LeaseToken).
@@ -559,7 +572,8 @@ type finishOut struct {
 // on the Process cannot reconstruct the value. A handler that nonetheless sees
 // Text must have received what Done was given, not a decode of Process.Output.
 type finishStrategy struct {
-	step func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[finishOut], error)
+	step      func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[finishOut], error)
+	encodeErr error
 }
 
 func (*finishStrategy) Version() int { return 1 }
@@ -575,7 +589,12 @@ func (s *finishStrategy) Step(ctx context.Context, sys agentkit.Syscalls, st scr
 	return s.step(ctx, sys, st)
 }
 
-func (*finishStrategy) EncodeOutput(finishOut) ([]byte, error) { return []byte("opaque"), nil }
+func (s *finishStrategy) EncodeOutput(finishOut) ([]byte, error) {
+	if s.encodeErr != nil {
+		return nil, s.encodeErr
+	}
+	return []byte("opaque"), nil
+}
 
 func (*finishStrategy) EncodeState(st scriptState) ([]byte, error) { return json.Marshal(st) }
 
@@ -587,14 +606,14 @@ func (*finishStrategy) DecodeState(_ int, raw []byte) (scriptState, error) {
 
 type finishStepFn = func(context.Context, agentkit.Syscalls, scriptState) (scriptState, agentkit.Decision[finishOut], error)
 
-// recorder collects what the completion handler was given.
-type recorder struct {
+// finishRecorder collects what the completion handler was given.
+type finishRecorder struct {
 	mu      sync.Mutex
 	calls   int
 	results []agentkit.FinishResult[finishOut]
 }
 
-func (r *recorder) handler(_ context.Context, _ agentkit.ProcessID, res agentkit.FinishResult[finishOut]) error {
+func (r *finishRecorder) handler(_ context.Context, _ agentkit.ProcessID, res agentkit.FinishResult[finishOut]) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
@@ -602,7 +621,7 @@ func (r *recorder) handler(_ context.Context, _ agentkit.ProcessID, res agentkit
 	return nil
 }
 
-func (r *recorder) snapshot() (int, []agentkit.FinishResult[finishOut]) {
+func (r *finishRecorder) snapshot() (int, []agentkit.FinishResult[finishOut]) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.calls, append([]agentkit.FinishResult[finishOut](nil), r.results...)
@@ -628,7 +647,7 @@ func finishDoneStep(text string) finishStepFn {
 
 func TestFinishHandlerOnDone(t *testing.T) {
 	ctx := context.Background()
-	var rec recorder
+	var rec finishRecorder
 	k, repo, ag := setupFinish(t, finishDoneStep("the answer"), rec.handler)
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
@@ -650,7 +669,7 @@ func TestFinishHandlerOnDone(t *testing.T) {
 
 func TestFinishHandlerOnFail(t *testing.T) {
 	ctx := context.Background()
-	var rec recorder
+	var rec finishRecorder
 	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[finishOut], error) {
 		return st, agentkit.Fail[finishOut](agentkit.FailureStrategyError, "nope"), nil
 	}
@@ -673,7 +692,7 @@ func TestFinishHandlerOnFail(t *testing.T) {
 // must still reach the handler.
 func TestFinishHandlerOnLimitExceeded(t *testing.T) {
 	ctx := context.Background()
-	var rec recorder
+	var rec finishRecorder
 	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[finishOut], error) {
 		if _, err := sys.Generate(c, []gollem.Input{gollem.Text(st.Seed)}); err != nil {
 			return st, agentkit.Decision[finishOut]{}, err
@@ -811,7 +830,7 @@ func TestFinishHandlerAbsentForUnknownAgent(t *testing.T) {
 	ctx := context.Background()
 	repo := memory.New()
 	reg := agentkit.NewRegistry()
-	var rec recorder
+	var rec finishRecorder
 	ag, err := agentkit.Register(reg, "main", 1, &finishStrategy{step: finishDoneStep("ok")},
 		agentkit.WithOnFinish(rec.handler))
 	gt.NoError(t, err)
@@ -836,7 +855,7 @@ func TestFinishHandlerAbsentForUnknownAgent(t *testing.T) {
 func TestFinishHandlerFiresOncePerProcessUnderConcurrency(t *testing.T) {
 	ctx := context.Background()
 	const n = 12
-	var rec recorder
+	var rec finishRecorder
 	k, repo, ag := setupFinish(t, finishDoneStep("ok"), rec.handler)
 
 	pids := make([]agentkit.ProcessID, 0, n)
@@ -887,5 +906,37 @@ func TestFinishHandlerFiresOncePerProcessUnderConcurrency(t *testing.T) {
 	for _, res := range results {
 		gt.Value(t, res.Status).Equal(agentkit.ProcessSucceeded)
 		gt.NotNil(t, res.Output)
+	}
+}
+
+// EncodeOutput runs in the worker after the Step middleware chain, so its
+// failure is a transition error: the Process never reaches a terminal state on
+// that attempt and the handler is not called.
+func TestEncodeOutputErrorFailsTheTransition(t *testing.T) {
+	ctx := context.Background()
+	var rec finishRecorder
+
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1,
+		&finishStrategy{step: finishDoneStep("ok"), encodeErr: gollemErr("cannot encode")},
+		agentkit.WithOnFinish(rec.handler))
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+
+	// Retries are exhausted rather than the Process succeeding with no output.
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	gt.Nil(t, p.Output)
+
+	// The handler still fires for the failed terminal, but never for a success.
+	_, results := rec.snapshot()
+	for _, res := range results {
+		gt.Value(t, res.Status).NotEqual(agentkit.ProcessSucceeded)
 	}
 }

@@ -101,10 +101,13 @@ func (outStrat) DecodeState(_ int, raw []byte) (bindState, error) {
 	return st, err
 }
 
-func TestBindStrategyStepEncodesOutput(t *testing.T) {
+// The step closure only erases the Decision. Encoding happens after the Step
+// middleware chain (a middleware may replace the Decision and cannot encode),
+// so a Done leaves the step closure with its typed value and no bytes.
+func TestBindStrategyStepErasesDecision(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("Done encodes the output and keeps the typed value", func(t *testing.T) {
+	t.Run("Done carries the typed value and no bytes yet", func(t *testing.T) {
 		calls := 0
 		b := agentkit.BindStrategy(outStrat{
 			encodeCalls: &calls,
@@ -115,15 +118,13 @@ func TestBindStrategyStepEncodesOutput(t *testing.T) {
 		_, d, err := b.StepForTest(ctx, nil, bindState{V: 1})
 		gt.NoError(t, err)
 		gt.Value(t, d.Kind).Equal(agentkit.DecisionDone)
-		gt.Value(t, string(d.Output)).Equal(`{"text":"hi"}`)
 		gt.Value(t, d.Typed).Equal(bindOut{Text: "hi"})
-		gt.Value(t, calls).Equal(1)
+		gt.Nil(t, d.Output)
+		gt.Value(t, calls).Equal(0)
 	})
 
-	t.Run("a non-Done decision never calls EncodeOutput", func(t *testing.T) {
-		calls := 0
+	t.Run("a non-Done decision carries no output at all", func(t *testing.T) {
 		b := agentkit.BindStrategy(outStrat{
-			encodeCalls: &calls,
 			step: func(bindState) (agentkit.Decision[bindOut], error) {
 				return agentkit.Continue[bindOut](), nil
 			},
@@ -133,20 +134,41 @@ func TestBindStrategyStepEncodesOutput(t *testing.T) {
 		gt.Value(t, d.Kind).Equal(agentkit.DecisionContinue)
 		gt.Nil(t, d.Output)
 		gt.Nil(t, d.Typed)
-		gt.Value(t, calls).Equal(0)
 	})
 
-	t.Run("EncodeOutput error aborts the transition", func(t *testing.T) {
+	t.Run("a state of the wrong type is a discriminable error", func(t *testing.T) {
 		b := agentkit.BindStrategy(outStrat{
-			encodeErr: gollemErr("boom"),
 			step: func(bindState) (agentkit.Decision[bindOut], error) {
-				return agentkit.Done(bindOut{Text: "hi"}), nil
+				return agentkit.Continue[bindOut](), nil
 			},
 		})
-		_, d, err := b.StepForTest(ctx, nil, bindState{V: 1})
+		_, _, err := b.StepForTest(ctx, nil, "not a bindState")
+		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
+	})
+}
+
+func TestBindStrategyEncodeOutput(t *testing.T) {
+	t.Run("encodes the typed output", func(t *testing.T) {
+		calls := 0
+		b := agentkit.BindStrategy(outStrat{encodeCalls: &calls})
+		raw, err := b.EncodeOutputForTest(bindOut{Text: "hi"})
+		gt.NoError(t, err)
+		gt.Value(t, string(raw)).Equal(`{"text":"hi"}`)
+		gt.Value(t, calls).Equal(1)
+	})
+
+	t.Run("propagates the strategy's error", func(t *testing.T) {
+		b := agentkit.BindStrategy(outStrat{encodeErr: gollemErr("boom")})
+		_, err := b.EncodeOutputForTest(bindOut{Text: "hi"})
 		gt.Error(t, err)
-		gt.Value(t, d.Kind).Equal(agentkit.DecisionKind(""))
-		gt.Nil(t, d.Typed)
+	})
+
+	t.Run("an output of the wrong type is a discriminable error", func(t *testing.T) {
+		// Reachable because a Step middleware can swap in another agent's
+		// Decision; it must not surface as a panic.
+		b := agentkit.BindStrategy(outStrat{})
+		_, err := b.EncodeOutputForTest("not a bindOut")
+		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
 	})
 }
 

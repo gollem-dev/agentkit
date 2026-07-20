@@ -52,15 +52,42 @@ func Suspend[O any](specs ...AwaitSpec) Decision[O] {
 	return Decision[O]{kind: DecisionSuspend, awaits: specs}
 }
 
-// decision is the type-erased form of Decision[O], carried through the worker.
-// output is what gets persisted to Process.Output; typed is the same value
-// before encoding, handed to the finish handler so no decode is needed.
+// decision is the type-erased form of Decision[O], carried through the worker
+// and the Step middleware chain, which know nothing of O. typed is the value
+// Done received; the worker turns it into output via the binding's
+// encodeOutput once the chain has settled on a Decision, and hands the same
+// typed value to a completion handler so no decode is needed.
 type decision struct {
 	kind    DecisionKind
 	output  []byte
-	typed   any // non-nil only when kind == DecisionDone.
+	typed   any
+	hasOut  bool // true only for Done; typed alone cannot say so for a nil-able O.
 	failure *Failure
 	awaits  []AwaitSpec
+}
+
+// erase drops O so the worker and the middleware chain can carry the Decision.
+func (d Decision[O]) erase() decision {
+	e := decision{kind: d.kind, failure: d.failure, awaits: d.awaits, hasOut: d.hasOut}
+	if d.hasOut {
+		e.typed = d.out
+	}
+	return e
+}
+
+// restore is erase's inverse, for a middleware reading the Decision back out.
+// ok is false when the erased Decision was produced for a different O.
+func restore[O any](e decision) (Decision[O], bool) {
+	d := Decision[O]{kind: e.kind, failure: e.failure, awaits: e.awaits}
+	if !e.hasOut {
+		return d, true
+	}
+	out, ok := e.typed.(O)
+	if !ok {
+		return Decision[O]{}, false
+	}
+	d.out, d.hasOut = out, true
+	return d, true
 }
 
 // AwaitSpec is a declared wait. It can only be built via the constructors

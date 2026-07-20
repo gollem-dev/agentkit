@@ -25,6 +25,11 @@ func (b StrategyBinding) StepForTest(ctx context.Context, sys Syscalls, st any) 
 	return state, DecisionView{Kind: d.kind, Output: d.output, Typed: d.typed, Failure: d.failure, Awaits: d.awaits}, err
 }
 
+// EncodeOutputForTest drives the erased output encoder.
+func (b StrategyBinding) EncodeOutputForTest(typedOut any) ([]byte, error) {
+	return b.encodeOutput(typedOut)
+}
+
 // FinishForTest drives the erased finish closure.
 func (b StrategyBinding) FinishForTest(ctx context.Context, pid ProcessID, status ProcessStatus, typedOut any, f *Failure) error {
 	return b.finish(ctx, pid, status, typedOut, f)

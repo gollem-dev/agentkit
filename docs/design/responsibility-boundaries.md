@@ -19,8 +19,9 @@ exists to name them.
 | Data formats round-trip correctly | **caller / strategy author** | the kernel never parses caller data |
 | Tenant isolation | **application** | the kernel has no tenancy concept |
 | Cost limits | **application** (`Limiter`) | pricing is not kernel knowledge |
-| Audit durability before an action | **tool author** | observers are best-effort |
+| Audit durability before an action | **tool author** | middleware runs inline and is not a journal |
 | Event delivery to channels | **application** | delivery couples to the store |
+| Follow-up work after a run that must not be lost | **strategy author** (a parent process) | a completion handler runs after the commit, so a crash can drop it |
 
 ## Idempotency belongs to tool authors
 
@@ -64,9 +65,14 @@ A strategy can ask a human before acting, by suspending on a question and
 resuming on the answer (ADR-0008). This is genuinely useful and it is genuinely
 not a security control.
 
-The kernel has no approval gate. A strategy that skips the question and calls
-`Syscalls.CallTool` is not stopped, because `Syscalls` is a gateway, not a
-privilege boundary — the strategy runs in the same address space as the kernel.
+The kernel has no approval gate. A `ToolCallMiddleware` *can* refuse a call
+fail-closed — unlike the audit-only mechanism this codebase used to have, it
+runs before the tool and sees a refused call — so it is a real chokepoint for
+calls made through `Syscalls.CallTool`. But it is not the only path to a tool:
+a strategy holding a `gollem.Tool` value can call `Run` on it directly, which
+runs in the same address space as the kernel and passes through no gateway at
+all. A middleware registered on the Kernel is therefore not a privilege
+boundary, and must never be described as one ([ADR-0012](../adr/0012-kernel-hooks-are-composable-middleware.md)).
 
 A hard allow/deny decision goes **inside the tool**:
 
@@ -80,11 +86,12 @@ func (t *deployTool) Run(ctx context.Context, args map[string]any) (map[string]a
 ```
 
 Wrap the tools your `ToolFactory` returns and the check cannot be routed around,
-because there is no path to the effect that does not pass through `Run`.
+because there is no path to the effect — through `Syscalls.CallTool` or
+directly — that does not pass through `Run`.
 
-The same reasoning applies to audit: an `Observer` cannot stop anything and its
-records are not persisted by the framework (ADR-0012). If something must be
-durably recorded *before* it happens, record it in `Run`, before the effect.
+The same reasoning applies to audit: middleware is not persisted by the
+framework and is not a journal (ADR-0012). If something must be durably
+recorded *before* it happens, record it in `Run`, before the effect.
 
 ## Metadata is data, not a credential
 
@@ -106,9 +113,11 @@ Beyond the above:
   recorded in state.
 - **`Step` must not block.** Waiting is expressed by suspending on an await, not
   by sleeping. A blocked `Step` holds a claim and a lease.
-- **`Init` must be pure.** It gets no context and no syscalls — structurally,
-  there is no path to an effect — and it runs synchronously inside `Spawn`, so
-  its error surfaces to the caller instead of becoming an asynchronous failure.
+- **`Init` must be pure.** It gets no context and no syscalls, so the strategy
+  author has structurally no path to an effect here (whoever configures the
+  Kernel can still wrap it with `InitMiddleware`, which does get a `ctx`). It
+  runs synchronously inside `Spawn`, so its error surfaces to the caller
+  instead of becoming an asynchronous failure.
 - **`DecodeState` owns migration.** It receives the version that wrote the bytes.
   Old checkpoints exist in production; refusing to read them strands processes.
 - **Bound the LLM work per transition.** One `Generate` per transition means a
@@ -121,7 +130,7 @@ Beyond the above:
   suite is unverified, however plausible it looks.
 - **Keep the `Limiter` cheap.** It runs before every effect and at every
   transition boundary.
-- **Keep observers non-blocking and duplicate-tolerant.** They run inline and
-  fire on replays.
+- **Keep middleware non-blocking and duplicate-tolerant.** It runs inline on
+  the transition path and fires on replays.
 - **Ship events yourself.** They are written durably and in order; delivering
   them to Slack, a queue, or anywhere else is the application's job.

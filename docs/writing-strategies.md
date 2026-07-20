@@ -136,9 +136,13 @@ case "finalize": return s.finalize(ctx, sys, st)  // one
 
 ### 4. `Init` is pure
 
-No context, no syscalls — the signature makes effects impossible. It runs
-synchronously inside `Spawn`, so validate the input there and return an error;
-the caller gets it directly instead of discovering a `failed` process later.
+No context, no syscalls — the signature gives you, the strategy author, no
+path to an effect. (Whoever configures the `Kernel` can still wrap `Init` with
+an `InitMiddleware`, which does receive a `ctx` — see
+[observability.md](observability.md) — but that is a decision made outside
+your strategy.) `Init` runs synchronously inside `Spawn`, so validate the input
+here and return an error; the caller gets it directly instead of discovering a
+`failed` process later.
 
 ### 5. `DecodeState` owns migration
 
