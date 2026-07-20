@@ -349,6 +349,10 @@ touches the outside world; it is short and it is the part people get wrong.
 
 ## Documentation
 
+- [examples/](./examples/) — six runnable programs, one per idea. They are a
+  separate module, so the LLM SDK they need stays out of this one's dependency
+  graph, and they work offline: `cd examples && go run ./quickstart` needs no
+  credentials.
 - [docs/](./docs/) — guides: execution model, getting started, concepts, writing
   strategies, tools, persistence, observability.
 - [docs/design/](./docs/design/) — architecture, process lifecycle, consistency

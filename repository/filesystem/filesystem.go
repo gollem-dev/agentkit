@@ -64,6 +64,8 @@ func New(dir string) (*Repository, error) {
 	if err != nil {
 		return nil, goerr.Wrap(err, "open lock file", goerr.V("dir", dir))
 	}
+	// #nosec G115 -- Fd() returns a file descriptor as a uintptr and the syscall
+	// wrapper takes an int; a descriptor is small and this cannot overflow.
 	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		if cerr := lockFile.Close(); cerr != nil {
 			err = errors.Join(err, cerr)
@@ -108,6 +110,7 @@ func (r *Repository) Close() error {
 		return nil
 	}
 	var errs []error
+	// #nosec G115 -- see the note in New; a file descriptor cannot overflow int.
 	if err := unix.Flock(int(r.lock.Fd()), unix.LOCK_UN); err != nil {
 		errs = append(errs, err)
 	}
@@ -291,6 +294,7 @@ func removeAndClose(f *os.File, tmp string, cause error) error {
 // closeWith closes the lock file (joining any error) while returning cause; used
 // on New's error paths.
 func closeWith(lockFile *os.File, cause error) error {
+	// #nosec G115 -- see the note in New; a file descriptor cannot overflow int.
 	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_UN); err != nil {
 		cause = errors.Join(cause, err)
 	}

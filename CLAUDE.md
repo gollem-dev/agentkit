@@ -71,7 +71,17 @@ agentkit/                  root package: kernel + every port definition
   repository/filesystem/   reference impl (single process, one snapshot file)
   repository/repotest/     the Repository contract, executable
   repository/internal/store/  shared state machine behind the two references
+
+examples/                  a SEPARATE module (its own go.mod, replace ../)
+  internal/demo/           live-or-stub model, and a Process poll helper
+  quickstart/ tools/ human-in-the-loop/ durable-worker/ fanout/ middleware/
 ```
+
+`examples/` is a second module on purpose: it needs an LLM provider's SDK, and
+that dependency must not reach anyone who imports agentkit. The cost is that
+`./...` from the root does not cover it — CI runs test, lint and gosec inside
+`examples/` separately, and those steps are the only thing keeping the examples
+compiling against the current API.
 
 The root package is flat on purpose — a layered split creates an import cycle
 ([ADR-0002](docs/adr/0002-flat-root-package.md)). File names carry the structure.
