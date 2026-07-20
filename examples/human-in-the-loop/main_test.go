@@ -21,7 +21,7 @@ func offline(t *testing.T) {
 	t.Setenv(demo.LocationEnv, "")
 }
 
-func TestRunActsOnApproval(t *testing.T) {
+func TestRunProceedsOnApproval(t *testing.T) {
 	offline(t)
 
 	var out bytes.Buffer
@@ -30,8 +30,8 @@ func TestRunActsOnApproval(t *testing.T) {
 	got := out.String()
 	gt.String(t, got).Contains("status:   succeeded")
 	gt.String(t, got).Contains("approved: true")
-	// The work only happens after the answer arrives.
-	gt.String(t, got).Contains("The snapshot has been deleted.")
+	// The strategy only reaches the model once the answer has arrived.
+	gt.String(t, got).Contains("Approved by an operator")
 }
 
 func TestRunStopsOnRefusal(t *testing.T) {
@@ -44,7 +44,42 @@ func TestRunStopsOnRefusal(t *testing.T) {
 	gt.String(t, got).Contains("approved: false")
 	gt.String(t, got).Contains("refused by user:alice")
 	// A refusal must not reach the model at all.
-	gt.String(t, got).NotContains("The snapshot has been deleted.")
+	gt.String(t, got).NotContains("Approved by an operator")
+}
+
+// TestRefusalCostsNothing pins the same claim to a metric rather than to the
+// stub's wording, so it still means something when the script changes.
+func TestRefusalCostsNothing(t *testing.T) {
+	offline(t)
+
+	ctx := context.Background()
+	model, _, err := demo.NewLLM(ctx, demo.Turn{Texts: []string{"should never be generated"}})
+	gt.NoError(t, err)
+
+	reg := agentkit.NewRegistry()
+	approver, err := agentkit.Register(reg, agentName, 1, &strategy{deadline: confirmDeadline})
+	gt.NoError(t, err)
+
+	k, err := agentkit.New(memory.New(), model, reg)
+	gt.NoError(t, err)
+
+	pid, err := approver.Spawn(ctx, k, input{Request: "drop the old snapshot"})
+	gt.NoError(t, err)
+
+	serveCtx, stop := context.WithCancel(ctx)
+	served := make(chan error, 1)
+	go func() {
+		served <- k.Serve(serveCtx, agentkit.WithPollInterval(20*time.Millisecond))
+	}()
+	defer func() { stop(); <-served }()
+
+	_, err = demo.WaitProcess(ctx, k, pid, demo.Waiting, 30*time.Second)
+	gt.NoError(t, err)
+	gt.NoError(t, k.Respond(ctx, pid, confirmKey, []byte("no")))
+
+	proc, err := demo.WaitProcess(ctx, k, pid, demo.Terminal, time.Minute)
+	gt.NoError(t, err)
+	gt.Number(t, proc.Metrics[agentkit.MetricLLMCalls]).Equal(0)
 }
 
 func TestRunEmitsTheApprovalRequest(t *testing.T) {

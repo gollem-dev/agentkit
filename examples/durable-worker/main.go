@@ -265,7 +265,9 @@ func runWork(ctx context.Context, w io.Writer, dir string, pid agentkit.ProcessI
 	go func() { served <- k.Serve(serveCtx, serveOpts...) }()
 
 	// A process left running by a dead worker only becomes claimable once its
-	// lease expires, so the first resume waits out demoLease.
+	// lease expires. The lease was set when the dead worker claimed it, so what
+	// is left to wait out is whatever remains of it -- at most demoLease, and
+	// nothing at all if enough time has already passed.
 	proc, waitErr := demo.WaitProcess(ctx, k, pid, demo.Terminal, 2*time.Minute)
 	stop()
 	<-served

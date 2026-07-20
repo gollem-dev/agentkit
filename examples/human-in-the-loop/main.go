@@ -1,13 +1,21 @@
 // Command human-in-the-loop implements a Strategy that stops and asks a person
-// before it acts, then resumes from the answer.
+// before it proceeds, then resumes from the answer.
 //
-// The Process parks in `waiting` with a durable question on it. Nothing is held
-// in memory in the meantime: the answer can arrive minutes later, from another
-// process, and a different worker can pick the work up.
+// The Process parks in `waiting` and the question goes into the Repository. The
+// strategy keeps no goroutine, no stack and no live handle while it waits: the
+// state that resumes it is entirely in the store. How long that survives is the
+// Repository's business, not the kernel's -- this example uses `memory`, so it
+// lasts exactly as long as the program. Back it with a shared store and the
+// answer can come from another process on another host, which is what
+// examples/durable-worker demonstrates.
 //
-// This is a confirmation, not a security gate. Nothing stops a strategy from
-// calling a tool without asking first -- a hard allow/deny decision belongs
-// inside the tool's Run (see examples/tools).
+// What happens on approval here is a generated line of text, not a deployment
+// or a delete: the effect belongs in a tool, along with the idempotency and
+// authorization a tool owes you (see examples/tools).
+//
+// And this is a confirmation, not a security gate. Nothing stops a strategy
+// from calling a tool without asking first -- a hard allow/deny decision has to
+// live inside the tool's Run, where there is no path around it.
 //
 // Run it with `go run ./examples/human-in-the-loop`, or with `-answer no`.
 package main
@@ -111,8 +119,11 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 			st.Note = refusalNote(aw.RespondedBy)
 			return done(st, output{Approved: false, Note: st.Note})
 		}
+		// Only reached once a human said yes. A real strategy would call the
+		// tool that does the work here; this one drafts the note an operator
+		// would file, so the example stays about the wait and not the effect.
 		res, err := sys.Generate(ctx, []gollem.Input{
-			gollem.Text("Confirm in one line that this was carried out: " + st.Request),
+			gollem.Text("Write one line for the change log describing this approved action: " + st.Request),
 		})
 		if err != nil {
 			return st, agentkit.Decision{}, err
@@ -167,7 +178,7 @@ func main() {
 
 func run(ctx context.Context, w io.Writer, request, answer string) error {
 	model, live, err := demo.NewLLM(ctx, demo.Turn{
-		Texts: []string{"Done. The snapshot has been deleted."},
+		Texts: []string{"Approved by an operator: the stale staging snapshot is scheduled for deletion."},
 	})
 	if err != nil {
 		return goerr.Wrap(err, "new llm")
@@ -198,7 +209,9 @@ func run(ctx context.Context, w io.Writer, request, answer string) error {
 	defer func() { stop(); <-served }()
 
 	// The Process parks itself; the operator side finds it by looking for open
-	// questions rather than by holding a handle to anything.
+	// questions in the store rather than by holding a handle to anything. That
+	// indirection is what lets the two halves be separate programs when the
+	// Repository is a shared one.
 	if _, err := demo.WaitProcess(ctx, k, pid, demo.Waiting, 30*time.Second); err != nil {
 		return goerr.Wrap(err, "wait for the question")
 	}

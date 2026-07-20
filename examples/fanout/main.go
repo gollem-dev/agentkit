@@ -3,8 +3,9 @@
 //
 // Two things are worth watching. Children are inserted as part of the parent's
 // transition commit, so a crash never leaves an orphan or a duplicate. And the
-// planner, the task workers and the summarizer are separate model roles, which
-// is how you point a cheap model at the tasks and a stronger one at the plan.
+// planner and the summarizer are bound to named model roles while the task
+// workers use the kernel's default model, which is how you point a stronger
+// model at planning and a cheaper one at the tasks.
 //
 // Run it with `go run ./examples/fanout`.
 package main
@@ -52,9 +53,11 @@ func run(ctx context.Context, w io.Writer, goal string) error {
 
 // newFanout wires the models, the two agents and the kernel.
 //
-// The planner, the summarizer and the task workers each get their own client.
-// Offline that also keeps the scripts deterministic: children run in parallel,
-// so a single shared script would be replayed in an unpredictable order.
+// Three clients: one bound to planexec.RolePlanner, one to RoleSummarizer, and
+// one passed positionally to New as the default that everything else -- here,
+// the task workers -- resolves to. Offline that separation also keeps the
+// scripts deterministic, since children run in parallel and a single shared
+// script would be replayed in an unpredictable order.
 func newFanout(ctx context.Context, w io.Writer, maxLLMCalls int) (*agentkit.Kernel, agentkit.Agent[planexec.Input], error) {
 	var none agentkit.Agent[planexec.Input]
 
@@ -109,10 +112,15 @@ func newFanout(ctx context.Context, w io.Writer, maxLLMCalls int) (*agentkit.Ker
 	// are that Process's own -- committed plus what this run has accumulated --
 	// so this caps the planner and each child separately. A budget for the whole
 	// tree has to be your own accounting, keyed by proc.RootID.
+	//
+	// The comparison is >= because the limiter runs *before* the call it is
+	// deciding about: at maxLLMCalls calls already spent, the next one is the
+	// one over the line.
 	budget := func(_ context.Context, proc *agentkit.Process, m agentkit.Metrics) error {
-		if m[agentkit.MetricLLMCalls] > int64(maxLLMCalls) {
+		if m[agentkit.MetricLLMCalls] >= int64(maxLLMCalls) {
 			return goerr.New("llm call budget exhausted",
-				goerr.V("process", proc.ID), goerr.V("calls", m[agentkit.MetricLLMCalls]))
+				goerr.V("process", proc.ID), goerr.V("calls", m[agentkit.MetricLLMCalls]),
+				goerr.V("budget", maxLLMCalls))
 		}
 		return nil
 	}

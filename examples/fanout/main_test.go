@@ -88,26 +88,50 @@ func TestChildrenBelongToTheParentTree(t *testing.T) {
 
 // TestBudgetStopsAProcessAtATransitionBoundary drives the limiter's own
 // terminal path: the check that runs before each transition finalizes the
-// Process itself.
+// Process itself. A budget of zero trips at the very first boundary, before any
+// call is made.
 func TestBudgetStopsAProcessAtATransitionBoundary(t *testing.T) {
-	_, proc := execute(t, 1)
+	_, proc := execute(t, 0)
 
 	gt.Value(t, proc.Status).Equal(agentkit.ProcessFailed)
 	gt.NotNil(t, proc.Failure)
 	gt.Value(t, proc.Failure.Code).Equal(agentkit.FailureLimitExceeded)
 }
 
-// TestBudgetRefusesToSpawnChildren covers the other path. A budget already
-// exhausted when the planner tries to fan out surfaces as ErrLimitExceeded to
-// the strategy, and planexec turns a failed spawn into a deterministic
-// strategy_error rather than retrying it.
+// TestBudgetRefusesToSpawnChildren covers the other path. A budget exhausted
+// mid-transition surfaces as ErrLimitExceeded to the strategy, and planexec
+// turns a failed spawn into a deterministic strategy_error rather than
+// retrying it.
 func TestBudgetRefusesToSpawnChildren(t *testing.T) {
-	_, proc := execute(t, 0)
+	_, proc := execute(t, 1)
 
 	gt.Value(t, proc.Status).Equal(agentkit.ProcessFailed)
 	gt.NotNil(t, proc.Failure)
 	gt.Value(t, proc.Failure.Code).Equal(agentkit.FailureStrategyError)
 	gt.String(t, proc.Failure.Message).Contains("budget exhausted")
+}
+
+// TestBudgetIsNeverExceeded is the assertion that matters: the cap is a cap,
+// not "a cap plus one". The limiter runs before each call, so a Process must
+// never end up having made more calls than its budget allows.
+func TestBudgetIsNeverExceeded(t *testing.T) {
+	for _, budget := range []int{0, 1, 2, 3} {
+		k, proc := execute(t, budget)
+
+		gt.Number(t, proc.Metrics[agentkit.MetricLLMCalls]).LessOrEqual(int64(budget))
+
+		// Children carry their own budget, and it binds them too.
+		var out planexec.Output
+		if proc.Status != agentkit.ProcessSucceeded {
+			continue
+		}
+		gt.NoError(t, json.Unmarshal(proc.Output, &out))
+		for _, task := range out.Tasks {
+			child, err := k.GetProcess(context.Background(), task.ProcessID)
+			gt.NoError(t, err)
+			gt.Number(t, child.Metrics[agentkit.MetricLLMCalls]).LessOrEqual(int64(budget))
+		}
+	}
 }
 
 func TestRunSurfacesAFailedProcess(t *testing.T) {
@@ -116,7 +140,7 @@ func TestRunSurfacesAFailedProcess(t *testing.T) {
 	var out bytes.Buffer
 	// The budget trips mid-run, so the example reports the failure rather than
 	// printing a summary it does not have.
-	err := runWith(context.Background(), &out, "should we adopt this?", 1)
+	err := runWith(context.Background(), &out, "should we adopt this?", 0)
 	gt.Error(t, err)
 	gt.String(t, out.String()).Contains(string(agentkit.FailureLimitExceeded))
 }

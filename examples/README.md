@@ -69,6 +69,13 @@ Two obligations are on display:
   `Run` is the only path to the effect, so it is the only place a refusal
   cannot be routed around.
 
+Only half of the first one is shown here, and the example says so: the key is
+the part a tool author writes, but the store that key is checked against has to
+outlive the worker. This one is a map in memory, so a replay coming from a
+different process after a crash would deploy a second time. In a real system
+that is the deploy API's own idempotency support, or a unique constraint in a
+database — hence the `deployments` interface the tool depends on.
+
 The output reports two tool calls but only one deployment: the kernel meters the
 attempt, not the outcome. A tool's error is returned to the strategy, not fatal
 to the Process.
@@ -84,9 +91,18 @@ answers it.
 go run ./examples/human-in-the-loop -answer no
 ```
 
-The Process parks in `waiting` with a durable question on it. Nothing is kept in
-memory in the meantime — the answer could arrive minutes later, from another
-process, and a different worker could resume the work. Refusing skips the action
+The Process parks in `waiting` and the question goes into the Repository. The
+strategy holds no goroutine, no stack and no live handle while it waits — the
+state that resumes it is entirely in the store, which is why the answer can
+arrive long after the transition that asked for it.
+
+How long "long" can be is the Repository's business, not the kernel's. This
+example uses `memory`, so the question lives exactly as long as the program.
+Back it with a shared store and the two halves can be separate programs on
+separate hosts; `durable-worker` shows that split.
+
+What approval leads to here is a generated line of text, not a deletion. The
+effect belongs in a tool, with the obligations `tools` covers. Refusing skips it
 entirely, which the metrics confirm: no LLM call happens at all.
 
 This is a *confirmation, not a security gate*. Nothing prevents a strategy from
@@ -112,10 +128,12 @@ so that round runs again on resume — the committed sequence number after the
 crash shows one fewer round than the LLM was asked for. That is at-least-once
 execution, and it is the reason a side-effecting tool has to be idempotent.
 
-The first resume waits a few seconds: a Process left `running` by a dead worker
-only becomes claimable once its lease expires. The lease here is shortened to 5
-seconds for the demo; a real deployment sets it well above how long one
-transition takes.
+The resume may pause before it picks the work up: a Process left `running` by a
+dead worker only becomes claimable once its lease expires. That lease started
+when the dead worker claimed it, so what is left to wait out is whatever remains
+of it — at most the 5 seconds this demo uses, and nothing at all if you spent
+longer than that reading the `status` output. A real deployment sets the lease
+well above how long one transition takes.
 
 The store is `repository/filesystem`, which holds an exclusive lock on its
 directory, so these commands run one at a time. It is a single-process reference
@@ -131,14 +149,20 @@ The children are inserted as part of the parent's transition commit, so a crash
 between "decided to fan out" and "children exist" is not possible — either both
 happened or neither did.
 
-The planner, the summarizer and the task workers are separate model roles, which
-is how you point a stronger model at planning and a cheaper one at the tasks.
-Offline it also keeps the run deterministic, since children execute in parallel.
+The planner and the summarizer are bound to named model roles, and the task
+workers fall through to the kernel's default model — which is how you point a
+stronger model at planning and a cheaper one at the tasks. Offline, giving each
+its own client also keeps the run deterministic, since children execute in
+parallel and would otherwise race over one script.
 
 Note what the budget in this example does **not** do: a `Limiter` sees one
 Process's metrics, so it caps the planner and each child separately, not the
 tree as a whole. A tree-wide budget needs your own accounting keyed by
 `proc.RootID`.
+
+The comparison is `>=`, because the limiter runs *before* the call it is
+deciding about. With `>`, a budget of N would allow N+1 calls — an off-by-one
+that only shows up once someone relies on the number.
 
 See [bundled-strategies.md](../docs/bundled-strategies.md) and
 [observability.md](../docs/observability.md).
