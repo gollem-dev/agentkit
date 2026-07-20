@@ -207,7 +207,11 @@ func run(ctx context.Context, w io.Writer, request, answer string) error {
 	go func() {
 		served <- k.Serve(serveCtx, agentkit.WithPollInterval(20*time.Millisecond))
 	}()
-	defer func() { stop(); <-served }()
+	// Deferred calls run last-registered-first, so stop() happens before the
+	// receive: cancelling is what makes Serve return, and only then is there
+	// anything to wait for.
+	defer func() { <-served }()
+	defer stop()
 
 	// The Process parks itself; the operator side finds it by looking for open
 	// questions in the store rather than by holding a handle to anything. That
