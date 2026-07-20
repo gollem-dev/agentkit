@@ -37,19 +37,13 @@ lease, and a wait queue — nothing more.
 - **Strategies included** — `strategy/simple` (LLM loop) and `strategy/planexec`
   (plan → parallel children → replan → finalize).
 
-### Why not just an in-memory loop?
+### Why not an in-memory loop?
 
-| When… | A plain `for` loop | agentkit |
-|---|---|---|
-| the process restarts mid-run | the run is lost | another worker resumes from the last committed transition |
-| the agent needs a human decision | you hold a goroutine/channel open and hope the pod lives | the `Process` suspends; `Respond` wakes it, possibly hours later on another host |
-| a run takes 10 minutes | it is tied to the caller's request/timeout | `Spawn` returns an id immediately; the caller polls or is notified |
-| you want 20 sub-tasks in parallel | you invent your own bookkeeping and joining | `SpawnChild` + a children await, committed atomically |
-| two replicas grab the same job | you build a distributed lock | claim + lease + CAS are part of the `Repository` contract |
-| a transition fails | you retry in place and lose context | the run is requeued with its attempt count on the `Process` |
-
-If your agent always finishes inside one request and losing it is acceptable, a
-plain loop is the right answer and you do not need this.
+An in-memory loop is fine until a run outlives the process holding it: a deploy,
+a ten-minute LLM step, a human who answers tomorrow. Then you need the run
+written down, resumable, and safe for several workers to share — which is what
+this is. If your agent finishes inside one request and losing it is acceptable,
+you do not need any of that.
 
 ## Quick start
 
