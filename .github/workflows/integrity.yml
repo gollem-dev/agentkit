@@ -1,0 +1,22 @@
+name: integrity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  invisible-chars:
+    name: invisible unicode chars
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: cicd-sensor
+        uses: cicd-sensor/cicd-sensor-action@6ee257338e68af2b279b321b3346fe5f385aa498 # v0.0.29
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Check for invisible / ambiguous Unicode characters
+        run: ./.github/scripts/check-invisible-chars.sh
