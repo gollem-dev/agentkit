@@ -161,3 +161,60 @@ func TestPlanExecEmptyPromptInitError(t *testing.T) {
 	gt.Error(t, err)
 	gt.Value(t, pid).Equal(agentkit.ProcessID(""))
 }
+
+// TestWithOnFinishDeliversTypedOutput checks the completion handler is wired
+// through planexec's own Option and receives the typed Output, while a child's
+// result still arrives at the parent as opaque bytes.
+func TestWithOnFinishDeliversTypedOutput(t *testing.T) {
+	ctx := context.Background()
+
+	planner := mockLLM(
+		jsonResponse(`{"tasks":[{"title":"Research","prompt":"research the topic"}]}`),
+		jsonResponse(`{"action":"finalize"}`),
+	)
+	summarizer := mockLLM(&gollem.Response{Texts: []string{"final"}, InputToken: 1, OutputToken: 1})
+	def := mockLLM(&gollem.Response{Texts: []string{"task complete"}, InputToken: 1, OutputToken: 1})
+
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	task, err := simple.Register(reg, "task", 1)
+	gt.NoError(t, err)
+
+	var mu sync.Mutex
+	var got []agentkit.FinishResult[planexec.Output]
+
+	plan, err := planexec.Register(reg, "planner", 1, task,
+		func(spec planexec.TaskSpec) (simple.Input, error) {
+			return simple.Input{Prompt: spec.Prompt}, nil
+		},
+		planexec.WithOnFinish(func(_ context.Context, _ agentkit.ProcessID, res agentkit.FinishResult[planexec.Output]) error {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, res)
+			return nil
+		}))
+	gt.NoError(t, err)
+
+	k, err := agentkit.New(repo, def, reg,
+		agentkit.WithModelRole(planexec.RolePlanner, planner),
+		agentkit.WithModelRole(planexec.RoleSummarizer, summarizer),
+	)
+	gt.NoError(t, err)
+
+	pid, err := plan.Spawn(ctx, k, planexec.Input{Prompt: "write a report"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, isTerminal, agentkit.WithConcurrency(4))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// The task children also finish, but only the planner has a handler.
+	gt.Array(t, got).Length(1)
+	gt.Value(t, got[0].Status).Equal(agentkit.ProcessSucceeded)
+	gt.NotNil(t, got[0].Output)
+	gt.Array(t, got[0].Output.Summary).Equal([]string{"final"})
+	gt.Array(t, got[0].Output.Tasks).Length(1)
+	// A child's output reaches the parent as bytes, not as a decoded type.
+	gt.Number(t, len(got[0].Output.Tasks[0].Output)).Greater(0)
+}

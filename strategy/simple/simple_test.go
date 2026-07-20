@@ -162,3 +162,37 @@ func TestSimpleRegisterVersionPropagates(t *testing.T) {
 	gt.NoError(t, err)
 	gt.Value(t, p.StateVersion).Equal(3)
 }
+
+func TestWithOnFinishDeliversTypedOutput(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(&gollem.Response{Texts: []string{"done"}})
+
+	var mu sync.Mutex
+	var got []agentkit.FinishResult[simple.Output]
+
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	assistant, err := simple.Register(reg, "assistant", 1,
+		simple.WithOnFinish(func(_ context.Context, _ agentkit.ProcessID, res agentkit.FinishResult[simple.Output]) error {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, res)
+			return nil
+		}))
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := assistant.Spawn(ctx, k, simple.Input{Prompt: "hello"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Array(t, got).Length(1)
+	gt.Value(t, got[0].Status).Equal(agentkit.ProcessSucceeded)
+	gt.NotNil(t, got[0].Output)
+	gt.Array(t, got[0].Output.Texts).Equal([]string{"done"})
+}

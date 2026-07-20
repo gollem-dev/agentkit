@@ -12,25 +12,34 @@ const (
 	DecisionFail     DecisionKind = "fail"
 )
 
-// Decision is the result of one transition. The kernel only nil-checks the
-// user data (Output); it never touches the content.
-type Decision struct {
-	Kind    DecisionKind
-	Output  []byte      // Done: the output (encoding is the strategy author's).
-	Failure *Failure    // Fail.
-	Awaits  []AwaitSpec // Suspend: the declared waits.
+// Decision is the result of one transition, carrying the strategy's output
+// type O. Its fields are unexported: it can only be built by Continue,
+// Suspend, Fail or Done, so a Done without an output cannot be constructed.
+//
+// Go infers a type argument from a call's arguments only, never from the
+// return or assignment context. Done therefore infers O from its argument,
+// while Continue/Suspend/Fail need it written out: agentkit.Continue[MyOut]().
+type Decision[O any] struct {
+	kind    DecisionKind
+	out     O           // Done: the typed output.
+	hasOut  bool        // true only for Done.
+	failure *Failure    // Fail.
+	awaits  []AwaitSpec // Suspend: the declared waits.
 }
 
 // Continue advances to the next transition.
-func Continue() Decision { return Decision{Kind: DecisionContinue} }
+func Continue[O any]() Decision[O] { return Decision[O]{kind: DecisionContinue} }
 
-// Done finalizes the Process as succeeded with the given output. The kernel
-// only checks that output is non-nil (E9); the format is the author's.
-func Done(output []byte) Decision { return Decision{Kind: DecisionDone, Output: output} }
+// Done finalizes the Process as succeeded with the given output. The value is
+// turned into the persisted bytes by the strategy's EncodeOutput, and the same
+// value is handed to a completion handler without a round trip (ADR-0014).
+func Done[O any](output O) Decision[O] {
+	return Decision[O]{kind: DecisionDone, out: output, hasOut: true}
+}
 
 // Fail finalizes the Process as failed.
-func Fail(code FailureCode, message string) Decision {
-	return Decision{Kind: DecisionFail, Failure: &Failure{Code: code, Message: message}}
+func Fail[O any](code FailureCode, message string) Decision[O] {
+	return Decision[O]{kind: DecisionFail, failure: &Failure{Code: code, Message: message}}
 }
 
 // Suspend is a checkpoint that declares waits. specs are upserted on the
@@ -39,8 +48,61 @@ func Fail(code FailureCode, message string) Decision {
 // time and no WaitChildren elision applies, the transition errors with
 // ErrSuspendWithoutAwait. Re-declaring a non-open key is a no-op (idempotent
 // re-execution after a restart).
-func Suspend(specs ...AwaitSpec) Decision {
-	return Decision{Kind: DecisionSuspend, Awaits: specs}
+func Suspend[O any](specs ...AwaitSpec) Decision[O] {
+	return Decision[O]{kind: DecisionSuspend, awaits: specs}
+}
+
+// typedOutput carries O across the erasure boundary.
+//
+// Storing the value bare in an `any` would not do. When O is an interface type
+// and the value is nil, `any(d.out)` is a nil interface, which asserts back to
+// nothing — not even to `any` — so a legitimate Done(nil) would become an
+// output-type mismatch. A bare value also leaves a Decision that carries no
+// output with no witness of O at all, which would make restore's "belongs to
+// another O" answer unknowable. The envelope fixes both: it is always present,
+// and its own type is the witness.
+type typedOutput[O any] struct{ value O }
+
+// decision is the type-erased form of Decision[O], carried through the worker
+// and the Step middleware chain, which know nothing of O. typed holds the value
+// Done received; the worker turns it into output via the binding's
+// encodeOutput once the chain has settled on a Decision, and hands the same
+// value to a completion handler so no decode is needed.
+type decision struct {
+	kind    DecisionKind
+	output  []byte
+	typed   any  // always a typedOutput[O]; the zero decision has none.
+	hasOut  bool // true only for Done; typed is present either way.
+	failure *Failure
+	awaits  []AwaitSpec
+}
+
+// erase drops O so the worker and the middleware chain can carry the Decision.
+func (d Decision[O]) erase() decision {
+	return decision{
+		kind:    d.kind,
+		failure: d.failure,
+		awaits:  d.awaits,
+		hasOut:  d.hasOut,
+		typed:   typedOutput[O]{value: d.out},
+	}
+}
+
+// restore is erase's inverse, for a middleware reading the Decision back out.
+// ok is false when the erased Decision was produced for a different O — for
+// every kind, not only for Done.
+func restore[O any](e decision) (Decision[O], bool) {
+	env, ok := e.typed.(typedOutput[O])
+	if !ok {
+		return Decision[O]{}, false
+	}
+	return Decision[O]{
+		kind:    e.kind,
+		failure: e.failure,
+		awaits:  e.awaits,
+		out:     env.value,
+		hasOut:  e.hasOut,
+	}, true
 }
 
 // AwaitSpec is a declared wait. It can only be built via the constructors

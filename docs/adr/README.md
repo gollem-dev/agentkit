@@ -26,6 +26,7 @@ change.
 | [0011](0011-kernel-has-no-tenancy.md) | The kernel has no tenancy concept |
 | [0012](0012-kernel-hooks-are-composable-middleware.md) | Kernel hooks are composable middleware |
 | [0013](0013-os-metaphor-naming.md) | OS-metaphor naming |
+| [0014](0014-completion-handlers-are-best-effort.md) | Completion handlers are best-effort and bound at registration |
 
 ## How to write one
 

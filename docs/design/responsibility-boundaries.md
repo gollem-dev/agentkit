@@ -21,6 +21,7 @@ exists to name them.
 | Cost limits | **application** (`Limiter`) | pricing is not kernel knowledge |
 | Audit durability before an action | **tool author** | middleware runs inline and is not a journal |
 | Event delivery to channels | **application** | delivery couples to the store |
+| Follow-up work after a run that must not be lost | **strategy author** (a parent process) | a completion handler runs after the commit, so a crash can drop it |
 
 ## Idempotency belongs to tool authors
 

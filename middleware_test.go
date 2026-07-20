@@ -83,20 +83,20 @@ func setupParentChild(t *testing.T, model gollem.LLMClient, opts ...agentkit.Ker
 	repo := memory.New()
 	reg := agentkit.NewRegistry()
 	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
-		step: func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		step: func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 			return st, agentkit.Done([]byte(st.Seed)), nil
 		},
 	})
 	gt.NoError(t, err)
 
-	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if st.N == 0 {
 			id, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"})
 			if e != nil {
-				return st, agentkit.Decision{}, e
+				return st, agentkit.Decision[[]byte]{}, e
 			}
 			st.N = 1
-			return st, agentkit.Suspend(agentkit.WaitChildren("kids", id)), nil
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kids", id)), nil
 		}
 		return st, agentkit.Done([]byte("done")), nil
 	}
@@ -316,10 +316,10 @@ func TestStepMiddlewareObservesStateAndDecision(t *testing.T) {
 	rec := &recorder{}
 
 	// Two transitions: N=0 -> Continue, N=1 -> Done.
-	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if st.N == 0 {
 			st.N = 1
-			return st, agentkit.Continue(), nil
+			return st, agentkit.Continue[[]byte](), nil
 		}
 		return st, agentkit.Done([]byte("fin")), nil
 	}
@@ -332,7 +332,7 @@ func TestStepMiddlewareObservesStateAndDecision(t *testing.T) {
 			}
 			out, _ := agentkit.ResultState[scriptState](res)
 			rec.add(fmt.Sprintf("seq=%d in=%d out=%d dec=%s",
-				req.Effect.StateSeq, in.N, out.N, res.Decision.Kind))
+				req.Effect.StateSeq, in.N, out.N, agentkit.DecisionKindOf(res)))
 			return res, nil
 		}
 	}
@@ -364,7 +364,7 @@ func TestStepMiddlewareOrder(t *testing.T) {
 			}
 		}
 	}
-	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		rec.add("base")
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -383,9 +383,9 @@ func TestStepMiddlewareReplacesState(t *testing.T) {
 	model, _ := mockLLM(textResponse("x"))
 
 	var seenSecond int
-	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if st.N < 99 {
-			return st, agentkit.Continue(), nil
+			return st, agentkit.Continue[[]byte](), nil
 		}
 		seenSecond = st.N
 		return st, agentkit.Done([]byte("ok")), nil
@@ -419,7 +419,7 @@ func TestStepMiddlewareShortCircuit(t *testing.T) {
 	model, _ := mockLLM(textResponse("x"))
 
 	stepCalls := 0
-	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		stepCalls++
 		return st, agentkit.Done([]byte("strategy")), nil
 	}
@@ -456,9 +456,9 @@ func TestStepMiddlewareWrapsSyscalls(t *testing.T) {
 	tool, toolCalls, _ := countingTool("t")
 	wrapped := &int32Box{}
 
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, err := sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "t", Arguments: map[string]any{}}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -489,8 +489,8 @@ func TestStepMiddlewareRerunsOnUncommittedTransition(t *testing.T) {
 	model, _ := mockLLM(textResponse("x"))
 	calls := &int32Box{}
 
-	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
-		return st, agentkit.Suspend(), nil
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Suspend[[]byte](), nil
 	}
 	mw := func(next agentkit.StepHandler) agentkit.StepHandler {
 		return func(c context.Context, req *agentkit.StepRequest) (*agentkit.StepResult, error) {
@@ -520,11 +520,11 @@ func TestStepMiddlewareRejectsSecondNext(t *testing.T) {
 	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: doneStep()})
 	gt.NoError(t, err)
 	// Spawn a child, then fail — the classic "retry the step" shape.
-	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"}); e != nil {
-			return st, agentkit.Decision{}, e
+			return st, agentkit.Decision[[]byte]{}, e
 		}
-		return st, agentkit.Decision{}, gollemErr("transient")
+		return st, agentkit.Decision[[]byte]{}, gollemErr("transient")
 	}
 	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
 	gt.NoError(t, err)
@@ -658,7 +658,7 @@ func TestStepMiddlewareNilSys(t *testing.T) {
 	ctx := context.Background()
 	model, _ := mockLLM(textResponse("x"))
 
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		_, err := sys.Generate(c, []gollem.Input{gollem.Text("go")})
 		return st, agentkit.Done([]byte("ok")), err
 	}
@@ -691,9 +691,9 @@ func TestGenerateMiddlewareOrder(t *testing.T) {
 			}
 		}
 	}
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -719,9 +719,9 @@ func TestGenerateMiddlewareRewritesRole(t *testing.T) {
 			return next(c, req)
 		}
 	}
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -747,9 +747,9 @@ func TestGenerateMiddlewareUnknownRoleFallsBack(t *testing.T) {
 			return next(c, req)
 		}
 	}
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -774,9 +774,9 @@ func TestGenerateMiddlewareRetriesNext(t *testing.T) {
 			return next(c, req)
 		}
 	}
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -800,9 +800,9 @@ func TestToolCallMiddlewareRewritesRequest(t *testing.T) {
 			return next(c, req)
 		}
 	}
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, err := sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "t", Arguments: map[string]any{"x": "given"}}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -831,7 +831,7 @@ func TestToolCallMiddlewareShortCircuit(t *testing.T) {
 		}
 	}
 	var got error
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		_, got = sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "t", Arguments: map[string]any{}})
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -862,7 +862,7 @@ func TestToolCallMiddlewareRewritesToUnknownTool(t *testing.T) {
 		}
 	}
 	var got error
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		_, got = sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "t", Arguments: map[string]any{}})
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -906,7 +906,7 @@ func TestMiddlewareObservesLimitExceeded(t *testing.T) {
 		}
 		return gollemErr("over budget")
 	}
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		_, _ = sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "t", Arguments: map[string]any{}})
 		return st, agentkit.Done([]byte("ok")), nil
 	}
@@ -1011,11 +1011,11 @@ func TestSpawnOnCommitFiresOnAbortedTransition(t *testing.T) {
 	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: doneStep()})
 	gt.NoError(t, err)
 	// Spawn a child and then Suspend with no await: buildCommit rejects it.
-	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"}); e != nil {
-			return st, agentkit.Decision{}, e
+			return st, agentkit.Decision[[]byte]{}, e
 		}
-		return st, agentkit.Suspend(), nil
+		return st, agentkit.Suspend[[]byte](), nil
 	}
 	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
 	gt.NoError(t, err)
@@ -1063,9 +1063,9 @@ func TestSpawnOnCommitOnTerminalTransition(t *testing.T) {
 	gt.NoError(t, err)
 	// Spawn and finish in the same transition: this commits through
 	// commitTerminal, not buildCommit.
-	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"}); e != nil {
-			return st, agentkit.Decision{}, e
+			return st, agentkit.Decision[[]byte]{}, e
 		}
 		return st, agentkit.Done([]byte("done")), nil
 	}
@@ -1116,9 +1116,9 @@ func TestSpawnOnCommitOnApplyFailure(t *testing.T) {
 
 	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: doneStep()})
 	gt.NoError(t, err)
-	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"}); e != nil {
-			return st, agentkit.Decision{}, e
+			return st, agentkit.Decision[[]byte]{}, e
 		}
 		return st, agentkit.Done([]byte("done")), nil
 	}
@@ -1267,7 +1267,7 @@ func TestMiddlewareReturningNil(t *testing.T) {
 	t.Run("generate handler", func(t *testing.T) {
 		model, _ := mockLLM(textResponse("x"))
 		var got error
-		step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 			_, got = sys.Generate(c, []gollem.Input{gollem.Text("go")})
 			return st, agentkit.Done([]byte("ok")), nil
 		}
@@ -1343,7 +1343,7 @@ func TestMiddlewarePanicFailsProcess(t *testing.T) {
 
 	t.Run("generate", func(t *testing.T) {
 		model, _ := mockLLM(textResponse("x"))
-		step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+		step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 			_, err := sys.Generate(c, []gollem.Input{gollem.Text("go")})
 			return st, agentkit.Done([]byte("ok")), err
 		}
@@ -1446,12 +1446,12 @@ func TestMiddlewareAuditTrail(t *testing.T) {
 	var genEC, toolEC, stepEC []agentkit.EffectContext
 	var initAgents []agentkit.AgentName
 
-	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision, error) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		if _, err := sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "t", Arguments: map[string]any{}}); err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("ok")), nil
 	}

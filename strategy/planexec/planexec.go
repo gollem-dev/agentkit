@@ -62,6 +62,7 @@ type config struct {
 	systemPrompt     string
 	maxRounds        int
 	maxParallelTasks int
+	registerOpts     []agentkit.RegisterOption[Output]
 }
 
 // WithSystemPrompt sets the system prompt for planner/summarizer Generates. Default: "".
@@ -73,6 +74,14 @@ func WithMaxRounds(n int) Option { return func(c *config) { c.maxRounds = n } }
 // WithMaxParallelTasks caps tasks per round (reflected as the plan schema maxItems).
 // Default: 5.
 func WithMaxParallelTasks(n int) Option { return func(c *config) { c.maxParallelTasks = n } }
+
+// WithOnFinish wires a completion handler for this agent. Delivery is
+// best-effort; see agentkit.WithOnFinish.
+func WithOnFinish(h agentkit.FinishHandler[Output]) Option {
+	return func(c *config) {
+		c.registerOpts = append(c.registerOpts, agentkit.WithOnFinish(h))
+	}
+}
 
 // Register builds and registers the planexec strategy. It is generic over the
 // task agent's input type T: makeInput adapts each planned TaskSpec into the
@@ -97,7 +106,7 @@ func Register[T any](r *agentkit.Registry, name agentkit.AgentName, version int,
 		systemPrompt:     cfg.systemPrompt,
 		maxRounds:        cfg.maxRounds,
 		maxParallelTasks: cfg.maxParallelTasks,
-	})
+	}, cfg.registerOpts...)
 }
 
 const (
@@ -139,7 +148,7 @@ func (s *strategy[T]) Init(in Input) (state, error) {
 	return state{Phase: phasePlan, Round: 1, Prompt: in.Prompt}, nil
 }
 
-func (s *strategy[T]) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision, error) {
+func (s *strategy[T]) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[Output], error) {
 	switch st.Phase {
 	case phasePlan:
 		return s.stepPlan(ctx, sys, st)
@@ -150,7 +159,7 @@ func (s *strategy[T]) Step(ctx context.Context, sys agentkit.Syscalls, st state)
 	case phaseFinalize:
 		return s.stepFinalize(ctx, sys, st)
 	default:
-		return st, agentkit.Decision{}, goerr.New("unknown phase", goerr.V("phase", st.Phase))
+		return st, agentkit.Decision[Output]{}, goerr.New("unknown phase", goerr.V("phase", st.Phase))
 	}
 }
 
@@ -160,13 +169,13 @@ type planResult struct {
 
 // stepPlan generates the task list, spawns a child per task, and suspends on the
 // children. E24: one in-transition correction Generate on a JSON parse failure.
-func (s *strategy[T]) stepPlan(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision, error) {
+func (s *strategy[T]) stepPlan(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[Output], error) {
 	input := []gollem.Input{gollem.Text(s.planPrompt(st))}
 	opts := s.plannerOptions(st, s.planSchema())
 
 	res, err := sys.Generate(ctx, input, opts...)
 	if err != nil {
-		return st, agentkit.Decision{}, err
+		return st, agentkit.Decision[Output]{}, err
 	}
 	var pr planResult
 	if perr := parseJSON(res.Texts, &pr); perr != nil {
@@ -177,10 +186,10 @@ func (s *strategy[T]) stepPlan(ctx context.Context, sys agentkit.Syscalls, st st
 		corr = append(corr, gollem.Text("Your previous response was not valid JSON matching the required schema. Respond ONLY with the JSON object, no prose."))
 		res2, err2 := sys.Generate(ctx, corr, opts...)
 		if err2 != nil {
-			return st, agentkit.Decision{}, err2
+			return st, agentkit.Decision[Output]{}, err2
 		}
 		if perr2 := parseJSON(res2.Texts, &pr); perr2 != nil {
-			return st, agentkit.Fail(agentkit.FailureStrategyError, "plan JSON parse failed after correction: "+perr2.Error()), nil
+			return st, agentkit.Fail[Output](agentkit.FailureStrategyError, "plan JSON parse failed after correction: "+perr2.Error()), nil
 		}
 		res = res2
 	}
@@ -189,7 +198,7 @@ func (s *strategy[T]) stepPlan(ctx context.Context, sys agentkit.Syscalls, st st
 	if len(pr.Tasks) == 0 {
 		// Nothing to run this round; let the planner decide continue/finalize.
 		st.Phase = phaseReplan
-		return st, agentkit.Continue(), nil
+		return st, agentkit.Continue[Output](), nil
 	}
 
 	var ids []agentkit.ProcessID
@@ -197,27 +206,27 @@ func (s *strategy[T]) stepPlan(ctx context.Context, sys agentkit.Syscalls, st st
 	for _, spec := range pr.Tasks {
 		in, merr := s.makeInput(spec)
 		if merr != nil {
-			return st, agentkit.Fail(agentkit.FailureStrategyError, "makeInput: "+merr.Error()), nil
+			return st, agentkit.Fail[Output](agentkit.FailureStrategyError, "makeInput: "+merr.Error()), nil
 		}
 		// E23: an unregistered task agent yields ErrUnknownAgent here; surface it as
 		// a deterministic strategy_error rather than a retry loop.
 		id, serr := s.taskAgent.SpawnChild(ctx, sys, in)
 		if serr != nil {
-			return st, agentkit.Fail(agentkit.FailureStrategyError, "spawn task: "+serr.Error()), nil
+			return st, agentkit.Fail[Output](agentkit.FailureStrategyError, "spawn task: "+serr.Error()), nil
 		}
 		ids = append(ids, id)
 		st.Current = append(st.Current, TaskResult{Title: spec.Title, ProcessID: id, Status: agentkit.ProcessPending})
 	}
 	st.RoundKey = agentkit.AwaitKey(fmt.Sprintf("tasks:%d", st.Round))
 	st.Phase = phaseCollect
-	return st, agentkit.Suspend(agentkit.WaitChildren(st.RoundKey, ids...)), nil
+	return st, agentkit.Suspend[Output](agentkit.WaitChildren(st.RoundKey, ids...)), nil
 }
 
 // stepCollect folds the finished children into the accumulated task results.
-func (s *strategy[T]) stepCollect(sys agentkit.Syscalls, st state) (state, agentkit.Decision, error) {
+func (s *strategy[T]) stepCollect(sys agentkit.Syscalls, st state) (state, agentkit.Decision[Output], error) {
 	aw, ok := sys.Await(st.RoundKey)
 	if !ok || aw.Status != agentkit.AwaitResponded {
-		return st, agentkit.Decision{}, goerr.New("children await not responded", goerr.V("key", st.RoundKey))
+		return st, agentkit.Decision[Output]{}, goerr.New("children await not responded", goerr.V("key", st.RoundKey))
 	}
 	byID := make(map[agentkit.ProcessID]agentkit.ChildResult, len(aw.Results))
 	for _, r := range aw.Results {
@@ -232,7 +241,7 @@ func (s *strategy[T]) stepCollect(sys agentkit.Syscalls, st state) (state, agent
 	}
 	st.Current = nil
 	st.Phase = phaseReplan
-	return st, agentkit.Continue(), nil
+	return st, agentkit.Continue[Output](), nil
 }
 
 type replanResult struct {
@@ -240,13 +249,13 @@ type replanResult struct {
 }
 
 // stepReplan asks the planner whether to iterate or finalize.
-func (s *strategy[T]) stepReplan(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision, error) {
+func (s *strategy[T]) stepReplan(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[Output], error) {
 	input := []gollem.Input{gollem.Text(s.replanPrompt(st))}
 	opts := s.plannerOptions(st, replanSchema())
 
 	res, err := sys.Generate(ctx, input, opts...)
 	if err != nil {
-		return st, agentkit.Decision{}, err
+		return st, agentkit.Decision[Output]{}, err
 	}
 	st.PlannerHistory = res.History
 
@@ -259,15 +268,15 @@ func (s *strategy[T]) stepReplan(ctx context.Context, sys agentkit.Syscalls, st 
 	}
 	if rr.Action == actionFinalize || st.Round >= s.maxRounds {
 		st.Phase = phaseFinalize
-		return st, agentkit.Continue(), nil
+		return st, agentkit.Continue[Output](), nil
 	}
 	st.Round++
 	st.Phase = phasePlan
-	return st, agentkit.Continue(), nil
+	return st, agentkit.Continue[Output](), nil
 }
 
 // stepFinalize summarizes the accumulated results into the Done output.
-func (s *strategy[T]) stepFinalize(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision, error) {
+func (s *strategy[T]) stepFinalize(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[Output], error) {
 	input := []gollem.Input{gollem.Text(s.finalizePrompt(st))}
 	opts := []agentkit.GenerateOption{agentkit.WithRole(RoleSummarizer)}
 	if s.systemPrompt != "" {
@@ -275,13 +284,9 @@ func (s *strategy[T]) stepFinalize(ctx context.Context, sys agentkit.Syscalls, s
 	}
 	res, err := sys.Generate(ctx, input, opts...)
 	if err != nil {
-		return st, agentkit.Decision{}, err
+		return st, agentkit.Decision[Output]{}, err
 	}
-	raw, merr := json.Marshal(Output{Summary: res.Texts, Tasks: st.Tasks})
-	if merr != nil {
-		return st, agentkit.Decision{}, goerr.Wrap(merr, "marshal output")
-	}
-	return st, agentkit.Done(raw), nil
+	return st, agentkit.Done(Output{Summary: res.Texts, Tasks: st.Tasks}), nil
 }
 
 func (s *strategy[T]) plannerOptions(st state, schema *gollem.Parameter) []agentkit.GenerateOption {
@@ -390,6 +395,8 @@ func parseJSON(texts []string, v any) error {
 }
 
 func (s *strategy[T]) EncodeState(st state) ([]byte, error) { return json.Marshal(st) }
+
+func (s *strategy[T]) EncodeOutput(out Output) ([]byte, error) { return json.Marshal(out) }
 
 func (s *strategy[T]) DecodeState(_ int, raw []byte) (state, error) {
 	var st state

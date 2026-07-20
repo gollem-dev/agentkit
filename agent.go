@@ -19,21 +19,67 @@ func NewRegistry() *Registry {
 	return &Registry{bindings: make(map[AgentName]StrategyBinding)}
 }
 
+// FinishResult is the terminal outcome handed to a completion handler.
+// Exactly one of Output / Failure is non-nil, or neither when cancelled.
+type FinishResult[O any] struct {
+	// Status is the committed terminal status: ProcessSucceeded, ProcessFailed
+	// or ProcessCancelled. Never a non-terminal status.
+	Status ProcessStatus
+	// Output is the value passed to Done. Non-nil if and only if
+	// Status == ProcessSucceeded.
+	Output *O
+	// Failure is the recorded failure. Non-nil if and only if
+	// Status == ProcessFailed.
+	Failure *Failure
+}
+
+// FinishHandler runs after a Process reaches a terminal state and that state
+// has been committed. Delivery is best-effort: it never fires twice, but a
+// crash between the commit and the call loses it entirely (ADR-0014).
+type FinishHandler[O any] func(ctx context.Context, pid ProcessID, res FinishResult[O]) error
+
+// RegisterOption configures Register.
+type RegisterOption[O any] func(*registerConfig[O])
+
+type registerConfig[O any] struct {
+	onFinish    FinishHandler[O]
+	onFinishSet bool // distinguishes "not given" from "given as nil".
+}
+
+// WithOnFinish wires a completion handler for this agent. The handler runs
+// synchronously on whichever instance committed the terminal transition, after
+// the commit succeeded; its error and panic are logged and change nothing. A
+// nil handler yields ErrInvalidAgentDef.
+func WithOnFinish[O any](h FinishHandler[O]) RegisterOption[O] {
+	return func(c *registerConfig[O]) { c.onFinish, c.onFinishSet = h, true }
+}
+
 // Register registers a typed strategy and returns a typed handle carrying the
 // input type I (D26/D43: required args are positional; the old AgentDef struct
-// is gone). Empty name, version < 1, nil strategy, or a duplicate name yields
-// ErrInvalidAgentDef. Contract: complete all Register calls before Spawn/Serve.
-func Register[S, I any](r *Registry, name AgentName, version int, s Strategy[S, I]) (Agent[I], error) {
+// is gone). Empty name, version < 1, nil strategy, a nil completion handler, or
+// a duplicate name yields ErrInvalidAgentDef. Contract: complete all Register
+// calls before Spawn/Serve.
+//
+// The handle stays Agent[I]: O is consumed only by the completion handler, so
+// carrying it on the handle would make it a phantom type parameter.
+func Register[S, I, O any](r *Registry, name AgentName, version int, s Strategy[S, I, O], opts ...RegisterOption[O]) (Agent[I], error) {
 	if name == "" || version < 1 || any(s) == nil {
 		return Agent[I]{}, goerr.Wrap(ErrInvalidAgentDef, "name/version/strategy",
 			goerr.V("name", name), goerr.V("version", version))
+	}
+	var cfg registerConfig[O]
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if cfg.onFinishSet && cfg.onFinish == nil {
+		return Agent[I]{}, goerr.Wrap(ErrInvalidAgentDef, "nil finish handler", goerr.V("name", name))
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, dup := r.bindings[name]; dup {
 		return Agent[I]{}, goerr.Wrap(ErrInvalidAgentDef, "duplicate agent name", goerr.V("name", name))
 	}
-	r.bindings[name] = BindStrategy(s)
+	r.bindings[name] = BindStrategy(s, opts...)
 	return Agent[I]{name: name}, nil
 }
 

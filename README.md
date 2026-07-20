@@ -169,15 +169,20 @@ More in [docs/getting-started.md](./docs/getting-started.md).
 
 The whole runtime is five moving parts, in the order you meet them:
 
-1. **You write a `Strategy[S, I]`** — the agent's logic, cut into transitions.
-   `Init` builds the initial state purely; each `Step` makes *one* move and
-   returns a `Decision` (`Continue` / `Suspend` / `Done` / `Fail`). Because a
-   `Step` is the unit that gets checkpointed, "how much work per `Step`" is the
-   main design decision you make. `EncodeState`/`DecodeState` are yours; the
-   kernel only stores the resulting bytes and never looks inside them.
+1. **You write a `Strategy[S, I, O]`** — the agent's logic, cut into
+   transitions, over the state you checkpoint, the input that launches a run and
+   the output it produces. `Init` builds the initial state purely; each `Step`
+   makes *one* move and returns a `Decision[O]` (`Continue` / `Suspend` / `Done`
+   / `Fail`). Because a `Step` is the unit that gets checkpointed, "how much work
+   per `Step`" is the main design decision you make. `EncodeState`/`DecodeState`
+   and `EncodeOutput` are yours; the kernel only stores the resulting bytes and
+   never looks inside them.
 2. **`Register` hands back a typed `Agent[I]`** — the only way to spawn that
    agent, so the input type is checked at compile time and `any` never reaches
-   the public API.
+   the public API. `WithOnFinish` there wires a handler that receives the typed
+   `O` once a run's terminal state is committed; delivery is best-effort, so
+   anything that must not be lost belongs in a parent process instead
+   ([ADR-0014](docs/adr/0014-completion-handlers-are-best-effort.md)).
 3. **`Spawn` creates a `Process`** — one run, with its state, status, metrics and
    lease living in the `Repository`. It is asynchronous: the row is written, the
    id comes back, and nothing has executed yet.
@@ -270,14 +275,20 @@ must be durable *before* the action, record it inside the tool's `Run`.
 `req.OnCommit(fn)` to learn whether the child was actually persisted.
 
 **A kernel middleware runs across all agents, so it does not know any
-strategy's input or state type.** The type-erased payloads are read with
-`InitInput[I]` / `StepState[S]` / `SpawnInput[I]` and replaced by deriving a new
-request (`NewInitRequest` and friends); `ok == false` just means "another
-agent's Process — pass it through". Passing `any` as the type argument always
-succeeds and is the intended form for generic logging. Nothing here is checked
-by the compiler: a wrong type surfaces as `ErrInvalidRequest` at run time. That
-is the nature of a cross-cutting layer, and it is why typed manipulation of a
-payload is better placed in the strategy's own `Init`.
+strategy's input, state or output type.** The type-erased payloads are read with
+`InitInput[I]` / `StepState[S]` / `SpawnInput[I]` / `ResultState[S]` and
+replaced by deriving a new request (`NewInitRequest` and friends); `ok == false`
+just means "another agent's Process — pass it through". Passing `any` as the
+type argument always succeeds and is the intended form for generic logging.
+Nothing here is checked by the compiler: a wrong type surfaces as
+`ErrInvalidRequest` at run time. That is the nature of a cross-cutting layer, and
+it is why typed manipulation of a payload is better placed in the strategy's own
+`Init`.
+
+A `Decision` is the one payload with no `any` shortcut. It is boxed with a type
+witness so that a nil interface output is not lost across the boundary, which
+means `ResultDecision[O]` needs the agent's exact `O`; use `DecisionKindOf` to
+branch on continue/suspend/done/fail without naming it.
 
 See [ADR-0012](docs/adr/0012-kernel-hooks-are-composable-middleware.md) for why
 this replaced the observation-only `Observer` hooks, and

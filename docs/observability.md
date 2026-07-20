@@ -158,12 +158,16 @@ Properties to design around, all detailed in `middleware.go` and
   side if you need to.
 - **No static type safety over the type-erased payloads.** A kernel-level
   middleware runs across every agent, so it cannot know a particular strategy's
-  input or state type. Read one with `InitInput[I]` / `StepState[S]` /
-  `SpawnInput[I]` (or `[any]` to observe without knowing the type), and replace
-  one by deriving a new request (`NewInitRequest`, `NewStepRequest`,
-  `NewSpawnRequest`). A wrong type compiles and fails at run time with
-  `ErrInvalidRequest` — the nature of a cross-cutting layer, not a gap to work
-  around.
+  input, state or output type. Read one with `InitInput[I]` / `StepState[S]` /
+  `SpawnInput[I]` / `ResultState[S]` (or `[any]` to observe without knowing the
+  type), and replace one by deriving a new request (`NewInitRequest`,
+  `NewStepRequest`, `NewSpawnRequest`) or by building a `NewStepResult`. A wrong
+  type compiles and fails at run time with `ErrInvalidRequest` — the nature of a
+  cross-cutting layer, not a gap to work around.
+- **A Decision is the one payload with no `[any]` escape hatch.**
+  `ResultDecision[O]` needs the agent's exact output type, because a Decision
+  carries a type witness so that a nil interface output survives erasure. Use
+  `DecisionKindOf` to branch on continue/suspend/done/fail without naming `O`.
 - **A panic in middleware is not recovered by the chain.** Inside a transition
   the worker's own recovery turns it into a transition error and the Process
   retries; in `Init` it propagates to the `Spawn` caller.

@@ -85,19 +85,17 @@ func (s *strategy) Init(in input) (state, error) {
 	return state{Topic: in.Topic, Total: in.Rounds}, nil
 }
 
-func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision, error) {
+func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[output], error) {
 	if st.Done >= st.Total {
-		raw, err := json.Marshal(output{Notes: st.Notes})
-		if err != nil {
-			return st, agentkit.Decision{}, goerr.Wrap(err, "marshal output")
-		}
-		return st, agentkit.Done(raw), nil
+		// Done takes the typed output; EncodeOutput below turns it into the
+		// bytes stored on the Process.
+		return st, agentkit.Done(output{Notes: st.Notes}), nil
 	}
 
 	res, err := sys.Generate(ctx, []gollem.Input{gollem.Text(fmt.Sprintf(
 		"Round %d of %d on %q: give one short observation.", st.Done+1, st.Total, st.Topic))})
 	if err != nil {
-		return st, agentkit.Decision{}, err
+		return st, agentkit.Decision[output]{}, err
 	}
 	st.Notes = append(st.Notes, strings.Join(res.Texts, " "))
 	st.Done++
@@ -111,10 +109,12 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 
 	// One transition per round: the checkpoint between them is what makes the
 	// work resumable.
-	return st, agentkit.Continue(), nil
+	return st, agentkit.Continue[output](), nil
 }
 
 func (s *strategy) EncodeState(st state) ([]byte, error) { return json.Marshal(st) }
+
+func (s *strategy) EncodeOutput(out output) ([]byte, error) { return json.Marshal(out) }
 
 func (s *strategy) DecodeState(_ int, raw []byte) (state, error) {
 	var st state

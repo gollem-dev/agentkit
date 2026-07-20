@@ -119,7 +119,7 @@ func stepTrace(log *auditLog) agentkit.StepMiddleware {
 				return res, err
 			}
 			log.add("step      %-11s seq=%d -> %s (state readable: %t)",
-				req.Effect.Agent, req.Effect.StateSeq, res.Decision.Kind, ok)
+				req.Effect.Agent, req.Effect.StateSeq, agentkit.DecisionKindOf(res), ok)
 			return res, nil
 		}
 	}
@@ -244,14 +244,14 @@ func (s *coordinator) Init(in input) (state, error) {
 	return state{Topic: in.Topic, Phase: phaseSurvey}, nil
 }
 
-func (s *coordinator) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision, error) {
+func (s *coordinator) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[output], error) {
 	switch st.Phase {
 	case phaseSurvey:
 		res, err := sys.Generate(ctx,
 			[]gollem.Input{gollem.Text("What should we check about " + st.Topic + "?")},
 			agentkit.WithRole(roleCoordinator))
 		if err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[output]{}, err
 		}
 		st.Notes = append(st.Notes, res.Texts...)
 
@@ -271,7 +271,7 @@ func (s *coordinator) Step(ctx context.Context, sys agentkit.Syscalls, st state)
 		}
 
 		st.Phase = phaseSpawn
-		return st, agentkit.Continue(), nil
+		return st, agentkit.Continue[output](), nil
 
 	case phaseSpawn:
 		st.Children = st.Children[:0]
@@ -280,17 +280,17 @@ func (s *coordinator) Step(ctx context.Context, sys agentkit.Syscalls, st state)
 				Prompt: fmt.Sprintf("Write report %d about %s.", i+1, st.Topic),
 			})
 			if err != nil {
-				return st, agentkit.Fail(agentkit.FailureStrategyError, "spawn reporter: "+err.Error()), nil
+				return st, agentkit.Fail[output](agentkit.FailureStrategyError, "spawn reporter: "+err.Error()), nil
 			}
 			st.Children = append(st.Children, pid)
 		}
 		st.Phase = phaseCollect
-		return st, agentkit.Suspend(agentkit.WaitChildren(reportsKey, st.Children...)), nil
+		return st, agentkit.Suspend[output](agentkit.WaitChildren(reportsKey, st.Children...)), nil
 
 	case phaseCollect:
 		aw, ok := sys.Await(reportsKey)
 		if !ok || aw.Status != agentkit.AwaitResponded {
-			return st, agentkit.Decision{}, goerr.New("children await not responded",
+			return st, agentkit.Decision[output]{}, goerr.New("children await not responded",
 				goerr.V("key", reportsKey))
 		}
 		var reports []string
@@ -301,22 +301,20 @@ func (s *coordinator) Step(ctx context.Context, sys agentkit.Syscalls, st state)
 			}
 			var childOut simple.Output
 			if err := json.Unmarshal(r.Output, &childOut); err != nil {
-				return st, agentkit.Decision{}, goerr.Wrap(err, "decode child output")
+				return st, agentkit.Decision[output]{}, goerr.Wrap(err, "decode child output")
 			}
 			reports = append(reports, strings.Join(childOut.Texts, " "))
 		}
-		raw, err := json.Marshal(output{Notes: st.Notes, Reports: reports})
-		if err != nil {
-			return st, agentkit.Decision{}, goerr.Wrap(err, "marshal output")
-		}
-		return st, agentkit.Done(raw), nil
+		return st, agentkit.Done(output{Notes: st.Notes, Reports: reports}), nil
 
 	default:
-		return st, agentkit.Decision{}, goerr.New("unknown phase", goerr.V("phase", st.Phase))
+		return st, agentkit.Decision[output]{}, goerr.New("unknown phase", goerr.V("phase", st.Phase))
 	}
 }
 
 func (s *coordinator) EncodeState(st state) ([]byte, error) { return json.Marshal(st) }
+
+func (s *coordinator) EncodeOutput(out output) ([]byte, error) { return json.Marshal(out) }
 
 func (s *coordinator) DecodeState(_ int, raw []byte) (state, error) {
 	var st state

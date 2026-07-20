@@ -154,18 +154,22 @@ func NewStepRequest[S any](req *StepRequest, state S) *StepRequest {
 }
 
 // StepResult is what one Step produced: the next state and the Decision.
+//
+// Both are type-erased for the same reason: a kernel middleware runs across
+// every agent and knows neither S nor the strategy's output type O. Read them
+// with ResultState and ResultDecision, and build a replacement with
+// NewStepResult.
 type StepResult struct {
-	Decision Decision
-
 	state any // S.
+	dec   decision
 }
 
 // NewStepResult builds a result without calling next, i.e. it decides the
-// transition in place of the strategy. S is unchecked here (see
+// transition in place of the strategy. S and O are unchecked here (see
 // NewInitRequest); a mismatch surfaces as ErrInvalidRequest when the state is
-// encoded.
-func NewStepResult[S any](state S, dec Decision) *StepResult {
-	return &StepResult{Decision: dec, state: state}
+// encoded or the Done output is.
+func NewStepResult[S, O any](state S, dec Decision[O]) *StepResult {
+	return &StepResult{state: state, dec: dec.erase()}
 }
 
 // ResultState reads the post-transition state as S.
@@ -173,6 +177,22 @@ func ResultState[S any](res *StepResult) (S, bool) {
 	v, ok := res.state.(S)
 	return v, ok
 }
+
+// ResultDecision reads the Decision as Decision[O]. ok == false means the
+// result belongs to an agent whose output type is not O — for every kind, not
+// only for a Done.
+//
+// Unlike StepState and friends, O must be the agent's exact output type:
+// Decision carries its own type witness, so ResultDecision[any] does NOT match
+// an agent whose O is something else. To branch on what a transition decided
+// without naming O, use DecisionKindOf.
+func ResultDecision[O any](res *StepResult) (Decision[O], bool) {
+	return restore[O](res.dec)
+}
+
+// DecisionKindOf reports what a result decided without naming O, for a
+// middleware that only needs to branch on continue/suspend/done/fail.
+func DecisionKindOf(res *StepResult) DecisionKind { return res.dec.kind }
 
 // StepHandler runs one transition of a strategy.
 type StepHandler func(ctx context.Context, req *StepRequest) (*StepResult, error)

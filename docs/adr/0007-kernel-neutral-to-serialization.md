@@ -5,9 +5,10 @@
 agentkit contains no `json.Marshal` or `json.Unmarshal` of caller data. User
 payloads cross the API as `[]byte` and are stored verbatim; the kernel's only
 check is that they are non-nil. Strategy state is encoded and decoded by the
-strategy author via `EncodeState`/`DecodeState`, in whatever format they choose.
-Kernel-owned data lives in typed row fields, and turning a row into bytes is the
-`Repository` implementation's job.
+strategy author via `EncodeState`/`DecodeState`, and a strategy's output is
+encoded by `EncodeOutput`, in whatever format they choose. Kernel-owned data
+lives in typed row fields, and turning a row into bytes is the `Repository`
+implementation's job.
 
 Serialization therefore exists in exactly two places: the caller's own code, and
 the `Repository` implementation.
@@ -55,14 +56,22 @@ The bundled strategies choose JSON, but that is `strategy/simple` and
   call site, but agentkit ends up owning `encoding/json` semantics for caller
   types, which is the thing being avoided.
 - **An `Output` contract on the agent definition, validated by the kernel.**
-  Validation requires parsing, which requires knowing the format. Dropped.
+  Validation requires parsing, which requires knowing the format. Still
+  rejected. Note what this does *not* cover: `Strategy.EncodeOutput` turns the
+  value passed to `Done` into bytes, exactly as `EncodeState` does for state.
+  The kernel calls it and checks the result is non-nil; it never parses the
+  bytes and never judges their shape. Adding a kernel-side check of what is
+  *inside* those bytes is the thing that stays out.
 
 ## Consequences
 
 - Callers write their own `Marshal`/`Unmarshal`. This is deliberate friction: it
   keeps the failure at the caller's own call site where the types are visible.
-- `Done(output)` with a nil output is a transition error. Non-nil is the only
-  thing the kernel can meaningfully check.
+- `Done(output)` takes the typed output; `EncodeOutput` produces the bytes, and
+  a nil result is a transition error. Non-nil is the only thing the kernel can
+  meaningfully check. There is no `DecodeOutput`, because nothing reads those
+  bytes back as a type: a completion handler is handed the value `Done` received
+  (ADR-0014) and a parent treats a child's `Output` as opaque bytes.
 - A `Repository` may store `State`/`Output` as `bytea`, base64 in JSON, or a
   blob reference — the kernel never inspects them.
 - Cross-version state reads are `DecodeState`'s problem, and version bumps are
@@ -75,3 +84,4 @@ The bundled strategies choose JSON, but that is `strategy/simple` and
 | Date | Change |
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D36, D39, D40, D41, D42). |
+| 2026-07-20 | `Done` now takes the typed output and `Strategy.EncodeOutput` produces the bytes (ADR-0014). The decision is unchanged — the kernel still marshals nothing and parses nothing — so the rejected "Output contract validated by the kernel" was clarified to say what it does and does not cover. |

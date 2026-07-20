@@ -83,14 +83,49 @@ proc, err := kernel.GetProcess(ctx, pid)
 // proc.Failure — the code and message, when failed
 ```
 
-`Output` is whatever bytes the strategy passed to `Done` — agentkit never parses
-it (see [ADR-0007](adr/0007-kernel-neutral-to-serialization.md)). The bundled
-strategies use JSON:
+`Output` is whatever the strategy's `EncodeOutput` produced — agentkit never
+parses it (see [ADR-0007](adr/0007-kernel-neutral-to-serialization.md)). The
+bundled strategies use JSON:
 
 ```go
 var out simple.Output
 if err := json.Unmarshal(proc.Output, &out); err != nil { ... }
 ```
+
+## Being told when a run finishes
+
+Polling is not the only option. Wire a handler at registration and it runs once
+the terminal state is committed, with the output already typed:
+
+```go
+agent, err := simple.Register(reg, "assistant", 1,
+    simple.WithOnFinish(func(ctx context.Context, pid agentkit.ProcessID,
+        res agentkit.FinishResult[simple.Output]) error {
+        switch res.Status {
+        case agentkit.ProcessSucceeded:
+            return post(ctx, res.Output.Texts)
+        case agentkit.ProcessFailed:
+            return alert(ctx, res.Failure.Code, res.Failure.Message)
+        default: // cancelled
+            return nil
+        }
+    }),
+)
+```
+
+Two things to know before you build on it.
+
+**Delivery is best-effort.** The handler never fires twice, but if the worker
+dies between committing the terminal state and calling it, nothing retries and
+it never fires at all. If the follow-up work must not be lost, model it as a
+parent process waiting on `WaitChildren` instead — every step there is part of a
+committed transition. See
+[ADR-0014](adr/0014-completion-handlers-are-best-effort.md).
+
+**It runs synchronously, on whichever instance committed the transition.** A
+slow handler delays that worker's next claim, so keep it short or hand off. For
+a `cancelled` process the committing instance is whoever called `Cancel`, which
+is usually your application rather than a worker.
 
 ## Answering a question
 

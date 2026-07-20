@@ -18,6 +18,10 @@ type myInput struct {
     Prompt string
 }
 
+type myOutput struct {
+    Answer string `json:"answer"`
+}
+
 type myStrategy struct {
     systemPrompt string
 }
@@ -31,7 +35,7 @@ func (s *myStrategy) Init(in myInput) (myState, error) {
     return myState{Prompt: in.Prompt, Phase: "start"}, nil
 }
 
-func (s *myStrategy) Step(ctx context.Context, sys agentkit.Syscalls, st myState) (myState, agentkit.Decision, error) {
+func (s *myStrategy) Step(ctx context.Context, sys agentkit.Syscalls, st myState) (myState, agentkit.Decision[myOutput], error) {
     // ... one transition ...
 }
 
@@ -46,13 +50,35 @@ func (s *myStrategy) DecodeState(version int, raw []byte) (myState, error) {
     }
     return st, nil
 }
+
+func (s *myStrategy) EncodeOutput(out myOutput) ([]byte, error) {
+    return json.Marshal(out)
+}
 ```
 
-Register it, and keep the handle:
+Register it, and keep the handle. The three type parameters are inferred from
+the strategy:
 
 ```go
-agent, err := agentkit.Register[myState, myInput](reg, "my-agent", 1, &myStrategy{})
+agent, err := agentkit.Register(reg, "my-agent", 1, &myStrategy{})
 pid, err := agent.Spawn(ctx, kernel, myInput{Prompt: "..."})
+```
+
+To react when a run finishes, wire a handler at registration. It receives the
+value you passed to `Done`, and fires for failures and cancellations too —
+delivery is best-effort, so see
+[ADR-0014](adr/0014-completion-handlers-are-best-effort.md) before relying on it:
+
+```go
+agent, err := agentkit.Register(reg, "my-agent", 1, &myStrategy{},
+    agentkit.WithOnFinish(func(ctx context.Context, pid agentkit.ProcessID,
+        res agentkit.FinishResult[myOutput]) error {
+        if res.Status != agentkit.ProcessSucceeded {
+            return nil
+        }
+        return notify(ctx, res.Output.Answer)
+    }),
+)
 ```
 
 ## Five rules

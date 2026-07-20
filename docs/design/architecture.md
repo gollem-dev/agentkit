@@ -46,7 +46,7 @@ transactions (ADR-0004), and cost (ADR-0010).
 | Port | Form | Who implements it | Mandatory |
 |---|---|---|---|
 | `Repository` | interface | the application | yes |
-| `Strategy[S, I]` | interface | the agent author | yes (or use a bundled one) |
+| `Strategy[S, I, O]` | interface | the agent author | yes (or use a bundled one) |
 | `ToolFactory` | function type | the application | no |
 | `Limiter` | function type | the application | no |
 | Middleware (`Init`/`Step`/`Generate`/`CallTool`/`Spawn`) | `next`-chain, repeatable | the application | no |

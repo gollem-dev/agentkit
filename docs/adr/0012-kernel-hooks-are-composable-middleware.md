@@ -12,9 +12,9 @@ twice, which is the truth); a `StepMiddleware` may not — see Consequences.
 Middleware is registered on the Kernel, so one registration covers every agent.
 That is what makes it right for cross-cutting concerns, and it has a
 consequence: a kernel-level middleware does not know any particular strategy's
-input type `I` or state type `S`, so **there is no static type safety over the
-type-erased payloads at this layer**. Touching one is an opaque operation and
-the responsibility is the middleware's.
+input type `I`, state type `S` or output type `O`, so **there is no static type
+safety over the type-erased payloads at this layer**. Touching one is an opaque
+operation and the responsibility is the middleware's.
 
 Nothing here is persisted, and effects still run at least once (ADR-0003), so a
 middleware fires on **every** execution including re-runs.
@@ -177,3 +177,4 @@ support.
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D21) and the post-journal observability design. |
 | 2026-07-20 | Replaced the `Observer` struct with `next`-chain middleware and extended the hooks from three to five (adding `Init` and `Step`). `Observer` could not express control and did not reach the state machine. Records the layer's lack of static type safety over type-erased payloads, and the per-agent registration alternative that was rejected with it. |
 | 2026-07-20 | Narrowed "may call `next` more than once" to effect middleware only: a Step's effects buffer per transition, so a retried Step would have committed a discarded attempt's children and events. Made `StepRequest.Process` a copy after finding that writing `Rev` through it would break CAS fencing. Corrected `OnCommit` to be described consistently as reporting the transition, not the child. |
+| 2026-07-20 | `Decision` became `Decision[O]` (ADR-0014), so `StepResult.Decision` joined the type-erased payloads: it is now read with `ResultDecision[O]` or `DecisionKindOf` and written with `NewStepResult`. The strategy's `EncodeOutput` consequently runs in the worker *after* the chain rather than inside the Step closure, because a middleware may replace the Decision and has no way to encode one. Unlike the other payloads a Decision is boxed with a type witness rather than stored bare, so that a nil interface output is not lost across the boundary; the cost is that `ResultDecision[any]` does not match an arbitrary agent, and `DecisionKindOf` is the type-free reader instead. |

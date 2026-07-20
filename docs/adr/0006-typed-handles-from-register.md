@@ -5,13 +5,15 @@
 `any` does not appear in agentkit's public API. Registration returns a typed
 handle that carries the type forward to every use site:
 
-- `Register[S, I](registry, name, version, strategy)` returns `Agent[I]`, and
-  `Agent[I]` is the **only** way to spawn. `Kernel.Spawn` does not exist.
+- `Register[S, I, O](registry, name, version, strategy, ...RegisterOption[O])`
+  returns `Agent[I]`, and `Agent[I]` is the **only** way to spawn.
+  `Kernel.Spawn` does not exist.
 - `DefineModelRole(name)` returns a `ModelRole`, a sealed interface (unexported
   marker method) that cannot be implemented or constructed outside the package.
 
 Type erasure is confined to unexported code: `BindStrategy` folds a
-`Strategy[S, I]` into closures, and the input closure re-asserts `input.(I)`.
+`Strategy[S, I, O]` into closures, the input closure re-asserts `input.(I)`, and
+`Decision[O]` is converted into an unexported erased form for the worker.
 
 ## Context
 
@@ -31,7 +33,7 @@ registration function returns a typed value instead:
 
 | Registration | Handle | What the type carries |
 |---|---|---|
-| `Register[S, I]` | `Agent[I]` | the launch input type |
+| `Register[S, I, O]` | `Agent[I]` | the launch input type. `O` stays off the handle: it is consumed by `Decision[O]` and by a completion handler (ADR-0014), never by `Agent`, so carrying it there would make it a phantom parameter |
 | `DefineModelRole` | `ModelRole` | a unique identity |
 | `planexec.Register[T]` | `Agent[planexec.Input]` | plus `makeInput func(TaskSpec) (T, error)` binding the child agent's input type |
 
@@ -72,3 +74,4 @@ as package variables (`planexec.RolePlanner`, `planexec.RoleSummarizer`).
 | Date | Change |
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D32, D41, D42, D43). |
+| 2026-07-20 | `Strategy` and `Register` gained the output type `O` (ADR-0014). The handle stays `Agent[I]`; the table row records why `O` is not carried on it. Existing `Register` call sites were unaffected — `O` is inferred from the strategy and the handler together, so a mismatched handler is a compile error. |

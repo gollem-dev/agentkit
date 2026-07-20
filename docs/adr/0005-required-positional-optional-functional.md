@@ -8,7 +8,7 @@ config struct mixing the two.
 
 ```go
 New(repo, model, agents, ...KernelOption)
-Register[S, I](registry, name, version, strategy)          // -> Agent[I]
+Register[S, I, O](registry, name, version, strategy, ...RegisterOption[O]) // -> Agent[I]
 Agent[I].Spawn(ctx, kernel, input, ...SpawnOption)
 Agent[I].SpawnChild(ctx, sys, input, ...SpawnOption)
 Syscalls.Generate(ctx, input, ...GenerateOption)
@@ -58,8 +58,9 @@ Two consequences of applying the rule strictly:
 - A new required dependency is a breaking change, by construction. That is
   correct — it *is* one — and it forces the question of whether it is really
   required.
-- Option types are per-call-site (`KernelOption`, `SpawnOption`, `ServeOption`,
-  `GenerateOption`, `RespondOption`, `AwaitOption`), so an option cannot be
+- Option types are per-call-site (`KernelOption`, `RegisterOption`,
+  `SpawnOption`, `ServeOption`, `GenerateOption`, `RespondOption`,
+  `AwaitOption`), so an option cannot be
   passed where it has no meaning.
 
 ## History
@@ -67,3 +68,4 @@ Two consequences of applying the rule strictly:
 | Date | Change |
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D26, D27). |
+| 2026-07-20 | `Register` gained `RegisterOption[O]`, carrying the optional completion handler (ADR-0014). |

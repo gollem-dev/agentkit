@@ -87,16 +87,16 @@ func (s *strategy) Init(in input) (state, error) {
 	return state{Request: in.Request}, nil
 }
 
-func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision, error) {
+func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[output], error) {
 	if !st.Asked {
 		payload := []byte("Approve: " + st.Request + " (yes/no)")
 		// Emitted events are buffered and committed with the transition, so the
 		// event and the wait become visible together or not at all.
 		if err := sys.Emit(ctx, approvalRequested, payload); err != nil {
-			return st, agentkit.Decision{}, goerr.Wrap(err, "emit approval request")
+			return st, agentkit.Decision[output]{}, goerr.Wrap(err, "emit approval request")
 		}
 		st.Asked = true
-		return st, agentkit.Suspend(
+		return st, agentkit.Suspend[output](
 			agentkit.Question(confirmKey, payload, agentkit.WithDeadline(sys.Now().Add(s.deadline))),
 		), nil
 	}
@@ -104,7 +104,7 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 	// Await reads the snapshot taken when this transition started.
 	aw, ok := sys.Await(confirmKey)
 	if !ok {
-		return st, agentkit.Decision{}, goerr.New("confirmation await missing",
+		return st, agentkit.Decision[output]{}, goerr.New("confirmation await missing",
 			goerr.V("key", confirmKey))
 	}
 
@@ -112,7 +112,7 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 	case agentkit.AwaitOpen:
 		// Reached when this transition re-runs before anyone answered. Suspend
 		// with no specs re-parks the Process without duplicating the wait.
-		return st, agentkit.Suspend(), nil
+		return st, agentkit.Suspend[output](), nil
 
 	case agentkit.AwaitResponded:
 		approved := strings.EqualFold(strings.TrimSpace(string(aw.Response)), "yes")
@@ -127,7 +127,7 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 			gollem.Text("Write one line for the change log describing this approved action: " + st.Request),
 		})
 		if err != nil {
-			return st, agentkit.Decision{}, err
+			return st, agentkit.Decision[output]{}, err
 		}
 		st.Note = strings.Join(res.Texts, " ")
 		return done(st, output{Approved: true, Note: st.Note})
@@ -137,17 +137,13 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 		return done(st, output{Approved: false, Note: st.Note})
 
 	default:
-		return st, agentkit.Fail(agentkit.FailureStrategyError,
+		return st, agentkit.Fail[output](agentkit.FailureStrategyError,
 			"confirmation await "+string(aw.Status)), nil
 	}
 }
 
-func done(st state, out output) (state, agentkit.Decision, error) {
-	raw, err := json.Marshal(out)
-	if err != nil {
-		return st, agentkit.Decision{}, goerr.Wrap(err, "marshal output")
-	}
-	return st, agentkit.Done(raw), nil
+func done(st state, out output) (state, agentkit.Decision[output], error) {
+	return st, agentkit.Done(out), nil
 }
 
 func refusalNote(by string) string {
@@ -158,6 +154,8 @@ func refusalNote(by string) string {
 }
 
 func (s *strategy) EncodeState(st state) ([]byte, error) { return json.Marshal(st) }
+
+func (s *strategy) EncodeOutput(out output) ([]byte, error) { return json.Marshal(out) }
 
 func (s *strategy) DecodeState(_ int, raw []byte) (state, error) {
 	var st state

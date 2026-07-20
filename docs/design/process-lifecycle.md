@@ -143,6 +143,21 @@ abandoned rather than committed partially. The process stays non-terminal and is
 retried after its lease expires — a delayed finalize is recoverable, a lost
 wakeup is not.
 
+A registered completion handler (`WithOnFinish`) runs immediately after that
+`Apply` succeeds, synchronously, on whichever instance committed. Everything
+above is inside the commit; the handler is outside it, and that asymmetry is the
+whole of its guarantee:
+
+- It cannot fire twice. Every terminal path funnels through one commit, and a
+  worker that loses the CAS race abandons before reaching the call.
+- **It can fire zero times.** A crash in the window between the `Apply` and the
+  call loses the notification, and nothing retries it — there is no journal to
+  retry from (ADR-0003).
+
+That window is the reason follow-up work which must not be lost belongs in a
+parent process waiting on `WaitChildren`, where it is part of a committed
+transition rather than a call after one ([ADR-0014](../adr/0014-completion-handlers-are-best-effort.md)).
+
 ## Cancellation
 
 `Cancel` sets `CancelRequested` on the row rather than terminating directly. A
