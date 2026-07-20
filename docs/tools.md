@@ -96,9 +96,12 @@ func (t *guardedTool) Run(ctx context.Context, args map[string]any) (map[string]
 Wrap in the `ToolFactory` and every call is checked, because `Run` is the only
 way to reach the effect.
 
-The same holds for audit. `Observer` hooks are best-effort and not persisted by
-the framework ([ADR-0012](adr/0012-observer-is-best-effort-observation.md)); if
-something must be durably recorded *before* it happens, record it in `Run`.
+The same holds for audit. A `ToolCallMiddleware` runs before the tool and can
+refuse a call fail-closed, but it is a chokepoint for calls made through
+`Syscalls.CallTool` — not the only path to a tool, since a strategy holding a
+`gollem.Tool` value can call `Run` on it directly
+([ADR-0012](adr/0012-kernel-hooks-are-composable-middleware.md)). If something
+must be durably recorded *before* it happens, record it in `Run`.
 
 ## Scoping tools per tenant
 

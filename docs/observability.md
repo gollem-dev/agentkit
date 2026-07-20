@@ -8,7 +8,7 @@ Four separate mechanisms, easy to confuse. They differ in one property —
 | `Metrics` | yes (on the process row) | no | usage accounting |
 | `Limiter` | — (a decision, not a record) | **yes** | budgets and caps |
 | `Event` | yes (committed with the transition) | no | progress your application consumes |
-| `Observer` | **no** | no | audit trails, tracing, metrics export |
+| Middleware | no (unless you persist something yourself) | **yes** | tracing, audit, cost accounting, redaction, tool policy |
 
 ## Metrics
 
@@ -93,66 +93,98 @@ events, err := kernel.ListEvents(ctx, pid)
 There is no global feed and no cursor API. Delivering events to Slack, a queue,
 or anywhere else is your application's job — tailing your own database is
 simpler than a delivery port every `Repository` implementation would have to
-support ([ADR-0012](adr/0012-observer-is-best-effort-observation.md)).
+support ([ADR-0012](adr/0012-kernel-hooks-are-composable-middleware.md)).
 
 Payload bytes are stored verbatim; encoding is yours.
 
-## Observer
+## Middleware
 
-Three span-shaped hooks. Each is called at the start of an effect and returns a
-callback invoked at completion — record intent at the start, outcome at the end:
+Five `next`-chain hooks, one per point where the kernel calls out: `Init`,
+`Step`, `Generate`, `CallTool`, `SpawnChild`. Registered on the `Kernel` with
+`WithInitMiddleware` and its four siblings, so one registration runs for every
+agent. A middleware receives the next handler and returns a replacement, which
+lets it observe, rewrite the request, refuse by not calling `next`, or call
+`next` more than once (`StepMiddleware` excepted — see below):
 
 ```go
-agentkit.WithObserver(agentkit.Observer{
-    ToolCall: func(ctx context.Context, ec agentkit.EffectContext, call gollem.FunctionCall) func(map[string]any, error) {
-        span := tracer.Start(ctx, "tool:"+call.Name,
-            attribute.String("process", string(ec.ProcessID)),
-            attribute.String("root", string(ec.RootID)),
-            attribute.Int("seq", ec.StateSeq),
+agentkit.WithToolCallMiddleware(func(next agentkit.ToolCallHandler) agentkit.ToolCallHandler {
+    return func(ctx context.Context, req *agentkit.ToolCallRequest) (map[string]any, error) {
+        span := tracer.Start(ctx, "tool:"+req.Call.Name,
+            attribute.String("process", string(req.Effect.ProcessID)),
+            attribute.String("root", string(req.Effect.RootID)),
+            attribute.Int("seq", req.Effect.StateSeq),
         )
-        return func(res map[string]any, err error) { span.End(err) }
-    },
-    Generate: func(ctx context.Context, ec agentkit.EffectContext, in []gollem.Input, role agentkit.ModelRole) func(*agentkit.GenerateResult, error) {
-        ...
-    },
-    Spawn: func(ctx context.Context, ec agentkit.EffectContext, child agentkit.ProcessID, agent agentkit.AgentName) func(error) {
-        ...
-    },
-})
+        res, err := next(ctx, req)
+        span.End(err)
+        return res, err
+    }
+}),
 ```
 
 `EffectContext` carries `ProcessID`, `RootID`, `Agent` and `StateSeq` — enough
-to key an audit row and to correlate a whole process tree. A nil field is never
-called.
+to key an audit row and to correlate a whole process tree.
 
-Four properties to design around:
+Properties to design around, all detailed in `middleware.go` and
+[ADR-0012](adr/0012-kernel-hooks-are-composable-middleware.md):
 
-- **Nothing is persisted by the framework.** This is not a journal. Whatever you
-  want kept, you keep.
-- **Hooks cannot stop execution.** Denial belongs inside a tool
-  ([tools.md](tools.md)).
+- **Nothing is persisted by the framework.** Whatever you want kept, you keep.
+- **A middleware is a real chokepoint, not a security gate.** `Generate`,
+  `CallTool` and `SpawnChild` middleware is the outermost layer of its syscall —
+  it wraps the `Limiter` check and, for tool calls, name resolution and argument
+  validation — so it can refuse a call fail-closed and see a call the `Limiter`
+  later refuses. But `Syscalls.CallTool` is not the only path to a tool: a
+  strategy holding a `gollem.Tool` value can call `Run` on it directly.
+  Enforcement still belongs inside `Run` ([tools.md](tools.md)).
+- **`StepMiddleware` sees the `Step` call, not the commit.** It sits between
+  `DecodeState` and `EncodeState`; the commit happens after it returns. A
+  transition that fails to commit is re-run, so the middleware runs again — the
+  at-least-once model is visible here exactly as it is.
+- **`StepMiddleware` must call `next` at most once.** A Step's effects — spawned
+  children, emitted events, metrics — buffer per transition, not per call, so a
+  retried Step would commit the discarded attempt's effects alongside the
+  accepted one's. The second call returns `ErrInvalidRequest`. To decide a
+  transition without running the strategy, skip `next` entirely and return a
+  `NewStepResult`.
+- **`StepRequest.Process` is a copy.** Writing to it changes nothing that is
+  committed — which is deliberate, since the commit is built from the original
+  and a middleware setting `Rev` would make every `Apply` conflict.
+- **A request and a result live only for the handler call.** Nothing is
+  deep-copied (the point of a middleware is that it may rewrite them), so their
+  payloads, maps and slices are shared with the kernel and with whatever runs
+  next. Handing one to a goroutine or a queue that outlives the call means
+  copying what you need out of it first.
 - **They fire on replays.** Effects run at least once, so the same logical
-  operation may be observed more than once. That is intentional — an audit trail
-  should record what actually happened. De-duplicate on your side if you need to.
-- **Arguments are deep copies**, so mutating them cannot affect execution. Panics
-  are recovered and logged rather than failing the transition.
+  operation may run through a middleware more than once. De-duplicate on your
+  side if you need to.
+- **No static type safety over the type-erased payloads.** A kernel-level
+  middleware runs across every agent, so it cannot know a particular strategy's
+  input or state type. Read one with `InitInput[I]` / `StepState[S]` /
+  `SpawnInput[I]` (or `[any]` to observe without knowing the type), and replace
+  one by deriving a new request (`NewInitRequest`, `NewStepRequest`,
+  `NewSpawnRequest`). A wrong type compiles and fails at run time with
+  `ErrInvalidRequest` — the nature of a cross-cutting layer, not a gap to work
+  around.
+- **A panic in middleware is not recovered by the chain.** Inside a transition
+  the worker's own recovery turns it into a transition error and the Process
+  retries; in `Init` it propagates to the `Spawn` caller.
 
-`Spawn` is the one hook with commit-aware timing: the start callback fires when
-the strategy requests the child, and the completion callback fires *after* the
-transition commit persists it — with `nil` on success, or the error if the
-transition never committed. So the record matches whether a child actually came
-into existence.
+`SpawnRequest.OnCommit(fn)` is the one thing a plain chain cannot express by
+itself: child creation is buffered into the transition commit (ADR-0009), so
+whether the child exists is only known later. `fn` is called once with that
+outcome — `nil` when the transition committed, non-nil otherwise. Its scope is
+the *transition*, not the child, and it runs after the commit, outside it, so a
+panic in it is recovered and logged rather than becoming a transition error.
 
 ## Choosing
 
 - **A durable audit record that must exist before an action happens** → inside
-  the tool's `Run`. Not an observer: observers are best-effort by design.
+  the tool's `Run`. Middleware runs inline and is not a journal.
 - **Progress your application reacts to** → `Emit`, then tail your own store.
-- **Distributed tracing / metrics export** → `Observer`.
+- **Distributed tracing / metrics export / tool policy** → middleware.
 - **Enforcing a budget** → `Limiter`.
 - **Reporting usage** → `Metrics`.
 
 ## Logging
 
-`WithLogger(*slog.Logger)` supplies the kernel's logger, used for things like
-recovered observer panics. It defaults to `slog.Default()`.
+`WithLogger(*slog.Logger)` supplies the kernel's logger, used for things like a
+recovered `SpawnRequest.OnCommit` panic. It defaults to `slog.Default()`.

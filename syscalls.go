@@ -19,6 +19,11 @@ import (
 // There is no effect journal and no approval gate. Generate/CallTool simply call
 // gollem and accumulate Metrics. There is no operation label either — nothing is
 // journaled, so no key is needed to identify a call.
+//
+// Generate, CallTool and SpawnChild each run through their middleware chain
+// first, if the Kernel was given one. The chain is the outermost layer: it wraps
+// the Limiter check, tool resolution and argument validation, and a middleware
+// that returns without calling next stops the call before any of them.
 type Syscalls interface {
 	// --- execution context ---
 	ProcessID() ProcessID
@@ -61,72 +66,57 @@ type GenerateResult struct {
 	History       *gollem.History        `json:"history"` // session history after the call (save it, pass it next time).
 }
 
-// GenerateOption configures a Generate. Only input is required (D26).
-type GenerateOption func(*generateConfig)
-
-type generateConfig struct {
-	role         ModelRole
-	history      *gollem.History
-	systemPrompt string
-	tools        []gollem.Tool
-	schema       *gollem.Parameter
-	llmOpts      []gollem.GenerateOption
-}
+// GenerateOption configures a Generate. Only input is required (D26). The
+// options fill in a GenerateRequest, which is also what Generate middleware
+// sees and may rewrite.
+type GenerateOption func(*GenerateRequest)
 
 // WithRole selects the model role. Omitting it (or nil) means the default model.
 func WithRole(r ModelRole) GenerateOption {
-	return func(c *generateConfig) { c.role = r }
+	return func(req *GenerateRequest) { req.Role = r }
 }
 
 // WithHistory passes prior conversation history (to gollem.WithSessionHistory).
 func WithHistory(h *gollem.History) GenerateOption {
-	return func(c *generateConfig) { c.history = h }
+	return func(req *GenerateRequest) { req.History = h }
 }
 
 // WithSystemPrompt sets the system prompt (to gollem.WithSessionSystemPrompt).
 func WithSystemPrompt(p string) GenerateOption {
-	return func(c *generateConfig) { c.systemPrompt = p }
+	return func(req *GenerateRequest) { req.SystemPrompt = p }
 }
 
 // WithTools declares tools to the LLM (execution goes through CallTool).
 func WithTools(tools ...gollem.Tool) GenerateOption {
-	return func(c *generateConfig) { c.tools = append(c.tools, tools...) }
+	return func(req *GenerateRequest) { req.Tools = append(req.Tools, tools...) }
 }
 
 // WithSchema requests JSON output against a schema (gollem
 // WithSessionContentType(JSON) + WithSessionResponseSchema).
 func WithSchema(p *gollem.Parameter) GenerateOption {
-	return func(c *generateConfig) { c.schema = p }
+	return func(req *GenerateRequest) { req.Schema = p }
 }
 
 // WithLLMOptions passes gollem generate options (temperature, etc.) straight
 // through. Note agentkit.GenerateOption and gollem.GenerateOption are distinct
 // types (package-qualified); pass-through is via this option.
 func WithLLMOptions(o ...gollem.GenerateOption) GenerateOption {
-	return func(c *generateConfig) { c.llmOpts = append(c.llmOpts, o...) }
+	return func(req *GenerateRequest) { req.LLMOptions = append(req.LLMOptions, o...) }
 }
 
-func newGenerateConfig(opts []GenerateOption) *generateConfig {
-	cfg := &generateConfig{}
-	for _, o := range opts {
-		o(cfg)
-	}
-	return cfg
-}
-
-func (c *generateConfig) sessionOptions() []gollem.SessionOption {
+func (r *GenerateRequest) sessionOptions() []gollem.SessionOption {
 	var opts []gollem.SessionOption
-	if c.history != nil {
-		opts = append(opts, gollem.WithSessionHistory(c.history))
+	if r.History != nil {
+		opts = append(opts, gollem.WithSessionHistory(r.History))
 	}
-	if c.systemPrompt != "" {
-		opts = append(opts, gollem.WithSessionSystemPrompt(c.systemPrompt))
+	if r.SystemPrompt != "" {
+		opts = append(opts, gollem.WithSessionSystemPrompt(r.SystemPrompt))
 	}
-	if len(c.tools) > 0 {
-		opts = append(opts, gollem.WithSessionTools(c.tools...))
+	if len(r.Tools) > 0 {
+		opts = append(opts, gollem.WithSessionTools(r.Tools...))
 	}
-	if c.schema != nil {
-		opts = append(opts, gollem.WithSessionContentType(gollem.ContentTypeJSON), gollem.WithSessionResponseSchema(c.schema))
+	if r.Schema != nil {
+		opts = append(opts, gollem.WithSessionContentType(gollem.ContentTypeJSON), gollem.WithSessionResponseSchema(r.Schema))
 	}
 	return opts
 }
@@ -207,7 +197,7 @@ type syscalls struct {
 	// transition buffers (folded into the commit ChangeSet).
 	pendingChildren  []*Process    // SpawnChild children (atomic insert on commit, D48).
 	pendingEvents    []*Event      // Emit / await.created.
-	pendingSpawnDone []func(error) // Spawn observer completions (called by the worker after commit, #8).
+	pendingSpawnDone []func(error) // SpawnRequest.OnCommit callbacks (called by the worker after commit, #8).
 }
 
 func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool) *syscalls {
@@ -241,7 +231,7 @@ func (s *syscalls) Metrics() Metrics { return addMetrics(s.proc.Metrics, s.runMe
 
 func (s *syscalls) addMetrics(m Metrics) { s.runMetrics = addMetrics(s.runMetrics, m) }
 
-// notifySpawnDone calls every buffered Spawn observer completion exactly once
+// notifySpawnDone calls every buffered OnCommit callback exactly once
 // with the transition outcome (nil = the child was committed; non-nil = the
 // transition did not commit), then clears them so a retry does not double-fire.
 func (s *syscalls) notifySpawnDone(err error) {
@@ -266,26 +256,36 @@ func (s *syscalls) checkLimit(ctx context.Context) error {
 	return nil
 }
 
+// Generate runs the middleware chain around generateBase. The chain is the
+// outermost layer: a middleware sees calls the Limiter later refuses, and one
+// that returns without calling next consumes neither quota nor metrics.
 func (s *syscalls) Generate(ctx context.Context, input []gollem.Input, opts ...GenerateOption) (*GenerateResult, error) {
+	req := &GenerateRequest{Effect: s.ec(), Input: input}
+	for _, o := range opts {
+		o(req)
+	}
+	h := chainGenerate(s.k.generateMW, s.generateBase)
+	if h == nil {
+		return nil, goerr.Wrap(ErrInvalidConfig, "generate middleware returned a nil handler")
+	}
+	return h(ctx, req)
+}
+
+func (s *syscalls) generateBase(ctx context.Context, req *GenerateRequest) (*GenerateResult, error) {
 	if err := s.checkLimit(ctx); err != nil {
 		return nil, err
 	}
-	cfg := newGenerateConfig(opts)
-	done := s.observeGenerate(ctx, input, cfg.role)
-	client := s.k.resolveModel(cfg.role)
-	session, err := client.NewSession(ctx, cfg.sessionOptions()...)
+	client := s.k.resolveModel(req.Role)
+	session, err := client.NewSession(ctx, req.sessionOptions()...)
 	if err != nil {
-		done(nil, err)
 		return nil, goerr.Wrap(err, "new session")
 	}
-	resp, err := session.Generate(ctx, input, cfg.llmOpts...)
+	resp, err := session.Generate(ctx, req.Input, req.LLMOptions...)
 	if err != nil {
-		done(nil, err)
 		return nil, goerr.Wrap(err, "generate")
 	}
 	hist, err := session.History()
 	if err != nil {
-		done(nil, err)
 		return nil, goerr.Wrap(err, "session history")
 	}
 	result := &GenerateResult{
@@ -301,26 +301,32 @@ func (s *syscalls) Generate(ctx context.Context, input []gollem.Input, opts ...G
 		MetricOutputTokens: int64(resp.OutputToken),
 		MetricLLMCalls:     1,
 	})
-	done(result, nil)
 	return result, nil // not journaled: a replay re-calls the LLM (re-charge allowed, D44).
 }
 
 func (s *syscalls) CallTool(ctx context.Context, call gollem.FunctionCall) (map[string]any, error) {
-	tool, ok := s.toolByName[call.Name]
+	req := &ToolCallRequest{Effect: s.ec(), Call: call}
+	h := chainToolCall(s.k.toolCallMW, s.toolCallBase)
+	if h == nil {
+		return nil, goerr.Wrap(ErrInvalidConfig, "tool call middleware returned a nil handler")
+	}
+	return h(ctx, req)
+}
+
+func (s *syscalls) toolCallBase(ctx context.Context, req *ToolCallRequest) (map[string]any, error) {
+	tool, ok := s.toolByName[req.Call.Name]
 	if !ok {
-		return nil, goerr.Wrap(ErrToolNotFound, "unknown tool", goerr.V("tool", call.Name))
+		return nil, goerr.Wrap(ErrToolNotFound, "unknown tool", goerr.V("tool", req.Call.Name))
 	}
 	spec := tool.Spec()
-	if err := spec.ValidateArgs(call.Arguments); err != nil {
-		return nil, goerr.Wrap(err, "validate tool args", goerr.V("tool", call.Name))
+	if err := spec.ValidateArgs(req.Call.Arguments); err != nil {
+		return nil, goerr.Wrap(err, "validate tool args", goerr.V("tool", req.Call.Name))
 	}
 	if err := s.checkLimit(ctx); err != nil {
 		return nil, err
 	}
-	done := s.observeToolCall(ctx, call)
-	out, terr := tool.Run(ctx, call.Arguments)
+	out, terr := tool.Run(ctx, req.Call.Arguments)
 	s.addMetrics(Metrics{MetricToolCalls: 1})
-	done(out, terr)
 	// A replay re-executes; side-effecting tools must be made idempotent by the
 	// author (D44/D45). Run errors are returned to the strategy (the Process is
 	// not dropped).
@@ -329,17 +335,58 @@ func (s *syscalls) CallTool(ctx context.Context, call gollem.FunctionCall) (map[
 
 func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts ...SpawnOption) (ProcessID, error) {
 	cfg := newSpawnConfig(opts)
+	// A static misuse, rejected before any middleware sees the request.
 	if cfg.hasIdempotencyKey {
 		return "", goerr.Wrap(ErrInvalidRequest, "WithIdempotencyKey is not allowed on SpawnChild (D48)")
 	}
+	req := &SpawnRequest{
+		Effect:   s.ec(),
+		Agent:    agent,
+		Metadata: cfg.metadata,
+		Subject:  cfg.subject,
+		OnCommit: s.registerSpawnCommit,
+		input:    input,
+	}
+	h := chainSpawn(s.k.spawnMW, s.spawnBase)
+	if h == nil {
+		return "", goerr.Wrap(ErrInvalidConfig, "spawn middleware returned a nil handler")
+	}
+	return h(ctx, req)
+}
+
+// registerSpawnCommit buffers fn to be called once with this transition's
+// commit outcome. It runs after the commit, outside the transition, so a panic
+// there cannot become a transition error — it is recovered and logged instead,
+// or it would take the worker down.
+func (s *syscalls) registerSpawnCommit(fn func(error)) {
+	if fn == nil {
+		return
+	}
+	s.pendingSpawnDone = append(s.pendingSpawnDone, func(err error) {
+		s.recover("spawn OnCommit", func() { fn(err) })
+	})
+}
+
+func (s *syscalls) spawnBase(ctx context.Context, req *SpawnRequest) (ProcessID, error) {
 	if err := s.checkLimit(ctx); err != nil {
 		return "", err
 	}
-	b, err := s.k.agents.binding(agent)
+	b, err := s.k.agents.binding(req.Agent)
 	if err != nil {
 		return "", err
 	}
-	st, err := b.init(input)
+	// Minted before Init so the Init middleware can name the child (D-K/ADR-0009).
+	cid := ProcessID(uuid.Must(uuid.NewV7()).String())
+	// The parent context comes from the live transition, not from req.Effect: a
+	// middleware may have overwritten that field, and the child's recorded
+	// lineage must match its actual ParentID/RootID.
+	parent := s.ec()
+	st, err := s.k.runInit(ctx, b, &InitRequest{
+		ProcessID: cid,
+		Agent:     req.Agent,
+		Parent:    &parent,
+		input:     req.input,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -348,30 +395,21 @@ func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts .
 		return "", goerr.Wrap(err, "encode child initial state")
 	}
 	now := s.k.clock()
-	cid := ProcessID(uuid.Must(uuid.NewV7()).String())
-	child := &Process{
+	s.pendingChildren = append(s.pendingChildren, &Process{
 		ID:           cid,
-		Agent:        agent,
+		Agent:        req.Agent,
 		Status:       ProcessPending,
-		Metadata:     cfg.metadata,
+		Metadata:     req.Metadata,
 		State:        raw,
 		StateVersion: b.version,
 		ParentID:     &s.proc.ID,
 		RootID:       s.proc.RootID,
-		Subject:      cfg.subject,
+		Subject:      req.Subject,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 		Rev:          0,
-	}
-	s.pendingChildren = append(s.pendingChildren, child)
+	})
 	s.addMetrics(Metrics{MetricSpawns: 1})
-	// Observation (#8): start now (intent), completion after the transition
-	// commit persists the child (the worker calls pendingSpawnDone).
-	if start := s.k.observer.Spawn; start != nil {
-		if done := s.safeSpawnStart(ctx, start, cid, agent); done != nil {
-			s.pendingSpawnDone = append(s.pendingSpawnDone, done)
-		}
-	}
 	return cid, nil
 }
 
@@ -393,130 +431,17 @@ func (s *syscalls) Emit(_ context.Context, typ EventType, payload []byte) error 
 	return nil
 }
 
-// --- observation helpers (best-effort; panics are recovered, C12) ---
-
-// The observer receives deep copies of inputs/results so it can never mutate a
-// value that execution uses (observation, not control, C12/#5).
-func (s *syscalls) observeGenerate(ctx context.Context, input []gollem.Input, role ModelRole) func(*GenerateResult, error) {
-	start := s.k.observer.Generate
-	if start == nil {
-		return func(*GenerateResult, error) {}
-	}
-	cp := copyInputs(input)
-	var done func(*GenerateResult, error)
-	s.recover("observer.Generate start", func() { done = start(ctx, s.ec(), cp, role) })
-	if done == nil {
-		return func(*GenerateResult, error) {}
-	}
-	return func(res *GenerateResult, err error) {
-		rc := copyGenerateResult(res)
-		s.recover("observer.Generate done", func() { done(rc, err) })
-	}
-}
-
-func (s *syscalls) observeToolCall(ctx context.Context, call gollem.FunctionCall) func(map[string]any, error) {
-	start := s.k.observer.ToolCall
-	if start == nil {
-		return func(map[string]any, error) {}
-	}
-	cp := call
-	cp.Arguments = deepCopyMap(call.Arguments)
-	var done func(map[string]any, error)
-	s.recover("observer.ToolCall start", func() { done = start(ctx, s.ec(), cp) })
-	if done == nil {
-		return func(map[string]any, error) {}
-	}
-	return func(res map[string]any, err error) {
-		rc := deepCopyMap(res)
-		s.recover("observer.ToolCall done", func() { done(rc, err) })
-	}
-}
-
-func (s *syscalls) safeSpawnStart(ctx context.Context, start func(context.Context, EffectContext, ProcessID, AgentName) func(error), cid ProcessID, agent AgentName) func(error) {
-	var done func(error)
-	s.recover("observer.Spawn start", func() { done = start(ctx, s.ec(), cid, agent) })
-	if done == nil {
-		return nil
-	}
-	return func(err error) { s.recover("observer.Spawn done", func() { done(err) }) }
-}
-
+// recover runs fn and turns a panic into a log line. It exists for the one
+// callback the kernel invokes outside a transition — a SpawnRequest.OnCommit
+// function, which runs on the worker goroutine after the commit, where a panic
+// would otherwise kill the worker. Middleware itself is NOT wrapped: it runs
+// inside the transition, where the worker's own recovery turns a panic into a
+// transition error, which is the right outcome for a failing control layer.
 func (s *syscalls) recover(where string, fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			s.k.logger.Error("observer panic recovered", slog.String("where", where), slog.Any("panic", r))
+			s.k.logger.Error("panic recovered", slog.String("where", where), slog.Any("panic", r))
 		}
 	}()
 	fn()
-}
-
-// deepCopyValue recursively copies JSON-like values (maps/slices/primitives) so
-// the observer cannot mutate nested data that execution shares.
-func deepCopyValue(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		return deepCopyMap(t)
-	case []any:
-		cp := make([]any, len(t))
-		for i, e := range t {
-			cp[i] = deepCopyValue(e)
-		}
-		return cp
-	default:
-		return v
-	}
-}
-
-func deepCopyMap(m map[string]any) map[string]any {
-	if m == nil {
-		return nil
-	}
-	cp := make(map[string]any, len(m))
-	for k, v := range m {
-		cp[k] = deepCopyValue(v)
-	}
-	return cp
-}
-
-// copyInputs deep-copies the mutable parts of the LLM input slice (a
-// FunctionResponse's Data map); immutable inputs (Text) are shared safely.
-func copyInputs(input []gollem.Input) []gollem.Input {
-	cp := make([]gollem.Input, len(input))
-	for i, in := range input {
-		switch v := in.(type) {
-		case *gollem.FunctionResponse:
-			fr := *v
-			fr.Data = deepCopyMap(v.Data)
-			cp[i] = &fr
-		case gollem.FunctionResponse:
-			v.Data = deepCopyMap(v.Data)
-			cp[i] = v
-		default:
-			cp[i] = in
-		}
-	}
-	return cp
-}
-
-func copyGenerateResult(r *GenerateResult) *GenerateResult {
-	if r == nil {
-		return nil
-	}
-	cp := *r
-	cp.Texts = append([]string(nil), r.Texts...)
-	cp.Thoughts = append([]string(nil), r.Thoughts...)
-	if r.FunctionCalls != nil {
-		cp.FunctionCalls = make([]*gollem.FunctionCall, len(r.FunctionCalls))
-		for i, fc := range r.FunctionCalls {
-			if fc != nil {
-				c := *fc
-				c.Arguments = deepCopyMap(fc.Arguments)
-				cp.FunctionCalls[i] = &c
-			}
-		}
-	}
-	if r.History != nil {
-		cp.History = r.History.Clone()
-	}
-	return &cp
 }

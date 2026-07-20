@@ -11,7 +11,8 @@ graph TB
     UC["Use case layer<br/>Spawn / Respond / Cancel"]
     RP["Repository impl<br/>(postgres, ...)"]
     TF["ToolFactory impl"]
-    LM["Limiter / Observer"]
+    LM["Limiter"]
+    MW["Middleware<br/>(Init/Step/Generate/CallTool/Spawn)"]
   end
   subgraph ak["agentkit"]
     K["Kernel<br/>lifecycle API + Serve worker loop"]
@@ -26,7 +27,8 @@ graph TB
   UC -->|"Agent[I].Spawn"| K
   RP -->|"New(repo, ...)"| K
   TF -->|WithToolFactory| K
-  LM -->|WithLimiter / WithObserver| K
+  LM -->|WithLimiter| K
+  MW -->|"WithInitMiddleware / WithStepMiddleware /<br/>WithGenerateMiddleware / WithToolCallMiddleware /<br/>WithSpawnMiddleware"| K
   K -->|"Step(ctx, sys, state)"| SG
   SG --> SC
   SC -->|NewSession / Generate| LC
@@ -39,19 +41,23 @@ of a `Process`, and the atomicity of one transition.** It is deliberately
 ignorant of everything else — data formats (ADR-0007), tenancy (ADR-0011),
 transactions (ADR-0004), and cost (ADR-0010).
 
-## The four extension points
+## The extension points
 
 | Port | Form | Who implements it | Mandatory |
 |---|---|---|---|
 | `Repository` | interface | the application | yes |
 | `Strategy[S, I]` | interface | the agent author | yes (or use a bundled one) |
 | `ToolFactory` | function type | the application | no |
-| `Limiter` / `Observer` | function / struct of functions | the application | no |
+| `Limiter` | function type | the application | no |
+| Middleware (`Init`/`Step`/`Generate`/`CallTool`/`Spawn`) | `next`-chain, repeatable | the application | no |
 
 `Repository` and `Strategy` are interfaces because both have several related
 operations that must move together. `ToolFactory` and `Limiter` are function
 types because each is a single decision best written as a closure — a stateful
-implementation passes a method value.
+implementation passes a method value. Middleware is a fifth kind: unlike the
+other four it is chain-composable — each `WithXMiddleware` call is repeatable,
+and registrations nest around one another instead of replacing a single slot
+([ADR-0012](../adr/0012-kernel-hooks-are-composable-middleware.md)).
 
 ## Package layout
 
@@ -71,7 +77,7 @@ Within the root package, file names carry the structure that packages would
 otherwise: `process.go`, `await.go`, `decision.go`, `event.go`, `metric.go` hold
 the model; `kernel.go` the lifecycle API; `worker.go` the transition machinery;
 `syscalls.go` the effect gateway; `strategy.go`, `repository.go`, `tool.go`,
-`observer.go` the ports.
+`middleware.go` the ports.
 
 ## One transition, end to end
 
@@ -82,6 +88,7 @@ effect on the world lands in a single `Repository.Apply`.
 sequenceDiagram
   participant W as Serve worker
   participant R as Repository
+  participant M as Middleware chain
   participant S as Strategy
   participant X as LLM / Tools
 
@@ -89,13 +96,23 @@ sequenceDiagram
   W->>R: settle any due awaits (timers, expired questions)
   W->>W: Limiter check
   W->>S: DecodeState(version, bytes)
-  W->>S: Step(ctx, sys, state)
-  S->>X: Generate / CallTool (via Syscalls; Limiter before, Metrics after)
-  S-->>W: new state + Decision
+  W->>M: StepMiddleware(Step call)
+  M->>S: Step(ctx, sys, state)
+  S->>M: Generate / CallTool (via Syscalls)
+  Note over M: outermost layer — Limiter check,<br/>tool resolution, arg validation happen inside here
+  M->>X: Generate / CallTool
+  X-->>M: result
+  M-->>S: result (Metrics recorded)
+  S-->>M: new state + Decision
+  M-->>W: new state + Decision
   W->>S: EncodeState(state)
   W->>R: Apply(ChangeSet)  ← the single atomic commit
   Note over W,R: state + awaits + events + spawned children + metrics
 ```
+
+`StepMiddleware` wraps the `Step` call shown above; it does not see this
+`Apply` — the commit happens after the handler returns, outside the chain
+([observability.md](../observability.md)).
 
 Everything the transition produced rides that one `Apply`:
 

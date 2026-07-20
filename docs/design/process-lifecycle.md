@@ -31,9 +31,11 @@ Two properties are worth stating explicitly:
   `FailureLimitExceeded`, alongside `FailureStrategyError` and
   `FailureRetryExhausted` (ADR-0010).
 
-`Spawn` is asynchronous. It runs `Init` purely, encodes the initial state, and
-inserts a `pending` row. Nothing executes until a worker claims it — which is
-why the verb is *spawn* and not *start* (ADR-0013).
+`Spawn` is asynchronous. It mints the `ProcessID`, runs `Init` through its
+middleware chain, encodes the initial state, and inserts a `pending` row.
+Nothing executes until a worker claims it — which is why the verb is *spawn*
+and not *start* (ADR-0013). `SpawnChild` follows the same path
+([observability.md](../observability.md)).
 
 ## What a claim does
 
@@ -100,7 +102,8 @@ its wait would leave nobody to do the waking (ADR-0009).
 Errors split into three kinds by *where* they arise.
 
 **Transition errors** — a failure in `DecodeState`, `Step`, or `EncodeState`,
-including a recovered strategy panic. The process is requeued with an
+including a recovered panic from the strategy or its `StepMiddleware` chain.
+The process is requeued with an
 exponential backoff (doubling, capped at a minute) and an incremented attempt
 counter. When attempts exceed the limit, it terminates as `failed` with
 `FailureRetryExhausted`. Metrics consumed by the failed attempt are folded in

@@ -28,8 +28,9 @@ lease, and a wait queue — nothing more.
   `Process`, and a `Limiter` decides when a run has had enough.
 - **Idempotent spawning** — an idempotency key or a `subject` prevents a retried
   request from starting a second run.
-- **Observation hooks** — `Observer` wraps every LLM call, tool call, and child
-  spawn in a span, for audit trails and tracing.
+- **Middleware** — a `next`-chain around `Init`, `Step`, `Generate`, `CallTool`
+  and `SpawnChild`, registered once on the `Kernel`: audit, tracing, redaction,
+  retry, tool policy. A middleware can also refuse a call by not calling `next`.
 - **Pluggable persistence** — `Repository` is a small SPI you implement over your
   own store; `repository/repotest` is its contract as a runnable test suite.
 - **Typed API** — `Register` returns an `Agent[I]`, so inputs are checked at
@@ -189,6 +190,10 @@ The whole runtime is five moving parts, in the order you meet them:
    a set of child processes. The `Process` leaves memory entirely and comes back
    when the await is satisfied.
 
+Around all of that, **middleware** wraps the five points where the kernel calls
+out (`Init`, `Step`, `Generate`, `CallTool`, `SpawnChild`) — that is where a
+concern that spans every agent goes.
+
 Concepts in full: [docs/concepts.md](./docs/concepts.md). Writing your own
 strategy: [docs/writing-strategies.md](./docs/writing-strategies.md).
 
@@ -222,6 +227,62 @@ hour, and the process that asked may be long gone.
 > `ToolFactory` returns so an unauthorized call is refused in `Run`. The kernel
 > deliberately has no authorization concept
 > ([ADR-0008](docs/adr/0008-three-await-kinds-confirmation-is-a-question.md)).
+> A `ToolCall` middleware is the other chokepoint — see below.
+
+## Middleware
+
+Five points where the kernel calls out are wrapped by a `next`-chain, registered
+on the `Kernel`: `Init` and `Step` (the strategy boundary) and `Generate`,
+`CallTool` and `SpawnChild` (the effects). One registration covers every agent,
+which makes this the place for audit, tracing, redaction, retry and tool policy.
+
+An effect middleware is the outermost layer of its syscall — it wraps the
+`Limiter` check, tool resolution and argument validation — so a refused call is
+visible to it too, and returning without calling `next` stops the call before
+any of them:
+
+```go
+kernel, _ := agentkit.New(repo, client, reg,
+	agentkit.WithToolCallMiddleware(func(next agentkit.ToolCallHandler) agentkit.ToolCallHandler {
+		return func(ctx context.Context, req *agentkit.ToolCallRequest) (map[string]any, error) {
+			if !allowed[req.Call.Name] {
+				audit(req.Effect, req.Call, "denied")
+				return nil, errDenied // next is never called: the tool does not run.
+			}
+			out, err := next(ctx, req)
+			audit(req.Effect, req.Call, err) // ErrLimitExceeded reaches here too.
+			return out, err
+		}
+	}),
+)
+```
+
+Effects run at least once, so a middleware fires on every execution including
+re-runs. Nothing it records is persisted by the framework; for an audit that
+must be durable *before* the action, record it inside the tool's `Run`.
+
+> Refusing a call is not an authorization gate. A middleware is a real
+> chokepoint for calls made through `Syscalls.CallTool`, but a strategy holding
+> a `gollem.Tool` value can call `Run` on it directly. Enforcement belongs
+> inside `Run`.
+
+`SpawnChild` is buffered into the transition commit, so its middleware gets
+`req.OnCommit(fn)` to learn whether the child was actually persisted.
+
+**A kernel middleware runs across all agents, so it does not know any
+strategy's input or state type.** The type-erased payloads are read with
+`InitInput[I]` / `StepState[S]` / `SpawnInput[I]` and replaced by deriving a new
+request (`NewInitRequest` and friends); `ok == false` just means "another
+agent's Process — pass it through". Passing `any` as the type argument always
+succeeds and is the intended form for generic logging. Nothing here is checked
+by the compiler: a wrong type surfaces as `ErrInvalidRequest` at run time. That
+is the nature of a cross-cutting layer, and it is why typed manipulation of a
+payload is better placed in the strategy's own `Init`.
+
+See [ADR-0012](docs/adr/0012-kernel-hooks-are-composable-middleware.md) for why
+this replaced the observation-only `Observer` hooks, and
+[docs/observability.md](./docs/observability.md) for the audit and tracing
+recipes.
 
 ## Bundled strategies
 
@@ -285,25 +346,6 @@ There is no effect journal, no operation label, and no deterministic clock — a
 worker just re-executes `Step` from the checkpoint. Read
 [docs/execution-model.md](./docs/execution-model.md) before you write a tool that
 touches the outside world; it is short and it is the part people get wrong.
-
-## Auditing & tracing (`Observer`)
-
-agentkit does not persist effects, but it exposes observation points via
-`WithObserver`. Each hook is a span (start with the intent, end with the result);
-it is best-effort — never persisted, never blocking, panics recovered — and fires
-on every execution including re-runs:
-
-```go
-kernel, _ := agentkit.New(repo, client, reg, agentkit.WithObserver(agentkit.Observer{
-	ToolCall: func(ctx context.Context, ec agentkit.EffectContext, call gollem.FunctionCall) func(map[string]any, error) {
-		auditStart(ec, call) // record intent
-		return func(res map[string]any, err error) { auditEnd(ec, res, err) }
-	},
-}))
-```
-
-For an audit that must be durable *before* the action, wrap the tool instead.
-More in [docs/observability.md](./docs/observability.md).
 
 ## Documentation
 
