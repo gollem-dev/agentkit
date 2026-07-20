@@ -14,25 +14,28 @@ any process can pick a run up from its last checkpoint. It is built on
 abstractions, and stays deliberately small: the kernel is a state machine, a
 lease, and a wait queue — nothing more.
 
-## What you get
+## Features
 
-- **A run survives the process that started it.** State is committed after every
-  transition; a crashed or redeployed worker's run is claimed and resumed by
-  another one.
-- **Long waits cost nothing.** An agent can wait for a human answer, a timer, or
-  a batch of child runs without any process, goroutine, or connection being held
-  open. The run is on disk, not in RAM.
-- **Horizontal by construction.** Workers claim runs through a lease and commit
-  through a `Rev` CAS, so you can run as many as you like without inventing a
-  lock. No cross-request state lives in process memory.
-- **Fan-out as real processes.** A strategy spawns child runs and waits for them;
-  children and the parent's new state commit in a single atomic write.
-- **Metering and limits per run.** Token/tool usage is accumulated on the
-  `Process`, and a `Limiter` can stop a run that goes over budget.
-- **Audit and tracing hooks.** `Observer` gives you a span around every LLM call,
-  tool call, and child spawn.
-- **Your database, your rules.** `Repository` is a small SPI you implement;
-  `repository/repotest` is the contract as an executable test suite.
+- **Checkpointed execution** — a run is a `Process` whose state is committed to
+  the store after every transition, and resumed from there by any worker.
+- **Durable waits** — `Suspend` parks a run on an await: a question for a human,
+  a timer, or a set of child processes. Nothing is held open while it waits.
+- **Multi-worker execution** — `Serve` claims runs with a lease and commits with
+  a `Rev` CAS, so any number of workers on any number of hosts is safe.
+- **Child processes** — a strategy spawns children and waits for their results;
+  the children and the parent's new state commit in one atomic write.
+- **Usage metering and limits** — token and tool usage accumulates on the
+  `Process`, and a `Limiter` decides when a run has had enough.
+- **Idempotent spawning** — an idempotency key or a `subject` prevents a retried
+  request from starting a second run.
+- **Observation hooks** — `Observer` wraps every LLM call, tool call, and child
+  spawn in a span, for audit trails and tracing.
+- **Pluggable persistence** — `Repository` is a small SPI you implement over your
+  own store; `repository/repotest` is its contract as a runnable test suite.
+- **Typed API** — `Register` returns an `Agent[I]`, so inputs are checked at
+  compile time and `any` never appears in the public API.
+- **Strategies included** — `strategy/simple` (LLM loop) and `strategy/planexec`
+  (plan → parallel children → replan → finalize).
 
 ### Why not just an in-memory loop?
 
