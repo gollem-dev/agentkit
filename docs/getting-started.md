@@ -198,6 +198,36 @@ up once the lease expires.
 
 An application that only submits work simply never calls `Serve`.
 
+### Sizing the lease
+
+A lease is **not** a timeout on a transition. Nothing is cancelled when it
+expires; it only marks the point from which another worker may assume this one
+died. So a lease that is too short does not fail — it lets a second worker start
+the same transition again, LLM call and tool calls included.
+
+Size it against **the slowest single transition** — one `Generate` plus that
+round's tool calls — not against the whole run. The lease is renewed on every
+commit, so a claim running sixteen transitions never needs a lease covering all
+sixteen. Nothing extends it while `Step` is executing, so leave margin.
+
+### The two retry bounds
+
+They look similar and mean different things:
+
+| Option | Bounds | Says |
+|---|---|---|
+| `WithMaxStepAttempts` | attempts that returned an **error** | the strategy keeps failing — read its code |
+| `WithMaxUncleanReclaims` | claims that **died mid-transition** | workers keep dying — look at the workers |
+
+They are separate because an error tells you how far the last attempt got, while
+a vanished claim tells you nothing: it may have completed every side effect and
+died just before committing. If duplicated side effects are unacceptable for an
+agent, set `WithMaxUncleanReclaims(0)` — the Process then fails as
+`unclean_reclaim` rather than being re-run after a crash.
+
+Details in [process-lifecycle.md](design/process-lifecycle.md) and
+[ADR-0015](adr/0015-unclean-reclaims-are-counted-and-bounded.md).
+
 ## Next
 
 - [examples/](../examples/) — the same shape as a program you can run, plus one

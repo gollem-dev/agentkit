@@ -17,12 +17,13 @@ import (
 type ServeOption func(*serveConfig)
 
 type serveConfig struct {
-	workerID         string
-	lease            time.Duration
-	pollInterval     time.Duration
-	maxStepsPerClaim int
-	maxStepAttempts  int
-	concurrency      int
+	workerID           string
+	lease              time.Duration
+	pollInterval       time.Duration
+	maxStepsPerClaim   int
+	maxStepAttempts    int
+	maxUncleanReclaims int
+	concurrency        int
 }
 
 // WithWorkerID sets the worker id (diagnostic). Default: hostname + "/" + uuid v7.
@@ -39,8 +40,28 @@ func WithPollInterval(d time.Duration) ServeOption {
 // WithMaxStepsPerClaim sets how many transitions one claim runs. Default: 16.
 func WithMaxStepsPerClaim(n int) ServeOption { return func(c *serveConfig) { c.maxStepsPerClaim = n } }
 
-// WithMaxStepAttempts sets the step retry limit. Default: 3.
+// WithMaxStepAttempts sets the step retry limit. Default: 3. This bounds
+// attempts that ended in an ERROR; a claim that died mid-transition is bounded
+// separately by WithMaxUncleanReclaims.
 func WithMaxStepAttempts(n int) ServeOption { return func(c *serveConfig) { c.maxStepAttempts = n } }
+
+// WithMaxUncleanReclaims bounds how many times a Process may be taken over
+// after a claim died mid-transition. Default: 3. Exceeding it terminates the
+// Process as failed with FailureUncleanReclaim.
+//
+// This is deliberately separate from WithMaxStepAttempts: an error tells the
+// strategy how far the previous attempt got, whereas a vanished claim tells it
+// nothing — the transition may have run every effect and died before its
+// commit, and a lease-expiry reclaim may overlap a predecessor that is still
+// running. Callers that cannot tolerate duplicated side effects set this to 0.
+//
+// The bound is compared as `UncleanReclaims > n`, matching the
+// `StepAttempts+1 > n` convention: n permits n further attempts after the
+// first. n=0 therefore finalizes the Process on the first unclean reclaim,
+// without running Step at all.
+func WithMaxUncleanReclaims(n int) ServeOption {
+	return func(c *serveConfig) { c.maxUncleanReclaims = n }
+}
 
 // WithConcurrency sets the number of parallel claim loops. Default: 1.
 func WithConcurrency(n int) ServeOption { return func(c *serveConfig) { c.concurrency = n } }
@@ -48,12 +69,13 @@ func WithConcurrency(n int) ServeOption { return func(c *serveConfig) { c.concur
 func newServeConfig(opts []ServeOption) serveConfig {
 	host, _ := os.Hostname()
 	cfg := serveConfig{
-		workerID:         host + "/" + uuid.Must(uuid.NewV7()).String(),
-		lease:            60 * time.Second,
-		pollInterval:     500 * time.Millisecond,
-		maxStepsPerClaim: 16,
-		maxStepAttempts:  3,
-		concurrency:      1,
+		workerID:           host + "/" + uuid.Must(uuid.NewV7()).String(),
+		lease:              60 * time.Second,
+		pollInterval:       500 * time.Millisecond,
+		maxStepsPerClaim:   16,
+		maxStepAttempts:    3,
+		maxUncleanReclaims: 3,
+		concurrency:        1,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -118,7 +140,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 	if k.toolFactory != nil {
 		toolList, err = k.toolFactory(ctx, proc)
 		if err != nil {
-			k.requeue(ctx, cfg, proc, goerr.Wrap(err, "tool factory"), nil)
+			k.requeueInfra(ctx, cfg, proc, claimToken, goerr.Wrap(err, "tool factory"))
 			return
 		}
 	}
@@ -137,6 +159,20 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			return
 		}
 		proc = fresh
+		// Bounded before Step rather than after a failure, because an unclean
+		// reclaim is already counted by the time the Process is claimed: the
+		// previous attempt may have run every effect and died before its commit.
+		// Deciding here is what lets maxUncleanReclaims=0 mean "do not re-run at
+		// all". In practice this only fires on the first iteration of a claim
+		// that took over a dead one — a successful commit resets the counter, so
+		// every later iteration reads 0.
+		if proc.UncleanReclaims > cfg.maxUncleanReclaims {
+			cause := goerr.New("unclean reclaim limit exceeded",
+				goerr.V("unclean_reclaims", proc.UncleanReclaims),
+				goerr.V("limit", cfg.maxUncleanReclaims))
+			_ = k.finalize(ctx, proc, failWith(FailureUncleanReclaim, cause), claimToken, nil)
+			return
+		}
 		if k.limiter != nil {
 			if lerr := k.limiter(ctx, proc, proc.Metrics); lerr != nil {
 				_ = k.finalize(ctx, proc, failWith(FailureLimitExceeded, lerr), claimToken, nil)
@@ -152,7 +188,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			if proc.StepAttempts+1 > cfg.maxStepAttempts {
 				_ = k.finalize(ctx, proc, failWith(FailureRetryExhausted, terr), claimToken, sys.runMetrics)
 			} else {
-				k.requeue(ctx, cfg, proc, terr, sys.runMetrics)
+				k.requeueTransition(ctx, cfg, proc, claimToken, terr, sys.runMetrics)
 			}
 			return
 		}
@@ -170,7 +206,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			if proc.StepAttempts+1 > cfg.maxStepAttempts {
 				_ = k.finalize(ctx, proc, failWith(FailureRetryExhausted, cerr), claimToken, sys.runMetrics)
 			} else {
-				k.requeue(ctx, cfg, proc, cerr, sys.runMetrics)
+				k.requeueTransition(ctx, cfg, proc, claimToken, cerr, sys.runMetrics)
 			}
 			return
 		}
@@ -307,6 +343,7 @@ func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte
 	p.StateVersion = version
 	p.StateSeq = seq
 	p.StepAttempts = 0
+	p.UncleanReclaims = 0
 	p.Metrics = addMetrics(p.Metrics, sys.runMetrics)
 	p.Metrics = addMetrics(p.Metrics, Metrics{MetricSteps: 1})
 	p.UpdatedAt = now
@@ -479,6 +516,7 @@ func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []b
 		p.StateVersion = version
 		p.StateSeq = seq
 		p.StepAttempts = 0
+		p.UncleanReclaims = 0
 		p.Metrics = addMetrics(p.Metrics, sys.runMetrics)
 		p.Metrics = addMetrics(p.Metrics, Metrics{MetricSteps: 1})
 		if dec.kind == DecisionDone {
@@ -695,30 +733,73 @@ func containsID(ids []ProcessID, id ProcessID) bool {
 	return false
 }
 
+// requeueTransition puts the Process back after a transition that failed,
+// consuming one step attempt.
+func (k *Kernel) requeueTransition(ctx context.Context, cfg serveConfig, proc *Process, fenceToken string, cause error, foldMetrics Metrics) {
+	k.requeue(ctx, cfg, proc, fenceToken, cause, foldMetrics, true)
+}
+
+// requeueInfra puts the Process back after a fault that is not the strategy's
+// (a ToolFactory failure, say), leaving the attempt counter alone. Charging an
+// attempt here would also make the next transition look like a replay through
+// Syscalls.Attempt(), which it is not: Step never ran.
+func (k *Kernel) requeueInfra(ctx context.Context, cfg serveConfig, proc *Process, fenceToken string, cause error) {
+	k.requeue(ctx, cfg, proc, fenceToken, cause, nil, false)
+}
+
 // requeue puts the Process back to pending with a backoff, folding this run's
 // metrics on the successful Apply (#5).
-func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, cause error, foldMetrics Metrics) {
-	now := k.clock()
-	p := proc.clone()
-	p.Status = ProcessPending
-	p.StepAttempts = proc.StepAttempts + 1
-	// max(0, ...) keeps the shift count non-negative: the uint conversion this
-	// replaces was what previously made a bogus stored StepAttempts harmless,
-	// and a negative shift count panics at runtime.
-	attempts := max(0, minInt(p.StepAttempts, 6))
-	backoff := time.Duration(1<<attempts) * time.Second
-	if backoff > 60*time.Second {
-		backoff = 60 * time.Second
-	}
-	wake := now.Add(backoff)
-	p.WakeAt = &wake
-	p.LeaseUntil = nil
-	p.UpdatedAt = now
-	if foldMetrics != nil {
-		p.Metrics = addMetrics(p.Metrics, foldMetrics)
-	}
-	if err := k.repo.Apply(ctx, ChangeSet{Processes: []*Process{p}}); err != nil {
-		k.logger.Error("requeue failed", "process", proc.ID, "cause", cause, "error", err)
+//
+// A conflict here must not be shrugged off. Leaving the row `running` would let
+// the lease lapse and the next claim would count the takeover as an unclean
+// reclaim (ADR-0015) — turning an error the worker actually observed into a
+// phantom crash, and charging the wrong budget. So a conflict is re-read and
+// rebuilt against fresh state, exactly like a terminal commit, and abandoned
+// only when the lease is genuinely gone.
+func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, fenceToken string, cause error, foldMetrics Metrics, consumeAttempt bool) {
+	for {
+		now := k.clock()
+		p := proc.clone()
+		p.Status = ProcessPending
+		if consumeAttempt {
+			p.StepAttempts = proc.StepAttempts + 1
+		}
+		// max(0, ...) keeps the shift count non-negative: the uint conversion this
+		// replaces was what previously made a bogus stored StepAttempts harmless,
+		// and a negative shift count panics at runtime.
+		attempts := max(0, minInt(p.StepAttempts, 6))
+		backoff := time.Duration(1<<attempts) * time.Second
+		if backoff > 60*time.Second {
+			backoff = 60 * time.Second
+		}
+		wake := now.Add(backoff)
+		p.WakeAt = &wake
+		p.LeaseUntil = nil
+		p.UpdatedAt = now
+		if foldMetrics != nil {
+			p.Metrics = addMetrics(p.Metrics, foldMetrics)
+		}
+		err := k.repo.Apply(ctx, ChangeSet{Processes: []*Process{p}})
+		if errors.Is(err, ErrConflict) {
+			fresh, gerr := k.repo.GetProcess(ctx, proc.ID)
+			if gerr != nil || fresh == nil {
+				k.logger.Error("requeue re-read failed", "process", proc.ID, "cause", cause, "error", gerr)
+				return
+			}
+			if fresh.Status.Terminal() {
+				return // another path finalized it; nothing to put back.
+			}
+			if fresh.LeaseToken != fenceToken {
+				return // lost the lease -> abandon (never rebase, D50).
+			}
+			// The metrics were not folded, so they are still owed to the retry.
+			proc = fresh
+			continue
+		}
+		if err != nil {
+			k.logger.Error("requeue failed", "process", proc.ID, "cause", cause, "error", err)
+		}
+		return
 	}
 }
 
@@ -726,20 +807,31 @@ func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, ca
 // re-reads first: after the last transition commit, the caller's proc holds the
 // pre-commit Rev, so a CAS from that stale value would always conflict and leave
 // the Process stuck running until the lease expires (#3).
+// A conflict is retried from a fresh read rather than logged and dropped: the
+// row would otherwise stay `running` with a lease nobody renews, and the next
+// claim would charge the takeover as an unclean reclaim (ADR-0015) even though
+// this worker exited in an orderly way.
 func (k *Kernel) release(ctx context.Context, proc *Process, fenceToken string) {
-	fresh, err := k.repo.GetProcess(ctx, proc.ID)
-	if err != nil || fresh == nil {
+	for {
+		fresh, err := k.repo.GetProcess(ctx, proc.ID)
+		if err != nil || fresh == nil {
+			return
+		}
+		if fresh.LeaseToken != fenceToken || fresh.Status != ProcessRunning {
+			return // lease lost, or already moved off running by another path.
+		}
+		p := fresh.clone()
+		p.Status = ProcessPending
+		p.LeaseUntil = nil
+		p.UpdatedAt = k.clock()
+		err = k.repo.Apply(ctx, ChangeSet{Processes: []*Process{p}})
+		if errors.Is(err, ErrConflict) {
+			continue // someone moved the row; re-read and decide again.
+		}
+		if err != nil {
+			k.logger.Error("release failed", "process", proc.ID, "error", err)
+		}
 		return
-	}
-	if fresh.LeaseToken != fenceToken || fresh.Status != ProcessRunning {
-		return // lease lost, or already moved off running by another path.
-	}
-	p := fresh.clone()
-	p.Status = ProcessPending
-	p.LeaseUntil = nil
-	p.UpdatedAt = k.clock()
-	if err := k.repo.Apply(ctx, ChangeSet{Processes: []*Process{p}}); err != nil {
-		k.logger.Error("release failed", "process", proc.ID, "error", err)
 	}
 }
 

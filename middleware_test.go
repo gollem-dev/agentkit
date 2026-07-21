@@ -1510,3 +1510,44 @@ func TestMiddlewareAuditTrail(t *testing.T) {
 	gt.Value(t, toolEC[0].Agent).Equal(agentkit.AgentName("main"))
 	gt.Value(t, stepEC[0].StateSeq).Equal(1)
 }
+
+// EffectContext carries the attempt counters, so a middleware can tell a
+// replayed effect from a first one without the strategy's cooperation.
+func TestEffectContextCarriesAttempt(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+
+	var mu sync.Mutex
+	var seen []agentkit.AttemptInfo
+	mw := func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+		return func(c context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+			mu.Lock()
+			seen = append(seen, req.Effect.Attempt)
+			mu.Unlock()
+			return next(c, req)
+		}
+	}
+
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		// Fail the first attempt so the second one is a replay.
+		if !sys.Attempt().IsReplay() {
+			return st, agentkit.Decision[[]byte]{}, gollemErr("boom")
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithGenerateMiddleware(mw))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Array(t, seen).Length(2)
+	// The first effect is a first attempt; the retry after the error is not.
+	gt.Value(t, seen[0]).Equal(agentkit.AttemptInfo{})
+	gt.Value(t, seen[1]).Equal(agentkit.AttemptInfo{Errors: 1})
+	gt.Value(t, seen[1].IsReplay()).Equal(true)
+}

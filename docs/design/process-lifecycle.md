@@ -59,6 +59,49 @@ it settles any due awaits: a timer past its deadline becomes `responded` with
 **Timers therefore fire on the next claim, not on a scheduler.** The `WakeAt`
 field is what makes that claim happen; precision is bounded by the poll interval.
 
+A claim ends in one of four ways, and three of them clear the lease as they move
+the process off `running`:
+
+| Ending | Result |
+|---|---|
+| `Suspend` | `waiting`, lease cleared |
+| `Done` / `Fail` | terminal, lease cleared |
+| step budget spent | `release` returns it to `pending`, lease cleared |
+| lease lost, or an error | abandon, or `requeue` to `pending` with backoff |
+
+That table is why a `running` row with a lapsed lease means something specific:
+no orderly ending leaves one behind, so encountering one means the previous
+claim vanished mid-transition.
+
+## The lease is not a timeout
+
+A lease does not limit how long a transition may take. Nothing is cancelled when
+it expires, and no error is raised. It answers one question only:
+
+> from when may another worker assume this one is dead?
+
+A worker whose lease lapses keeps running. It discovers it lost only at its next
+fence check, or when its `Apply` conflicts and the stored `LeaseToken` is no
+longer its own — and then it discards its work
+([consistency-model.md](consistency-model.md)). So a lease that is too short does
+not produce a failure; it produces **a second execution of the same transition**,
+which is the at-least-once model showing through
+([execution-model.md](../execution-model.md)).
+
+**The lease is renewed on every commit**, not once per claim. A claim runs up to
+`WithMaxStepsPerClaim` transitions, and each committed one pushes the expiry out
+again. The window a lease has to cover is therefore *one transition*, not the
+whole run.
+
+**There is no heartbeat inside a transition.** Nothing extends the lease while
+`Step` is executing, so a single `Generate` that outlives the lease will be
+reclaimed underneath the worker running it. Size the lease against the slowest
+single transition — one `Generate` plus that round's tool calls — with margin.
+
+`LeaseUntil` is the expiry; `LeaseToken` is the fence identity and the thing
+every correctness check compares. `LeaseOwner` is diagnostic only and must never
+be used to fence.
+
 ## Anatomy of one transition
 
 ```
@@ -99,7 +142,8 @@ its wait would leave nobody to do the waking (ADR-0009).
 
 ## Errors, retries, and termination
 
-Errors split into three kinds by *where* they arise.
+Re-execution splits into four kinds by *where* it arises. The first three are
+errors the worker saw; the fourth is the worker not being there any more.
 
 **Transition errors** — a failure in `DecodeState`, `Step`, or `EncodeState`,
 including a recovered panic from the strategy or its `StepMiddleware` chain.
@@ -118,6 +162,24 @@ rebases its `Rev`. See [consistency-model.md](consistency-model.md).
 
 **Infrastructure errors** — a `ToolFactory` failure, for example. Requeued
 without consuming an attempt, since the fault is not the strategy's.
+
+**Unclean reclaims** — the claim itself vanished. The worker died, or its lease
+lapsed while it was still running, and another worker took the row over. Nothing
+went through `requeue`, so `StepAttempts` does not move; `ClaimNextProcess`
+increments `UncleanReclaims` instead, and the worker refuses to start a
+transition once it exceeds `WithMaxUncleanReclaims` (default 3), terminating as
+`failed` with `FailureUncleanReclaim`.
+
+The two counters stay apart because they carry different information. An error
+says how far the previous attempt got. A vanished claim says nothing at all: the
+transition may have completed every effect and died immediately before its
+commit, and a lease-expiry reclaim may be running *alongside* a predecessor that
+has not noticed yet. That difference is why the bounds are separate knobs — "retry
+errors three times, but never re-run after a crash" is a sentence one counter
+cannot express ([ADR-0015](../adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
+
+Both are reset by any successful commit, and both are visible to the strategy as
+`Syscalls.Attempt()` and to middleware as `EffectContext.Attempt`.
 
 A strategy's own `Fail` is not an error at all. It is a normal decision that
 commits a terminal state.

@@ -24,6 +24,11 @@ import (
 //     (atomic claim, +1 Rev). It writes status=running / lease_owner=workerID /
 //     lease_token=new-uuid-v7 / lease_until, and mints a fresh lease_token every
 //     claim (even a re-claim by the same workerID) — the fence identity.
+//     When the target was status=running (an expired or absent lease) — i.e. the
+//     previous claim died mid-transition — it also increments unclean_reclaims.
+//     A claim from pending or waiting leaves it unchanged, and ClaimNextProcess
+//     never writes step_attempts. This is what bounds re-execution after a
+//     crash; an implementation that skips it degrades to unbounded replay.
 //  5. Uniqueness is maintained: idempotency_key / open Process subject /
 //     (process_id, await_key). An insert violation writes nothing and returns
 //     ErrConflict.
@@ -39,6 +44,7 @@ type Repository interface {
 	// ClaimNextProcess atomically claims one runnable Process. Targets:
 	// status=pending, or status=waiting with wake_at<=now, or status=running
 	// with lease_until<now (lease expired). No target -> (nil, nil) (not an error).
+	// A claim from status=running also increments unclean_reclaims (contract 4).
 	ClaimNextProcess(ctx context.Context, workerID string, leaseUntil time.Time, now time.Time) (*Process, error)
 
 	// ListAwaits returns all awaits of a Process.

@@ -59,15 +59,48 @@ For exactly-once semantics, **checkpoint the decision, then act on it**:
 if st.Plan == nil {
     plan, err := decide(ctx, sys)
     if err != nil {
-        return st, agentkit.Decision{}, err
+        return st, agentkit.Decision[myOutput]{}, err
     }
     st.Plan = plan
-    return st, agentkit.Continue(), nil
+    return st, agentkit.Continue[myOutput](), nil
 }
 
 // transition N+1: the plan is durable, so any replay executes the same one.
 res, err := sys.CallTool(ctx, st.Plan.Call)
 ```
+
+That splits the decision from the act. What it does not tell you is whether the
+*act* already happened — a crash between `CallTool` returning and the commit
+leaves no trace in state. For that, ask whether this attempt is a replay:
+
+```go
+// transition N+1, continued: has a previous attempt at THIS transition run?
+if a := sys.Attempt(); a.IsReplay() {
+    // A previous attempt may have executed the call. Check before repeating it,
+    // if the operation can be checked at all.
+    if done, err := alreadyApplied(ctx, st.Plan.OperationID); err == nil && done {
+        st.Result = ...
+        return st, agentkit.Continue[myOutput](), nil
+    }
+}
+res, err := sys.CallTool(ctx, st.Plan.Call)
+```
+
+`AttemptInfo` reports the two origins separately, because they are not equally
+informative. `Errors` counts previous attempts that returned an error, so you
+know roughly how far they got. `UncleanReclaims` counts previous claims that
+*vanished*, and those tell you nothing: the transition may have completed every
+effect and died immediately before its commit. Worse, a reclaim caused by an
+expired lease may be running **concurrently** with a predecessor that has not
+yet noticed it lost — so `UncleanReclaims > 0` is not a promise that you are
+alone.
+
+This is the tool for the obligation this page places on you. It narrows the
+window; it does not close it. An operation that must never run twice still needs
+an idempotency key the tool itself enforces
+([tools.md](tools.md)), and how many times a crashed transition may be retried
+at all is bounded by `WithMaxUncleanReclaims`
+([ADR-0015](adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
 
 ### `Step` must be re-runnable and must not block
 

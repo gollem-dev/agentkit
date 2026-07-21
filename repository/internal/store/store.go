@@ -216,12 +216,16 @@ func (s *State) After(cs agentkit.ChangeSet) (*State, error) {
 // or (nil, nil, nil) when there is no target.
 func (s *State) ClaimNext(workerID string, leaseUntil, now time.Time) (*agentkit.Process, *State, error) {
 	var target *agentkit.Process
+	var kind claimKind
 	for _, p := range s.procs {
-		if !claimable(p, now) {
+		k := claimKindOf(p, now)
+		if k == notClaimable {
 			continue
 		}
+		// kind is assigned with target, not per candidate: only the winner's
+		// reason may survive the loop.
 		if target == nil || p.CreatedAt.Before(target.CreatedAt) {
-			target = p
+			target, kind = p, k
 		}
 	}
 	if target == nil {
@@ -233,6 +237,9 @@ func (s *State) ClaimNext(workerID string, leaseUntil, now time.Time) (*agentkit
 	np.Status = agentkit.ProcessRunning
 	np.LeaseOwner = workerID
 	np.LeaseToken = uuid.Must(uuid.NewV7()).String() // fresh fence identity every claim.
+	if kind == uncleanClaim {
+		np.UncleanReclaims++
+	}
 	lu := leaseUntil
 	np.LeaseUntil = &lu
 	np.Rev++
@@ -244,18 +251,37 @@ func (s *State) ClaimNext(workerID string, leaseUntil, now time.Time) (*agentkit
 	return cloneProcess(np), next, nil
 }
 
-// claimable reports whether p is a valid ClaimNext target at now.
-func claimable(p *agentkit.Process, now time.Time) bool {
+// claimKind reports why a Process is claimable. The reason is named where it is
+// decided so that a future claimable status cannot silently be counted as clean.
+type claimKind int
+
+const (
+	notClaimable claimKind = iota
+	cleanClaim             // pending, or waiting whose WakeAt is due.
+	uncleanClaim           // running: the previous claim died mid-transition.
+)
+
+// claimKindOf classifies p as a ClaimNext target at now.
+func claimKindOf(p *agentkit.Process, now time.Time) claimKind {
 	switch p.Status {
 	case agentkit.ProcessPending:
-		return true
+		return cleanClaim
 	case agentkit.ProcessWaiting:
-		return p.WakeAt != nil && !p.WakeAt.After(now)
+		if p.WakeAt != nil && !p.WakeAt.After(now) {
+			return cleanClaim
+		}
+		return notClaimable
 	case agentkit.ProcessRunning:
-		// A live lease fences the row; nil lease means unfenced (reclaimable).
-		return p.LeaseUntil == nil || p.LeaseUntil.Before(now)
+		// A live lease fences the row; nil lease means unfenced. Every orderly
+		// exit from a claim (suspend, terminate, requeue, release) clears the
+		// lease as it moves the Process off running, so reaching here at all
+		// means the previous claim vanished mid-transition.
+		if p.LeaseUntil == nil || p.LeaseUntil.Before(now) {
+			return uncleanClaim
+		}
+		return notClaimable
 	default:
-		return false
+		return notClaimable
 	}
 }
 

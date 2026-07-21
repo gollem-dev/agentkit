@@ -88,3 +88,4 @@ decision before performing it.
 | Date | Change |
 |---|---|
 | 2026-07-20 | Initial record. Supersedes the original effect-journal design (spec D11, D13, D14) with D44/D45; folds in the removal of `Now`/`Rand` determinism. |
+| 2026-07-21 | Unchanged, but no longer the whole story: [ADR-0015](0015-unclean-reclaims-are-counted-and-bounded.md) bounds how many times replay may happen after a crash, and makes "this is a replay, and here is why" readable from a strategy. Replay is still at-least-once and there is still no journal. |

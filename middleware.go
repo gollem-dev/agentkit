@@ -13,6 +13,9 @@ type EffectContext struct {
 	RootID    ProcessID // correlation id for the whole tree (reaches down to children).
 	Agent     AgentName
 	StateSeq  int // transition number.
+	// Attempt reports prior attempts at this transition that did not commit, so
+	// a middleware can tell a replayed effect from a first one.
+	Attempt AttemptInfo
 }
 
 // This file defines the five next-chains the kernel calls out through: the
