@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/gollem-dev/gollem"
@@ -28,6 +29,12 @@ type Kernel struct {
 	spawnMW      []SpawnMiddleware
 	logger       *slog.Logger
 	clock        func() time.Time
+	// dispatcher is the in-process eager scheduler, installed by Serve and cleared
+	// when it returns. It is the one mutable field on an otherwise-immutable
+	// Kernel: process-local scheduler wiring, not cross-request business state
+	// (its loss only degrades to polling). This is the second explicit exception
+	// to "no cross-request state", after Registry (ADR-0016).
+	dispatcher atomic.Pointer[dispatcher]
 }
 
 type kernelConfig struct {
@@ -270,6 +277,10 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 		}
 		return "", err
 	}
+	// Eager dispatch: run the just-created pending Process now instead of waiting
+	// for a poll. No-op if no Serve is running here (ADR-0016). Only the new-insert
+	// path reaches here; an idempotency hit returns above without dispatching.
+	k.dispatch(pid)
 	return pid, nil
 }
 
@@ -312,6 +323,10 @@ func (k *Kernel) Respond(ctx context.Context, pid ProcessID, key AwaitKey, respo
 		err = k.repo.Apply(ctx, ChangeSet{Processes: []*Process{wake}, Awaits: []*Await{aw}})
 		if errors.Is(err, ErrConflict) {
 			continue // re-read and re-judge (E19).
+		}
+		if err == nil {
+			// Eager dispatch: resume the now-pending Process immediately (ADR-0016).
+			k.dispatch(pid)
 		}
 		return err
 	}

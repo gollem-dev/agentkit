@@ -28,6 +28,7 @@ change.
 | [0013](0013-os-metaphor-naming.md) | OS-metaphor naming |
 | [0014](0014-completion-handlers-are-best-effort.md) | Completion handlers are best-effort and bound at registration |
 | [0015](0015-unclean-reclaims-are-counted-and-bounded.md) | Unclean reclaims are counted separately and bounded |
+| [0016](0016-eager-dispatch-is-a-scheduling-optimization.md) | Eager dispatch is a scheduling optimization |
 
 ## How to write one
 

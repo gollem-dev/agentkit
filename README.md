@@ -154,7 +154,7 @@ func main() {
 	go func() {
 		// The worker loop: claim a runnable Process, run one transition, commit.
 		// Run it in as many processes as you like.
-		if err := kernel.Serve(ctx, agentkit.WithConcurrency(4)); err != nil {
+		if err := kernel.Serve(ctx, agentkit.WithPollConcurrency(4)); err != nil {
 			panic(err)
 		}
 	}()
@@ -322,6 +322,11 @@ atomic application of a `ChangeSet` and conditional writes:
 5. `ClaimNextProcess` atomically claims one runnable Process, mints a fresh
    `LeaseToken` on every claim (the fence identity), and never double-claims.
 6. `ListEvents` preserves append order.
+
+An instance running `Serve` also dispatches a newly-runnable Process eagerly,
+in-process, instead of waiting for the next poll — a latency optimization only;
+polling remains the ground truth and the fallback
+([ADR-0016](docs/adr/0016-eager-dispatch-is-a-scheduling-optimization.md)).
 
 Two reference implementations are bundled:
 

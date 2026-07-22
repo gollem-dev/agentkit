@@ -111,6 +111,20 @@ Waiting is expressed by suspending on an await, never by sleeping. A blocked
 `Step` holds a claim and a lease and stops the process from being picked up
 elsewhere.
 
+This now cuts closer to home than it used to. An instance running `Serve`
+dispatches a newly-runnable Process eagerly, on a goroutine driven from the
+`Spawn`/`Respond` call itself ([ADR-0016](adr/0016-eager-dispatch-is-a-scheduling-optimization.md)) — so a
+blocking `Step` no longer only delays some other process's poll; it can also
+sit directly on the interactive request path, and it occupies one of
+`WithMaxConcurrent`'s hard-limit slots the whole time.
+
+Two `ServeOption`s bound how much of this runs at once: `WithPollConcurrency`
+is a soft limit on the number of poll loops, `WithMaxConcurrent` is the hard
+limit on claims driven at once by polling and eager dispatch combined. Eager
+dispatch itself returns no result to the caller — `Spawn` and `Respond` still
+only report that the transition was scheduled or resumed; observe the outcome
+through `GetProcess` or `WithOnFinish`, same as with polling.
+
 ### Bound the work per transition
 
 One `Generate` per transition means a crash costs at most one LLM round. Both

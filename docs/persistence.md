@@ -128,7 +128,10 @@ they can be the same indexes.
 **Wakeup is polling.** There is no push notification in the contract. A
 `LISTEN`/`NOTIFY`-style optimization is store-specific; requiring it would tax
 every implementation, and it can be added later as an optional interface without
-breaking anyone.
+breaking anyone. On the kernel side, an instance running `Serve` dispatches a
+Process it just made runnable eagerly, in-process, rather than waiting for the
+next poll — a latency optimization on top of `ClaimNextProcess`, not a
+replacement for it ([ADR-0016](adr/0016-eager-dispatch-is-a-scheduling-optimization.md)).
 
 **`ErrConflict` must be returned, not swallowed.** The kernel relies on it: its
 retry loops re-read and re-decide when they see it. A repository that quietly

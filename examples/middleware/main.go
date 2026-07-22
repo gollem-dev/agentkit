@@ -435,7 +435,7 @@ func runWith(ctx context.Context, w io.Writer, topic string) (map[string]bool, e
 	served := make(chan error, 1)
 	go func() {
 		served <- k.Serve(serveCtx,
-			agentkit.WithConcurrency(4),
+			agentkit.WithPollConcurrency(4),
 			agentkit.WithPollInterval(20*time.Millisecond))
 	}()
 

@@ -29,6 +29,12 @@ import (
 //     A claim from pending or waiting leaves it unchanged, and ClaimNextProcess
 //     never writes step_attempts. This is what bounds re-execution after a
 //     crash; an implementation that skips it degrades to unbounded replay.
+//     ClaimNextProcess and Apply are mutually linearizable on the same Process
+//     row: a claim and a Rev-CAS Apply that both read the row at Rev N cannot
+//     both succeed — exactly one advances it to N+1 and the other observes the
+//     new Rev (a claim finds nothing to claim; an Apply returns ErrConflict).
+//     This is what lets eager dispatch claim a specific pending row via Apply
+//     without a dedicated SPI method, racing a poller's ClaimNextProcess safely.
 //  5. Uniqueness is maintained: idempotency_key / open Process subject /
 //     (process_id, await_key). An insert violation writes nothing and returns
 //     ErrConflict.

@@ -15,7 +15,7 @@ graph TB
     MW["Middleware<br/>(Init/Step/Generate/CallTool/Spawn)"]
   end
   subgraph ak["agentkit"]
-    K["Kernel<br/>lifecycle API + Serve worker loop"]
+    K["Kernel<br/>lifecycle API + Serve worker loop<br/>+ in-process eager dispatcher"]
     SC["Syscalls<br/>the only path to the world"]
     SG["Strategy<br/>(strategy/simple, strategy/planexec, yours)"]
   end
@@ -93,6 +93,7 @@ sequenceDiagram
   participant X as LLM / Tools
 
   W->>R: ClaimNextProcess (mints a fresh LeaseToken)
+  Note over W,R: triggered by a poll loop (as drawn) or by eager dispatch claiming this row via an Apply Rev-CAS instead (ADR-0016) — the rest is identical either way
   W->>R: settle any due awaits (timers, expired questions)
   W->>W: Limiter check
   W->>S: DecodeState(version, bytes)

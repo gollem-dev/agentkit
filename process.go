@@ -92,7 +92,9 @@ type Process struct {
 	// UncleanReclaims counts claims that took over this Process after its
 	// previous claim died mid-transition. Same reset scope as StepAttempts.
 	// Maintained by ClaimNextProcess (see the Repository contract), never by the
-	// worker — the worker only reads it to bound re-execution.
+	// worker — the worker only reads it to bound re-execution. Eager dispatch
+	// (claimSpecific) claims only pending rows, so it never increments this;
+	// reclaiming an expired-lease running row is ClaimNextProcess's job alone.
 	UncleanReclaims int
 	Metrics         Metrics // committed cumulative usage.
 	ParentID        *ProcessID
@@ -102,8 +104,8 @@ type Process struct {
 	CancelRequested bool
 	CancelReason    string
 	WakeAt          *time.Time // wake time while waiting (min of open await deadlines).
-	LeaseOwner      string     // diagnostic (hostname/uuid). Not used for fencing (shared across WithConcurrency claims).
-	LeaseToken      string     // unique per claim (ClaimNextProcess mints a uuid v7). The fence identity: a worker
+	LeaseOwner      string     // diagnostic (hostname/uuid). Not used for fencing (shared across WithPollConcurrency claims).
+	LeaseToken      string     // unique per claim (ClaimNextProcess and eager claimSpecific each mint a uuid v7). The fence identity: a worker
 	// keeps its claim's LeaseToken and, on conflict, checks "stored LeaseToken == mine" to tell "still hold the
 	// lease (rebase ok)" from "re-claimed by another worker (abandon)".
 	LeaseUntil *time.Time
