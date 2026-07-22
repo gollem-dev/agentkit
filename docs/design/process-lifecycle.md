@@ -10,7 +10,8 @@ stateDiagram-v2
   pending --> running: a worker claims it
   running --> running: Continue (commit, keep the claim)
   running --> waiting: Suspend (open awaits exist)
-  waiting --> pending: Respond / deadline reached / all children done
+  waiting --> pending: Respond / all children done
+  waiting --> running: claimed once a wake deadline is due
   running --> succeeded: Done
   running --> failed: Fail / limit exceeded / retries exhausted
   running --> cancelled: Cancel
@@ -24,9 +25,11 @@ stateDiagram-v2
 
 Two properties are worth stating explicitly:
 
-- **`pending` is the parking state.** A process becomes claimable by returning to
-  `pending`, whether it was answered, requeued after an error, or is waking on a
-  deadline. There is only one way in for a worker: `ClaimNextProcess`.
+- **`pending` is the main parking state.** A process is put back to `pending`
+  when it is answered (`Respond`) or requeued after an error, and claimed from
+  there; the one exception is a process `waiting` on a deadline, which is claimed
+  straight from `waiting` once its `WakeAt` is due. Either way there is only one
+  way in for a worker: `ClaimNextProcess`.
 - **`limit_exceeded` is not a status.** It is `failed` carrying
   `FailureLimitExceeded`, alongside `FailureStrategyError` and
   `FailureRetryExhausted` (ADR-0010).
@@ -36,6 +39,158 @@ middleware chain, encodes the initial state, and inserts a `pending` row.
 Nothing executes until a worker claims it — which is why the verb is *spawn*
 and not *start* (ADR-0013). `SpawnChild` follows the same path
 ([observability.md](../observability.md)).
+
+## Major cases, in sequence
+
+The state machine above says *which* transitions exist. These diagrams say *who*
+drives each one and *when* — the lifecycle-level view, one actor per column. The
+inner mechanics of a single transition (decode → `Step` → commit) are in
+[architecture.md](architecture.md); here the smallest unit is a whole `Apply`.
+
+Two columns recur: **Caller** is application code holding the `Kernel` (a use
+case, an HTTP handler), and **Worker** is a `Serve` claim loop — possibly on a
+different instance, possibly minutes later. The gap between them is the whole
+point: every arrow into the `Repository` is durable, and nothing bridges Caller
+and Worker except rows.
+
+### Spawn — launch, then walk away
+
+`Spawn` returns a `ProcessID` the instant the `pending` row lands. Execution is a
+separate event: a later claim by some worker — this process's own `Serve` loop,
+or another instance.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor App as Caller
+  participant K as Kernel
+  participant R as Repository
+  participant W as Worker
+
+  App->>K: Agent[I].Spawn(input, opts)
+  K->>K: mint ProcessID · run Init (+ middleware) · EncodeState
+  opt idempotency key set
+    K->>R: FindProcessByIdempotencyKey
+    Note right of K: a match returns the existing ID
+  end
+  opt subject set
+    K->>R: FindOpenProcessBySubject
+    Note right of K: an open holder → ErrSubjectBusy
+  end
+  K->>R: Apply(pending row + process.created)
+  K-->>App: ProcessID (returns immediately)
+  Note over K,W: Spawn runs no strategy — execution needs a separate claim,<br/>which may even happen before Spawn returns
+  W->>R: ClaimNextProcess
+  Note over W: pending → running — the strategy's first transition begins
+```
+
+`Init` runs *before* the idempotency and subject lookups, so an idempotent
+`Spawn` that ends up returning an existing process still pays for `Init`; the
+freshly minted id is discarded. The two guards differ in outcome — an idempotency
+match returns the existing id, a busy subject is `ErrSubjectBusy`. And if a
+concurrent idempotent `Spawn` wins the race so that `Apply` conflicts, the loser
+re-finds and returns the winner's id; that recovery is specific to the
+idempotency key.
+
+### Respond — deliver an answer to a waiting process
+
+`Respond` is how an answer to a question await (a human's yes/no, an external
+callback) re-queues a `waiting` process. It moves the row to `pending`; it does
+**not** run the strategy — a worker does that on its next claim.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor App as Caller
+  participant K as Kernel
+  participant R as Repository
+  participant W as Worker
+
+  Note over R: process is `waiting` on an open question await
+  App->>K: Respond(pid, key, response)
+  K->>R: GetProcess(pid)
+  alt terminal
+    K-->>App: ErrProcessFinished
+  else await missing / not a question / not open
+    K-->>App: ErrAwaitNotFound / ErrInvalidRequest / ErrAwaitClosed
+  else open question await
+    K->>R: Apply(await → responded, waiting → pending)
+    Note right of K: ErrConflict → re-read and re-judge (first-writer-wins)
+    K-->>App: nil
+    W->>R: ClaimNextProcess
+    Note over W: the strategy resumes with the response visible
+  end
+```
+
+Two of the three ways a `waiting` process becomes claimable put it back on
+`pending` first — a `Respond` and the last child finishing. The third, a wake
+deadline coming due, is claimed straight from `waiting` (see
+[What a claim does](#what-a-claim-does)). Either way a worker just claims the row
+and re-runs `Step`; it does not care which path re-queued it.
+
+### Cancel — request now, finalize wherever the process lives
+
+`Cancel` never terminates a *running* process directly, because that worker owns
+the lease. It splits on whether anyone is currently executing the row.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor App as Caller
+  participant K as Kernel
+  participant R as Repository
+  participant W as Worker
+
+  App->>K: Cancel(pid, reason)
+  K->>R: GetProcess(pid)
+  alt terminal
+    K-->>App: ErrProcessFinished
+  else running (a worker is, or was, executing it)
+    K->>R: Apply(cancel_requested = true)
+    K-->>App: nil
+    Note over W: the current owner finalizes at its next re-read; if that worker<br/>vanished, a reclaim after lease expiry finalizes it instead
+    W->>R: finalize as cancelled (fenced by the claim token)
+  else pending / waiting (unclaimed)
+    K->>R: finalize as cancelled now (external fence)
+    Note right of K: ErrConflict from any concurrent writer → loop re-reads<br/>and re-judges the now-fresh status
+    K-->>App: nil
+  end
+```
+
+Either branch reaches termination through the same commit path, so awaits are
+closed and a waiting parent is woken exactly as with any other ending. The
+detail of why an external caller propagates `ErrConflict` instead of retrying
+silently is in [Cancellation](#cancellation) below.
+
+### Child processes — spawn, wait, and be woken atomically
+
+The case that most needs a picture: a parent spawns children, suspends on
+`WaitChildren`, and is woken by the *last child's own terminal commit* — never by
+a separate "notify the parent" write (ADR-0009).
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant P as Parent claim
+  participant R as Repository
+  participant C as Child claim
+
+  Note over P: strategy calls SpawnChild (buffered), then WaitChildren → Suspend
+  P->>R: Apply(parent: running → waiting · child: pending · children-await open)
+  Note over P,R: one commit — parent suspend and child spawn land together
+  C->>R: ClaimNextProcess (the child row)
+  Note over C: child runs to Done / Fail
+  C->>R: Apply(child terminal + parent waiting → pending + await responded)
+  Note over C,R: the child's terminal commit wakes the parent, in the same Apply
+  P->>R: ClaimNextProcess (parent, now pending again)
+  Note over P: WaitChildren await now carries each child's ChildResult
+```
+
+If every waited child is *already* terminal when the parent declares the wait,
+there is no one left to do the waking — so the await is written already
+`responded`. And when no other open await keeps the process waiting, the parent
+stays `running` and continues straight on (the elision in
+[The four decisions](#the-four-decisions)).
 
 ## What a claim does
 
