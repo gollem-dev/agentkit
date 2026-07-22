@@ -49,6 +49,16 @@ Firestore, DynamoDB, an in-memory map.
    `Subject`, and on `(process_id, await_key)`. A violation writes nothing and
    returns `ErrConflict`.
 6. `ListEvents` preserves per-process append order.
+7. `ClaimNextProcess` and `Apply`'s per-row `Rev` CAS (item 2) are mutually
+   linearizable on the same `Process` row: if a claim and a CAS `Apply` both
+   read the row at the same `Rev`, exactly one of them advances it to `Rev+1`
+   and the other observes the result — a claim finds nothing eligible, or an
+   `Apply` returns `ErrConflict`. This is not an extra obligation beyond items
+   2 and 4; it falls out of both being CAS writes on the same row once a store
+   implements them correctly. It matters because it is what lets a caller claim
+   one specific `pending` row through an ordinary `Apply`, instead of through
+   `ClaimNextProcess`, and still race a poller safely — eager dispatch
+   (ADR-0016) does exactly this, with no new SPI method.
 
 Reads deep-copy on the way out: a caller mutating a returned `*Process` must not
 be able to reach stored state.
@@ -80,8 +90,9 @@ conditional write, or a mutex around an immutable snapshot.
   increment, cross-row atomicity, guards, both uniqueness domains, await upsert,
   event ordering, claim eligibility (pending / waiting past `WakeAt` / expired
   lease), fresh-token-per-claim, unclean-reclaim counting, attempt-counter
-  round-trip, no-double-claim under 100-way concurrency, and deep-copy-on-read.
-  **Run it against any new implementation.**
+  round-trip, no-double-claim under 100-way concurrency, item 7's mutual
+  linearizability of `ClaimNextProcess` against a racing `Apply`, and
+  deep-copy-on-read. **Run it against any new implementation.**
 - The kernel must handle `ErrConflict` everywhere it writes. It does, with
   re-read-and-re-decide loops in `Respond`, `Cancel`, `commitFinal`, the worker's
   commit path, and the two orderly exits from a claim (`requeue` and `release`).
@@ -101,3 +112,4 @@ conditional write, or a mutex around an immutable snapshot.
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D3, D34). |
 | 2026-07-21 | Contract item 4 gained the `unclean_reclaims` counting rule (ADR-0015). It belongs here rather than only in ADR-0015 because this is the contract a third-party `Repository` author implements against; without it they could conform to the letter and still leave crash replay unbounded. |
+| 2026-07-22 | Added contract item 7: `ClaimNextProcess` and `Apply` are mutually linearizable on the same `Process` row. It belongs here rather than only in ADR-0016 because it is a property of this SPI's `Rev` CAS itself, not of the eager-dispatch feature that first needed it stated explicitly — a third-party `Repository` could otherwise conform to items 1–6 and still let a claim and a racing `Apply` both succeed on one row. |

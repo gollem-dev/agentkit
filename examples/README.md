@@ -60,9 +60,10 @@ descriptions below are of the offline run.
 The four steps, always in this order: register, construct, spawn, serve.
 
 Worth noticing that `Spawn` returns before anything executes. It writes a
-pending `Process` and stops there; work begins when a `Serve` worker claims it.
-The example runs the worker in a goroutine only so that one program can show
-both halves.
+pending `Process` and stops there; work begins when a `Serve` worker claims it —
+with `Serve` already running, that is usually eager and immediate rather than
+waiting for the next poll. The example runs the worker in a goroutine only so
+that one program can show both halves.
 
 ## tools
 

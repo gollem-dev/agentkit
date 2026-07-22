@@ -109,7 +109,7 @@ func TestPlanExecE2E(t *testing.T) {
 	pid, err := plan.Spawn(ctx, k, planexec.Input{Prompt: "write a report"})
 	gt.NoError(t, err)
 
-	p := serveUntil(t, k, repo, pid, isTerminal, agentkit.WithConcurrency(4))
+	p := serveUntil(t, k, repo, pid, isTerminal, agentkit.WithPollConcurrency(4))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 
 	var out planexec.Output
@@ -204,7 +204,7 @@ func TestWithOnFinishDeliversTypedOutput(t *testing.T) {
 	pid, err := plan.Spawn(ctx, k, planexec.Input{Prompt: "write a report"})
 	gt.NoError(t, err)
 
-	p := serveUntil(t, k, repo, pid, isTerminal, agentkit.WithConcurrency(4))
+	p := serveUntil(t, k, repo, pid, isTerminal, agentkit.WithPollConcurrency(4))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 
 	mu.Lock()

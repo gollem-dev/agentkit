@@ -29,7 +29,10 @@ Two properties are worth stating explicitly:
   when it is answered (`Respond`) or requeued after an error, and claimed from
   there; the one exception is a process `waiting` on a deadline, which is claimed
   straight from `waiting` once its `WakeAt` is due. Either way there is only one
-  way in for a worker: `ClaimNextProcess`.
+  claim mechanism (take the row to `running` with a fresh `LeaseToken`); what
+  *triggers* it is either a poll loop's `ClaimNextProcess` or eager dispatch
+  claiming a specific pending row in-process
+  ([ADR-0016](../adr/0016-eager-dispatch-is-a-scheduling-optimization.md)).
 - **`limit_exceeded` is not a status.** It is `failed` carrying
   `FailureLimitExceeded`, alongside `FailureStrategyError` and
   `FailureRetryExhausted` (ADR-0010).
@@ -56,8 +59,10 @@ and Worker except rows.
 ### Spawn — launch, then walk away
 
 `Spawn` returns a `ProcessID` the instant the `pending` row lands. Execution is a
-separate event: a later claim by some worker — this process's own `Serve` loop,
-or another instance.
+separate event. On an instance running `Serve`, eager dispatch drives the row
+immediately; otherwise it waits for some worker's poll — this process's own
+`Serve` loop, or another instance
+([ADR-0016](../adr/0016-eager-dispatch-is-a-scheduling-optimization.md)).
 
 ```mermaid
 sequenceDiagram
@@ -79,9 +84,13 @@ sequenceDiagram
   end
   K->>R: Apply(pending row + process.created)
   K-->>App: ProcessID (returns immediately)
-  Note over K,W: Spawn runs no strategy — execution needs a separate claim,<br/>which may even happen before Spawn returns
-  W->>R: ClaimNextProcess
-  Note over W: pending → running — the strategy's first transition begins
+  alt Serve running here (and a slot is free)
+    K->>R: eager dispatch: Apply(pending → running, fresh LeaseToken)
+    Note over K,R: drives the first transition now, on a goroutine
+  else no Serve here / hard limit full
+    W->>R: ClaimNextProcess (a later poll)
+    Note over W: pending → running — the first transition begins
+  end
 ```
 
 `Init` runs *before* the idempotency and subject lookups, so an idempotent
@@ -96,7 +105,8 @@ idempotency key.
 
 `Respond` is how an answer to a question await (a human's yes/no, an external
 callback) re-queues a `waiting` process. It moves the row to `pending`; it does
-**not** run the strategy — a worker does that on its next claim.
+**not** run the strategy itself. On an instance running `Serve` it then eagerly
+dispatches the resume; otherwise a worker picks it up on its next poll.
 
 ```mermaid
 sequenceDiagram
@@ -117,7 +127,11 @@ sequenceDiagram
     K->>R: Apply(await → responded, waiting → pending)
     Note right of K: ErrConflict → re-read and re-judge (first-writer-wins)
     K-->>App: nil
-    W->>R: ClaimNextProcess
+    alt Serve running here (and a slot is free)
+      K->>R: eager dispatch: claim + resume now
+    else
+      W->>R: ClaimNextProcess (a later poll)
+    end
     Note over W: the strategy resumes with the response visible
   end
 ```
@@ -178,13 +192,20 @@ sequenceDiagram
   Note over P: strategy calls SpawnChild (buffered), then WaitChildren → Suspend
   P->>R: Apply(parent: running → waiting · child: pending · children-await open)
   Note over P,R: one commit — parent suspend and child spawn land together
-  C->>R: ClaimNextProcess (the child row)
-  Note over C: child runs to Done / Fail
+  P->>C: eager dispatch each child (on this commit, before OnCommit)
+  Note over C: child claimed (Apply Rev-CAS) and runs to Done / Fail
   C->>R: Apply(child terminal + parent waiting → pending + await responded)
   Note over C,R: the child's terminal commit wakes the parent, in the same Apply
-  P->>R: ClaimNextProcess (parent, now pending again)
-  Note over P: WaitChildren await now carries each child's ChildResult
+  C->>P: eager dispatch the woken parent (on this commit)
+  Note over P: resumes; WaitChildren await now carries each child's ChildResult
 ```
+
+Each arrow labelled *eager dispatch* is the in-process fast path on an instance
+running `Serve` (ADR-0016); on overflow or with no `Serve` here, a poll's
+`ClaimNextProcess` does the same claim instead. The whole tree therefore runs
+without a poll wait between hops on the common path. Eager dispatch happens on
+the same commit, *before* the transition's `OnCommit`/`OnFinish` callbacks, so a
+child may begin executing before the parent's `OnCommit` runs.
 
 If every waited child is *already* terminal when the parent declares the wait,
 there is no one left to do the waking — so the await is written already
@@ -199,10 +220,22 @@ claimable when it is `pending`, or `waiting` with a `WakeAt` in the past, or
 `running` with an expired lease. Every claim mints a fresh `LeaseToken` — the
 fence identity for that claim.
 
-Wakeup is polling only. A `LISTEN`/`NOTIFY`-style push is a store-specific
-optimization; putting it in the `Repository` contract would tax every
-implementation. It can be added later as an optional interface without breaking
-anyone.
+**Cross-instance wakeup is polling only.** A `LISTEN`/`NOTIFY`-style push is a
+store-specific optimization; putting it in the `Repository` contract would tax
+every implementation. It can be added later as an optional interface without
+breaking anyone.
+
+**Within an instance running `Serve`, eager dispatch is the in-process form of
+that push** ([ADR-0016](../adr/0016-eager-dispatch-is-a-scheduling-optimization.md)).
+When a Process becomes runnable here — `Spawn`, `Respond`, a spawned child, a
+woken parent — it is driven immediately on a goroutine instead of waiting for the
+next poll. It is a scheduling optimization only: it claims a specific pending row
+via an ordinary `Apply` Rev-CAS (racing a poller's `ClaimNextProcess` under the
+same fence) and then runs the identical claim machinery. Polling remains the
+ground truth and the fallback: when the hard concurrency limit is full, or no
+`Serve` runs here, or a crash intervenes, a poll recovers the row. Concurrency is
+two-tier — `WithPollConcurrency` (poll loops) and `WithMaxConcurrent` (the hard
+ceiling shared by poll and eager).
 
 A claim is not one transition. Having paid for the claim, the worker runs a
 bounded run of transitions, re-reading the process each time and stopping when
@@ -360,10 +393,12 @@ abandoned rather than committed partially. The process stays non-terminal and is
 retried after its lease expires — a delayed finalize is recoverable, a lost
 wakeup is not.
 
-A registered completion handler (`WithOnFinish`) runs immediately after that
-`Apply` succeeds, synchronously, on whichever instance committed. Everything
-above is inside the commit; the handler is outside it, and that asymmetry is the
-whole of its guarantee:
+A registered completion handler (`WithOnFinish`) runs right after that `Apply`
+succeeds, synchronously, on whichever instance committed — but *after* eager
+dispatch has already submitted any child buffered by this transition and the
+parent this termination woke, so a slow handler cannot delay runnable work
+(ADR-0016). Everything above is inside the commit; the handler is outside it, and
+that asymmetry is the whole of its guarantee:
 
 - It cannot fire twice. Every terminal path funnels through one commit, and a
   worker that loses the CAS race abandons before reaching the call.

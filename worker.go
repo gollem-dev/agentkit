@@ -23,7 +23,8 @@ type serveConfig struct {
 	maxStepsPerClaim   int
 	maxStepAttempts    int
 	maxUncleanReclaims int
-	concurrency        int
+	pollConcurrency    int // soft limit: number of parallel poll (claim) loops.
+	maxConcurrent      int // hard limit: max claims driven at once (poll + eager).
 }
 
 // WithWorkerID sets the worker id (diagnostic). Default: hostname + "/" + uuid v7.
@@ -38,6 +39,8 @@ func WithPollInterval(d time.Duration) ServeOption {
 }
 
 // WithMaxStepsPerClaim sets how many transitions one claim runs. Default: 16.
+// A value < 1 is treated as the default (0 would run no transition and release,
+// which under eager dispatch re-submits in a tight loop).
 func WithMaxStepsPerClaim(n int) ServeOption { return func(c *serveConfig) { c.maxStepsPerClaim = n } }
 
 // WithMaxStepAttempts sets the step retry limit. Default: 3. This bounds
@@ -63,8 +66,31 @@ func WithMaxUncleanReclaims(n int) ServeOption {
 	return func(c *serveConfig) { c.maxUncleanReclaims = n }
 }
 
-// WithConcurrency sets the number of parallel claim loops. Default: 1.
-func WithConcurrency(n int) ServeOption { return func(c *serveConfig) { c.concurrency = n } }
+// WithPollConcurrency sets the number of parallel poll (claim) loops — the soft
+// limit on polling-driven concurrency. Default: 1. It is sub-capped by the hard
+// limit (WithMaxConcurrent).
+func WithPollConcurrency(n int) ServeOption {
+	return func(c *serveConfig) { c.pollConcurrency = n }
+}
+
+// WithMaxConcurrent sets the hard limit: the maximum number of claims this Serve
+// drives at once, counting both poll loops and eager dispatch. Default: 64. It
+// is the capacity of a single semaphore shared by both; eager dispatch may burst
+// up to it, and WithPollConcurrency is clamped to it. This bounds concurrent
+// drivers, not `running` rows (a driver that panics frees its slot while the row
+// stays running until its lease expires; other instances are not counted).
+func WithMaxConcurrent(n int) ServeOption {
+	return func(c *serveConfig) { c.maxConcurrent = n }
+}
+
+// defaultMaxConcurrent is the default hard limit. It is a moderate ceiling
+// rather than a CPU-count derivation because a claim is I/O-bound (an LLM call),
+// not CPU-bound; tune it to the deployment's LLM rate limits and memory.
+const defaultMaxConcurrent = 64
+
+// defaultMaxStepsPerClaim is the default (and clamp floor) for how many
+// transitions one claim runs.
+const defaultMaxStepsPerClaim = 16
 
 func newServeConfig(opts []ServeOption) serveConfig {
 	host, _ := os.Hostname()
@@ -72,49 +98,96 @@ func newServeConfig(opts []ServeOption) serveConfig {
 		workerID:           host + "/" + uuid.Must(uuid.NewV7()).String(),
 		lease:              60 * time.Second,
 		pollInterval:       500 * time.Millisecond,
-		maxStepsPerClaim:   16,
+		maxStepsPerClaim:   defaultMaxStepsPerClaim,
 		maxStepAttempts:    3,
 		maxUncleanReclaims: 3,
-		concurrency:        1,
+		pollConcurrency:    1,
+		maxConcurrent:      defaultMaxConcurrent,
 	}
 	for _, o := range opts {
 		o(&cfg)
 	}
-	if cfg.concurrency < 1 {
-		cfg.concurrency = 1
+	// Clamp order matters: the hard limit must be >= 1 first (a zero hard limit
+	// would let no poll loop ever acquire a slot, deadlocking Serve), then the
+	// soft limit >= 1, then soft <= hard so poll loops can always acquire.
+	if cfg.maxConcurrent < 1 {
+		cfg.maxConcurrent = defaultMaxConcurrent
+	}
+	if cfg.pollConcurrency < 1 {
+		cfg.pollConcurrency = 1
+	}
+	if cfg.pollConcurrency > cfg.maxConcurrent {
+		cfg.pollConcurrency = cfg.maxConcurrent
+	}
+	// maxStepsPerClaim must be >= 1. Zero means "run no transition, release", and
+	// under eager dispatch that release re-submits immediately — a tight claim ->
+	// release -> re-dispatch loop that churns goroutines and hammers the store.
+	if cfg.maxStepsPerClaim < 1 {
+		cfg.maxStepsPerClaim = defaultMaxStepsPerClaim
 	}
 	return cfg
 }
 
-// Serve runs claim loops until ctx is done (blocking). WithConcurrency loops
-// share a workerID; the per-claim LeaseToken is the fence identity (D50).
+// Serve runs claim loops until ctx is done (blocking). WithPollConcurrency loops
+// share a workerID; the per-claim LeaseToken is the fence identity (D50). It also
+// installs the eager dispatcher for this Kernel: a Process becoming runnable here
+// (Spawn/Respond/child/parent) is driven immediately rather than at the next poll
+// (ADR-0016). Only one Serve may be active per Kernel; a second returns
+// ErrServeActive, because the dispatcher and its concurrency semaphore are
+// per-Serve state that a second Serve would silently clobber.
 func (k *Kernel) Serve(ctx context.Context, opts ...ServeOption) error {
 	cfg := newServeConfig(opts)
+	sem := newSemaphore(cfg.maxConcurrent)
+	d := &dispatcher{k: k, ctx: ctx, cfg: cfg, sem: sem}
+	if !k.dispatcher.CompareAndSwap(nil, d) {
+		return goerr.Wrap(ErrServeActive, "another Serve is already active on this Kernel")
+	}
+	// Drain BEFORE clearing the pointer, not after. While close() stops new
+	// submits and waits out in-flight eager runs, the pointer still points at the
+	// (now closed) dispatcher, so dispatch() degrades to polling and a second
+	// Serve still sees non-nil and gets ErrServeActive. Clearing first would let a
+	// second Serve install its own dispatcher while this one's eager runs are
+	// still draining — two live dispatchers, two semaphores, hard limit doubled.
+	defer func() {
+		d.close()
+		k.dispatcher.CompareAndSwap(d, nil) // owner-checked: never clears a successor's pointer.
+	}()
 	var wg sync.WaitGroup
-	for i := 0; i < cfg.concurrency; i++ {
+	for i := 0; i < cfg.pollConcurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			k.serveLoop(ctx, cfg)
+			k.serveLoop(ctx, cfg, sem)
 		}()
 	}
 	wg.Wait()
 	return ctx.Err()
 }
 
-func (k *Kernel) serveLoop(ctx context.Context, cfg serveConfig) {
+// serveLoop polls for runnable Processes. It acquires a hard-limit slot before
+// claiming (never after), so it never holds a claim while blocked for a slot —
+// which would let the lease lapse and be charged as an unclean reclaim. The
+// semaphore is shared with eager dispatch, bounding total concurrent claims to
+// the hard limit.
+func (k *Kernel) serveLoop(ctx context.Context, cfg serveConfig, sem semaphore) {
 	for ctx.Err() == nil {
+		if !sem.acquire(ctx) {
+			return // ctx done.
+		}
 		proc, err := k.repo.ClaimNextProcess(ctx, cfg.workerID, k.clock().Add(cfg.lease), k.clock())
 		if err != nil {
+			sem.release()
 			k.logger.Error("claim failed", "error", err)
 			sleepOrDone(ctx, cfg.pollInterval)
 			continue
 		}
 		if proc == nil {
+			sem.release()
 			sleepOrDone(ctx, cfg.pollInterval)
 			continue
 		}
 		k.runClaim(ctx, cfg, proc)
+		sem.release()
 	}
 }
 
@@ -127,21 +200,32 @@ func sleepOrDone(ctx context.Context, d time.Duration) {
 	}
 }
 
+// claimOutcome reports how runClaim ended, so the eager dispatcher can decide
+// whether to re-submit. Only the step-budget release path yields claimReleased;
+// every other exit (suspend, terminal, abandon, error, requeue) is claimStopped
+// and needs no re-dispatch (a response, wake, or poll will pick it back up).
+type claimOutcome int
+
+const (
+	claimStopped  claimOutcome = iota
+	claimReleased              // maxStepsPerClaim spent, released back to pending.
+)
+
 // runClaim drives one claimed Process for up to maxStepsPerClaim transitions.
-func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
+func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) claimOutcome {
 	claimToken := proc.LeaseToken // the fence identity for this claim (D50).
 	b, err := k.agents.binding(proc.Agent)
 	if err != nil {
 		// Unknown agent: a permanent config mismatch (e.g. a binary generation skew).
 		_ = k.finalize(ctx, proc, failWith(FailureStrategyError, err), claimToken, nil)
-		return
+		return claimStopped
 	}
 	var toolList []gollem.Tool
 	if k.toolFactory != nil {
 		toolList, err = k.toolFactory(ctx, proc)
 		if err != nil {
 			k.requeueInfra(ctx, cfg, proc, claimToken, goerr.Wrap(err, "tool factory"))
-			return
+			return claimStopped
 		}
 	}
 	k.expireDueAwaits(ctx, proc)
@@ -149,14 +233,14 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 	for i := 0; i < cfg.maxStepsPerClaim; i++ {
 		fresh, err := k.repo.GetProcess(ctx, proc.ID)
 		if err != nil {
-			return
+			return claimStopped
 		}
 		if fresh.LeaseToken != claimToken {
-			return // lost the lease between transitions.
+			return claimStopped // lost the lease between transitions.
 		}
 		if fresh.CancelRequested {
 			_ = k.finalize(ctx, fresh, cancelledWith(fresh.CancelReason), claimToken, nil)
-			return
+			return claimStopped
 		}
 		proc = fresh
 		// Bounded before Step rather than after a failure, because an unclean
@@ -171,12 +255,12 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 				goerr.V("unclean_reclaims", proc.UncleanReclaims),
 				goerr.V("limit", cfg.maxUncleanReclaims))
 			_ = k.finalize(ctx, proc, failWith(FailureUncleanReclaim, cause), claimToken, nil)
-			return
+			return claimStopped
 		}
 		if k.limiter != nil {
 			if lerr := k.limiter(ctx, proc, proc.Metrics); lerr != nil {
 				_ = k.finalize(ctx, proc, failWith(FailureLimitExceeded, lerr), claimToken, nil)
-				return
+				return claimStopped
 			}
 		}
 
@@ -190,13 +274,14 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			} else {
 				k.requeueTransition(ctx, cfg, proc, claimToken, terr, sys.runMetrics)
 			}
-			return
+			return claimStopped
 		}
 
 		if dec.kind == DecisionDone || dec.kind == DecisionFail {
-			// commitTerminal fires the spawn OnCommit callbacks itself (nil on commit, err on abandon).
+			// commitTerminal fires the spawn OnCommit callbacks and eager dispatch
+			// itself (nil on commit, err on abandon).
 			_ = k.commitTerminal(ctx, proc, rawState, b.version, sys.seq, dec, sys, claimToken)
-			return
+			return claimStopped
 		}
 
 		cs, cerr := k.buildCommit(ctx, proc, rawState, b.version, sys.seq, dec, sys, cfg)
@@ -208,27 +293,29 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 			} else {
 				k.requeueTransition(ctx, cfg, proc, claimToken, cerr, sys.runMetrics)
 			}
-			return
+			return claimStopped
 		}
 		if err := k.repo.Apply(ctx, cs.changeSet); err != nil {
 			if errors.Is(err, ErrConflict) {
 				sys.notifySpawnDone(err) // this attempt's buffered children did not commit.
 				cur, gerr := k.repo.GetProcess(ctx, proc.ID)
 				if gerr != nil || cur == nil || cur.LeaseToken != claimToken {
-					return // lost the lease -> abandon (never rebase, D50).
+					return claimStopped // lost the lease -> abandon (never rebase, D50).
 				}
 				proc = cur
 				i--
 				continue // same-lease race (Cancel etc.) -> rebuild.
 			}
 			sys.notifySpawnDone(err)
-			return
+			return claimStopped
 		}
-		// Committed: fire spawn OnCommit callbacks (#5/#8).
+		// Committed: eager-dispatch buffered children before firing OnCommit, so a
+		// slow handler cannot delay a runnable child (ADR-0016). Then the callbacks.
+		k.dispatchChildren(sys)
 		sys.notifySpawnDone(nil)
 		switch {
 		case cs.suspend:
-			return // waiting committed.
+			return claimStopped // waiting committed.
 		case cs.elidedRunning:
 			// WaitChildren elision: children already done; continue this claim.
 			continue
@@ -237,6 +324,55 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) {
 		}
 	}
 	k.release(ctx, proc, claimToken)
+	return claimReleased
+}
+
+// claimSpecific claims one pending Process by id, for eager dispatch. It writes
+// running + a fresh LeaseToken via an ordinary Rev-CAS Apply — the same fence a
+// poll claim uses — so it races ClaimNextProcess safely: whoever advances the
+// Rev first wins, the loser sees ErrConflict and abandons. It targets pending
+// ONLY; a running row (an expired lease) is left to ClaimNextProcess, which is
+// the sole path that counts unclean reclaims, so eager never inflates that
+// counter.
+//
+// A normal loss — ErrConflict, a not-found row, or a status that is no longer
+// pending — is silent (a poller or another dispatch got there first). Any other
+// error is a repository fault worth surfacing, so it is logged before abandoning
+// (the row is recovered by polling either way).
+func (k *Kernel) claimSpecific(ctx context.Context, pid ProcessID, cfg serveConfig) (*Process, bool) {
+	proc, err := k.repo.GetProcess(ctx, pid)
+	if err != nil {
+		if !errors.Is(err, ErrProcessNotFound) {
+			k.logger.Error("eager claim: get failed", "process", pid, "error", err)
+		}
+		return nil, false
+	}
+	if proc.Status != ProcessPending {
+		return nil, false
+	}
+	now := k.clock()
+	c := proc.clone()
+	c.Status = ProcessRunning
+	c.LeaseOwner = cfg.workerID
+	c.LeaseToken = uuid.Must(uuid.NewV7()).String() // fresh fence identity per claim.
+	lu := now.Add(cfg.lease)
+	c.LeaseUntil = &lu
+	c.UpdatedAt = now
+	// Rev stays proc.Rev so Apply's CAS advances it by one; a conflict means
+	// another worker claimed the row first.
+	if err := k.repo.Apply(ctx, ChangeSet{Processes: []*Process{c}}); err != nil {
+		if !errors.Is(err, ErrConflict) {
+			// A non-conflict Apply error may have committed indeterminately (e.g. the
+			// filesystem store's post-rename failure): the row could already be
+			// running with our token. We still abandon; the lease then expires and a
+			// poller reclaims it (counted as an unclean reclaim). Rare, bounded by
+			// WithMaxUncleanReclaims, and always recovered by polling.
+			k.logger.Error("eager claim: apply failed", "process", pid, "error", err)
+		}
+		return nil, false
+	}
+	c.Rev = proc.Rev + 1
+	return c, true
 }
 
 // runTransition decodes state, runs Step, and encodes the result. Panics are
@@ -612,6 +748,14 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 		}
 		if err != nil {
 			return k.abortFinal(sys, err)
+		}
+		// Eager-dispatch after the durable commit, before user callbacks (ADR-0016):
+		// any child buffered by this (terminal) transition, and the parent this
+		// termination may have woken to pending. Both are self-guarded by
+		// claimSpecific, so dispatching a not-actually-woken parent is a no-op.
+		k.dispatchChildren(sys)
+		if p.ParentID != nil {
+			k.dispatch(*p.ParentID)
 		}
 		if sys != nil {
 			sys.notifySpawnDone(nil)

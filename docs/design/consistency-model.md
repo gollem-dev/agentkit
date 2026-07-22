@@ -101,6 +101,27 @@ The reachable variant is: worker A's lease expires while it is still alive,
 worker B claims, and A then tries to commit. A's `Rev` is stale, `Apply`
 conflicts, A compares lease tokens, sees B's, and abandons.
 
+Eager dispatch claims through the same fence rather than a second one: it
+targets a specific `pending` row with an ordinary `Apply` `Rev` CAS instead of
+`ClaimNextProcess`, so it can race a poll loop claiming the same row. The
+contract requires `ClaimNextProcess` and `Apply` to be mutually linearizable on
+one `Process` row — of two claimants reading it at the same `Rev`, exactly one
+advances it and the other observes the new `Rev` (a claim finds nothing to
+claim; an `Apply` gets `ErrConflict`) — which is what lets eager dispatch claim
+a pending row via `Apply` without a dedicated SPI method
+([ADR-0004](../adr/0004-repository-changeset-rev-cas.md), `repository.go`
+contract item 4).
+
+An eager claim's `Apply` can also fail *indeterminately* — the filesystem
+store's post-rename failure is the example — meaning the row may already be
+committed as `running` under the claim's token even though `Apply` returned an
+error. Eager dispatch still abandons on any non-`ErrConflict` error rather than
+assuming success, so that row's lease then simply expires and a poller
+reclaims it, counted as an unclean reclaim
+([ADR-0015](../adr/0015-unclean-reclaims-are-counted-and-bounded.md)). Rare,
+bounded by `WithMaxUncleanReclaims`, and always recovered by polling — an
+`Apply` error here is not a claim that nothing was committed.
+
 ### A child finishes before the parent waits on it
 
 Handled at declaration: `WaitChildren` reads the children and, if all are

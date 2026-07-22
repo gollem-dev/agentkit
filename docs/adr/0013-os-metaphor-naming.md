@@ -10,6 +10,7 @@ agentkit's core vocabulary is borrowed from operating systems, consistently:
 | the driving core | `Kernel` | the kernel |
 | the effect gateway | `Syscalls` (parameter name `sys`) | system calls |
 | launching | `Spawn` / `SpawnChild` | `fork` |
+| dispatching a ready process | `dispatch` / `dispatcher` | the scheduler's dispatcher (ready → CPU) |
 | identity / clock | `ProcessID()` / `Now()` | `getpid` / clock |
 | a registered program | `AgentName` + strategy | a program on disk |
 | launch input | `Input` | `argv` |
@@ -42,8 +43,16 @@ Adopt the OS metaphor throughout, and let it decide naming questions:
   `ProcessID` is.
 - `ModelSlot` → **`ModelRole`** (see ADR-0006).
 - `Start` → **`Spawn`**. Launching is asynchronous — it writes a pending row and
-  returns; execution begins when a worker claims it. "Spawn" describes creation,
-  which is what actually happens; "start" would suggest execution has begun.
+  returns. "Spawn" describes creation, which is what actually happens; "start"
+  would suggest execution has begun. Execution is a separate event: a worker's
+  claim, or — on an instance running `Serve` — eager dispatch, which may begin
+  driving the Process on a goroutine before `Spawn` even returns
+  ([ADR-0016](0016-eager-dispatch-is-a-scheduling-optimization.md)). `Spawn`
+  still only creates; it does not itself run the strategy.
+- **`dispatch`** names the in-process scheduler step that hands a ready Process to
+  a goroutine to run, mirroring an OS dispatcher handing a ready process to a CPU
+  (ADR-0016). It is the one scheduler-metaphor name; there is still no scheduler
+  *priority*.
 
 ## Alternatives rejected
 
@@ -71,3 +80,4 @@ Adopt the OS metaphor throughout, and let it decide naming questions:
 | Date | Change |
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D5, D22, D23, D24, D25, D30, D37). |
+| 2026-07-22 | Added `dispatch`/`dispatcher` to the vocabulary and clarified that, with eager dispatch, execution may begin before `Spawn` returns (ADR-0016). |

@@ -70,6 +70,24 @@ func AddMetrics(a, b Metrics) Metrics { return addMetrics(a, b) }
 // CloneProcess is the exported form of (*Process).clone for testing.
 func CloneProcess(p *Process) *Process { return p.clone() }
 
+// ServeConfigForTest resolves ServeOptions to the clamped (pollConcurrency,
+// maxConcurrent) so tests can assert the clamp order without starting Serve.
+func ServeConfigForTest(opts ...ServeOption) (pollConcurrency, maxConcurrent int) {
+	c := newServeConfig(opts)
+	return c.pollConcurrency, c.maxConcurrent
+}
+
+// MaxStepsPerClaimForTest resolves ServeOptions to the clamped maxStepsPerClaim.
+func MaxStepsPerClaimForTest(opts ...ServeOption) int {
+	return newServeConfig(opts).maxStepsPerClaim
+}
+
+// ClaimSpecificForTest exposes claimSpecific (the eager claim path) so a test can
+// assert it claims pending rows only and never touches UncleanReclaims.
+func (k *Kernel) ClaimSpecificForTest(ctx context.Context, pid ProcessID) (*Process, bool) {
+	return k.claimSpecific(ctx, pid, newServeConfig(nil))
+}
+
 // AwaitSpecView exposes an AwaitSpec's private fields for testing.
 type AwaitSpecView struct {
 	Key      AwaitKey

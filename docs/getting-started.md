@@ -68,7 +68,9 @@ Four steps, always in this order: **register → construct → spawn → serve.*
 
 `Spawn` runs the strategy's `Init` synchronously (so a bad input is an error you
 get right there), writes a `pending` process row, and returns its ID. Nothing
-executes until a `Serve` worker claims it.
+executes until a `Serve` worker claims it — on an instance already running
+`Serve`, that claim is usually dispatched eagerly rather than waiting for the
+next poll ([ADR-0016](adr/0016-eager-dispatch-is-a-scheduling-optimization.md)).
 
 That separation is the point: the process that accepts a request and the process
 that runs the agent do not have to be the same one, or even be alive at the same
@@ -186,7 +188,7 @@ open it. Neither bundled implementation is meant for multi-host workers — see
 ```go
 err := kernel.Serve(ctx,
     agentkit.WithWorkerID("worker-1"),
-    agentkit.WithConcurrency(4),
+    agentkit.WithPollConcurrency(4),
     agentkit.WithPollInterval(200*time.Millisecond),
     agentkit.WithLease(30*time.Second),
 )

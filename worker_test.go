@@ -347,9 +347,9 @@ func TestChildrenWakeup(t *testing.T) {
 	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
 	gt.NoError(t, err)
 
-	// WithConcurrency(4) so the two children run in parallel, exercising the
+	// WithPollConcurrency(4) so the two children run in parallel, exercising the
 	// #3 sibling-finalize serialization and #4 buffered-child overlay.
-	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithConcurrency(4))
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithPollConcurrency(4))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 	gt.Value(t, string(p.Output)).Equal("2") // both children succeeded and were collected.
 }
@@ -545,7 +545,7 @@ func TestParentWakeupSurvivesTransientReadError(t *testing.T) {
 
 	// Short lease so an aborted finalize retries quickly.
 	p := serveUntil(t, k, hr, pid, 5*time.Second, isTerminal,
-		agentkit.WithLease(30*time.Millisecond), agentkit.WithConcurrency(2))
+		agentkit.WithLease(30*time.Millisecond), agentkit.WithPollConcurrency(2))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 	gt.Value(t, string(p.Output)).Equal("ok")
 }
@@ -840,7 +840,7 @@ func TestFinishHandlerFiresOncePerProcessUnderConcurrency(t *testing.T) {
 			_ = k.Serve(serveCtx,
 				agentkit.WithPollInterval(2*time.Millisecond),
 				agentkit.WithLease(2*time.Second),
-				agentkit.WithConcurrency(2))
+				agentkit.WithPollConcurrency(2))
 		}()
 	}
 

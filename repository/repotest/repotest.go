@@ -6,6 +6,7 @@ package repotest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -494,6 +495,77 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 			gt.Value(t, p.Status).Equal(agentkit.ProcessRunning)
 		}
 		gt.Value(t, count).Equal(n) // every Process claimed exactly once.
+	})
+
+	// ClaimNextProcess and Apply must be mutually linearizable on the same row: a
+	// poll claim and an eager Apply-claim that both start from Rev N cannot both
+	// succeed. This is what lets eager dispatch claim a pending row via Apply
+	// without a dedicated SPI, racing a poller safely (repository.go contract 4).
+	t.Run("ClaimVsApplyLinearizable", func(t *testing.T) {
+		repo := factory(t)
+		const rounds = 50
+		for i := 0; i < rounds; i++ {
+			pid := newPID()
+			gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mkProc(pid)}}))
+
+			cur, err := repo.GetProcess(ctx, pid) // Rev 1, pending.
+			gt.NoError(t, err)
+			now := time.Now()
+			lu := now.Add(time.Hour)
+			cur.Status = agentkit.ProcessRunning
+			cur.LeaseOwner = "eager"
+			cur.LeaseToken = uniqueStr("tok")
+			cur.LeaseUntil = &lu
+			cur.UpdatedAt = now // Rev stays at the read value so Apply CAS races the claim.
+
+			// A start barrier so both operations genuinely race from the same Rev,
+			// rather than possibly running in sequence (which would pass vacuously).
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			var claimProc *agentkit.Process
+			var claimErr, applyErr error
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-start
+				claimProc, claimErr = repo.ClaimNextProcess(ctx, "poller", lu, now)
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				applyErr = repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{cur}})
+			}()
+			close(start)
+			wg.Wait()
+
+			gt.NoError(t, claimErr) // ClaimNextProcess never errors here (nil,nil if nothing).
+			claimWon := claimProc != nil && claimProc.ID == pid
+			applyWon := applyErr == nil
+
+			// Exactly one path won the row.
+			won := 0
+			if claimWon {
+				won++
+			}
+			if applyWon {
+				won++
+			}
+			gt.Value(t, won).Equal(1)
+
+			// The loser must lose in the contract-defined way, not by some other
+			// error: an implementation that fails Apply with a non-ErrConflict error
+			// while the claim wins would otherwise satisfy `won == 1` and slip past.
+			if applyWon {
+				gt.Bool(t, claimProc == nil).True() // claim saw the row already running.
+			} else {
+				gt.Bool(t, errors.Is(applyErr, agentkit.ErrConflict)).True() // Apply lost via Rev CAS.
+			}
+
+			final, err := repo.GetProcess(ctx, pid)
+			gt.NoError(t, err)
+			gt.Value(t, final.Status).Equal(agentkit.ProcessRunning)
+			gt.Value(t, final.Rev).Equal(int64(2)) // exactly one write advanced Rev 1 -> 2.
+		}
 	})
 
 	t.Run("DeepCopyProcess", func(t *testing.T) {

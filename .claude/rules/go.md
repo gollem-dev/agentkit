@@ -54,8 +54,13 @@ tests, no `strings.Contains(err.Error(), ...)`) apply as usual.
   rebuild against fresh state and retry; different token → abandon.
 - **`ErrConflict` must propagate.** The kernel's retry loops depend on seeing
   it. Never swallow it or translate it into another error.
-- No cross-request state in process memory. The `Registry` is the one long-lived
-  in-memory structure, and it is read-only after registration.
+- No cross-request state in process memory, with two explicit exceptions. The
+  `Registry` is one: long-lived, read-only after registration. The second is
+  `Kernel.dispatcher` (the eager scheduler, ADR-0016): an `atomic.Pointer`
+  installed by `Serve` and cleared when it returns. It holds no business state —
+  losing it only degrades to polling — so it does not violate the rule's intent
+  (durable business state must not live only in memory). Any further mutable
+  Kernel state needs the same justification and an ADR.
 
 ## Errors
 

@@ -8,7 +8,7 @@
 // (flock) makes a second New on the same directory fail — and it rewrites the
 // whole snapshot on every write, so I/O is O(state size). It suits development,
 // tests, and small one-shot runs; large or high-throughput deployments should
-// use a database-backed Repository. Serve's WithConcurrency (in-process
+// use a database-backed Repository. Serve's WithPollConcurrency (in-process
 // goroutine concurrency) is supported.
 package filesystem
 

@@ -41,4 +41,8 @@ var (
 	// implementation after a post-rename I/O failure leaves persisted state and
 	// in-memory state diverged; the Repository is fail-stopped until reopened.
 	ErrRepositoryIndeterminate = goerr.New("repository indeterminate")
+	// ErrServeActive is returned by Serve when another Serve is already running on
+	// the same Kernel. One Kernel drives at most one active Serve, because the
+	// eager dispatcher and its concurrency semaphore are installed per-Serve.
+	ErrServeActive = goerr.New("serve already active")
 )
