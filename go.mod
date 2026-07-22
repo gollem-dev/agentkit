@@ -10,4 +10,7 @@ require (
 	golang.org/x/sys v0.47.0
 )
 
-require github.com/google/go-cmp v0.7.0 // indirect
+require (
+	github.com/google/go-cmp v0.7.0 // indirect
+	google.golang.org/grpc v1.82.1 // indirect
+)
