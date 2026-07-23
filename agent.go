@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/gollem-dev/gollem"
 	"github.com/m-mizutani/goerr/v2"
 )
 
@@ -44,6 +45,9 @@ type RegisterOption[O any] func(*registerConfig[O])
 type registerConfig[O any] struct {
 	onFinish    FinishHandler[O]
 	onFinishSet bool // distinguishes "not given" from "given as nil".
+	// historyRepo, when non-nil, opts this agent into runtime-managed History
+	// persistence. It is O-independent, so no type-erased closure is needed.
+	historyRepo gollem.HistoryRepository
 }
 
 // WithOnFinish wires a completion handler for this agent. The handler runs
@@ -52,6 +56,19 @@ type registerConfig[O any] struct {
 // nil handler yields ErrInvalidAgentDef.
 func WithOnFinish[O any](h FinishHandler[O]) RegisterOption[O] {
 	return func(c *registerConfig[O]) { c.onFinish, c.onFinishSet = h, true }
+}
+
+// WithHistoryRepository opts this agent into runtime-managed conversation
+// History persistence. When set, the worker lazily loads History (keyed by the
+// ProcessID string) the first time the strategy uses sys.Session(), and saves it
+// to hr before each transition commit — including terminal commits, so a later
+// restart/handoff can read the final transcript (ADR-0017). Without it,
+// sys.Session() still works but its History lives only for the duration of one
+// claim (not durable across steps). The store is a SEPARATE port (blob storage)
+// from the Kernel's Repository, injected here per agent rather than on the
+// Kernel.
+func WithHistoryRepository[O any](hr gollem.HistoryRepository) RegisterOption[O] {
+	return func(c *registerConfig[O]) { c.historyRepo = hr }
 }
 
 // Register registers a typed strategy and returns a typed handle carrying the

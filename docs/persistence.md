@@ -10,6 +10,11 @@ How you realize that — an RDB transaction, a document-store transaction, a
 conditional write, a mutex — is entirely yours
 ([ADR-0004](adr/0004-repository-changeset-rev-cas.md)).
 
+Conversation History (`*gollem.History`) is **not** part of this contract — it
+lives in a separate, opt-in blob store keyed by process id. See
+[writing-strategies.md#persisting-conversation-history](writing-strategies.md#persisting-conversation-history)
+and [ADR-0017](adr/0017-history-is-a-decoupled-best-effort-store.md).
+
 ## Bundled implementations
 
 | Package | Scope | Use it for |

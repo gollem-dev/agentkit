@@ -89,3 +89,4 @@ decision before performing it.
 |---|---|
 | 2026-07-20 | Initial record. Supersedes the original effect-journal design (spec D11, D13, D14) with D44/D45; folds in the removal of `Now`/`Rand` determinism. |
 | 2026-07-21 | Unchanged, but no longer the whole story: [ADR-0015](0015-unclean-reclaims-are-counted-and-bounded.md) bounds how many times replay may happen after a crash, and makes "this is a replay, and here is why" readable from a strategy. Replay is still at-least-once and there is still no journal. |
+| 2026-07-23 | Conversation History persistence ([ADR-0017](0017-history-is-a-decoupled-best-effort-store.md)) is an at-least-once effect under this ADR: History is saved before each commit, outside the atomic `Apply`, and a replayed or saved-but-not-committed attempt may re-save, so History can carry a duplicated turn. No journal, no exactly-once — the same posture as tool calls. |

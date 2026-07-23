@@ -220,6 +220,11 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 		_ = k.finalize(ctx, proc, failWith(FailureStrategyError, err), claimToken, nil)
 		return claimStopped
 	}
+	// One History holder per claim: the committed baseline is loaded once (on
+	// first Session use) and advanced only when a transition commits, so it is
+	// shared across this claim's transitions (ADR-0017). repo is nil when the
+	// agent did not opt in, in which case Session runs claim-local only.
+	hs := &historyState{repo: b.historyRepo, pid: proc.ID}
 	var toolList []gollem.Tool
 	if k.toolFactory != nil {
 		toolList, err = k.toolFactory(ctx, proc)
@@ -264,7 +269,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 			}
 		}
 
-		sys := newSyscalls(k, proc, toolList)
+		sys := newSyscalls(k, proc, toolList, hs)
 		rawState, dec, terr := k.runTransition(ctx, sys, b, proc)
 		if terr != nil {
 			// This transition did not commit; its buffered children are dropped.
@@ -278,6 +283,25 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 		}
 
 		if dec.kind == DecisionDone || dec.kind == DecisionFail {
+			// Fence the History write against a lost lease: if a newer worker
+			// reclaimed this Process, our stale Save would clobber the History it
+			// already committed, so skip it and abandon (ADR-0017).
+			if sys.historyPending() && !k.ownsLease(ctx, proc.ID, claimToken) {
+				sys.notifySpawnDone(ErrConflict)
+				return claimStopped
+			}
+			// Persist History before the terminal commit too, so a later
+			// restart/handoff can read the final transcript (ADR-0017, D-D). A save
+			// failure is treated like a transition failure: do not commit, requeue.
+			if serr := sys.saveHistory(ctx); serr != nil {
+				sys.notifySpawnDone(serr)
+				if proc.StepAttempts+1 > cfg.maxStepAttempts {
+					_ = k.finalize(ctx, proc, failWith(FailureRetryExhausted, serr), claimToken, sys.runMetrics)
+				} else {
+					k.requeueTransition(ctx, cfg, proc, claimToken, serr, sys.runMetrics)
+				}
+				return claimStopped
+			}
 			// commitTerminal fires the spawn OnCommit callbacks and eager dispatch
 			// itself (nil on commit, err on abandon).
 			_ = k.commitTerminal(ctx, proc, rawState, b.version, sys.seq, dec, sys, claimToken)
@@ -292,6 +316,26 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 				_ = k.finalize(ctx, proc, failWith(FailureRetryExhausted, cerr), claimToken, sys.runMetrics)
 			} else {
 				k.requeueTransition(ctx, cfg, proc, claimToken, cerr, sys.runMetrics)
+			}
+			return claimStopped
+		}
+		// Fence the History write against a lost lease (see ownsLease / ADR-0017):
+		// a stale worker must not overwrite a newer worker's committed History.
+		if sys.historyPending() && !k.ownsLease(ctx, proc.ID, claimToken) {
+			sys.notifySpawnDone(ErrConflict)
+			return claimStopped
+		}
+		// Persist History before the commit (ADR-0017: commit is the completion
+		// marker, so durable work precedes it). A save failure requeues rather than
+		// committing. This does NOT advance the committed baseline — commitHistory
+		// does that only after Apply succeeds, so a conflict retry re-seeds from
+		// committed state.
+		if serr := sys.saveHistory(ctx); serr != nil {
+			sys.notifySpawnDone(serr)
+			if proc.StepAttempts+1 > cfg.maxStepAttempts {
+				_ = k.finalize(ctx, proc, failWith(FailureRetryExhausted, serr), claimToken, sys.runMetrics)
+			} else {
+				k.requeueTransition(ctx, cfg, proc, claimToken, serr, sys.runMetrics)
 			}
 			return claimStopped
 		}
@@ -313,6 +357,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 		// slow handler cannot delay a runnable child (ADR-0016). Then the callbacks.
 		k.dispatchChildren(sys)
 		sys.notifySpawnDone(nil)
+		sys.commitHistory() // advance the committed History baseline (ADR-0017).
 		switch {
 		case cs.suspend:
 			return claimStopped // waiting committed.
@@ -325,6 +370,17 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 	}
 	k.release(ctx, proc, claimToken)
 	return claimReleased
+}
+
+// ownsLease reports whether this claim still holds proc's lease, by re-reading
+// the row. It fences the History Save (a blob write that lives outside the
+// Rev/LeaseToken fence): if a newer worker has reclaimed proc, a stale Save would
+// overwrite the History that worker already committed, so the caller skips it
+// (ADR-0017). This narrows the last-writer-wins window to the gap between this
+// read and the write; the transition's own commit stays fenced by Rev CAS.
+func (k *Kernel) ownsLease(ctx context.Context, pid ProcessID, claimToken string) bool {
+	cur, err := k.repo.GetProcess(ctx, pid)
+	return err == nil && cur != nil && cur.LeaseToken == claimToken
 }
 
 // claimSpecific claims one pending Process by id, for eager dispatch. It writes

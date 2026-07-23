@@ -39,6 +39,11 @@ type Syscalls interface {
 	// --- LLM (via gollem; Limiter before, Metrics after) ---
 	Tools() []gollem.Tool // the tools the ToolFactory built (to declare to the LLM).
 	Generate(ctx context.Context, input []gollem.Input, opts ...GenerateOption) (*GenerateResult, error)
+	// Session returns a conversation handle that carries History across Generate
+	// calls (and, when the agent opted into WithHistoryRepository, across steps
+	// and workers). Generate on the returned Session injects that History and the
+	// claim's tools automatically. See ADR-0017.
+	Session() *Session
 
 	// --- tool execution (Limiter before, Metrics after; no approval gate) ---
 	CallTool(ctx context.Context, call gollem.FunctionCall) (map[string]any, error)
@@ -194,6 +199,12 @@ type syscalls struct {
 	toolByName map[string]gollem.Tool
 	awaits     map[AwaitKey]*Await
 
+	// hist is the claim-scoped committed History holder (shared across a claim's
+	// transitions). session is this transition's conversation handle, created
+	// lazily by Session(). See session.go / ADR-0017.
+	hist    *historyState
+	session *Session
+
 	// run accumulation (committed proc.Metrics is only the committed cumulative;
 	// this run's share is folded on any successful Apply, D44).
 	runMetrics Metrics
@@ -204,7 +215,7 @@ type syscalls struct {
 	pendingSpawnDone []func(error) // SpawnRequest.OnCommit callbacks (called by the worker after commit, #8).
 }
 
-func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool) *syscalls {
+func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool, hist *historyState) *syscalls {
 	byName := make(map[string]gollem.Tool, len(tools))
 	for _, t := range tools {
 		byName[t.Spec().Name] = t
@@ -215,7 +226,7 @@ func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool) *syscalls {
 			awaits[aw.Key] = aw
 		}
 	}
-	return &syscalls{k: k, proc: proc, seq: proc.StateSeq + 1, tools: tools, toolByName: byName, awaits: awaits}
+	return &syscalls{k: k, proc: proc, seq: proc.StateSeq + 1, tools: tools, toolByName: byName, awaits: awaits, hist: hist}
 }
 
 func (s *syscalls) ProcessID() ProcessID { return s.proc.ID }
