@@ -3,6 +3,7 @@ package agentkit
 import (
 	"context"
 
+	"github.com/gollem-dev/gollem"
 	"github.com/m-mizutani/goerr/v2"
 )
 
@@ -58,6 +59,9 @@ type StrategyBinding struct {
 	// finish is nil unless WithOnFinish was given. typedOut is the value Done
 	// received (nil for failed/cancelled).
 	finish func(ctx context.Context, pid ProcessID, status ProcessStatus, typedOut any, f *Failure) error
+	// historyRepo is nil unless WithHistoryRepository was given. It drives
+	// runtime History persistence for this agent (ADR-0017).
+	historyRepo gollem.HistoryRepository
 }
 
 // BindStrategy erases the type of a Strategy by folding Init/Step/EncodeState/
@@ -125,5 +129,6 @@ func BindStrategy[S, I, O any](s Strategy[S, I, O], opts ...RegisterOption[O]) S
 			return cfg.onFinish(ctx, pid, res)
 		}
 	}
+	b.historyRepo = cfg.historyRepo
 	return b
 }

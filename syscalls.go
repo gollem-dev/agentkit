@@ -39,6 +39,19 @@ type Syscalls interface {
 	// --- LLM (via gollem; Limiter before, Metrics after) ---
 	Tools() []gollem.Tool // the tools the ToolFactory built (to declare to the LLM).
 	Generate(ctx context.Context, input []gollem.Input, opts ...GenerateOption) (*GenerateResult, error)
+	// SessionGenerate runs one LLM turn as part of the Process's managed
+	// conversation: the runtime carries History across calls (and, once
+	// committed, across steps and workers) and injects the claim's tools, so the
+	// strategy threads neither by hand. It requires the agent to have been
+	// registered with WithHistoryRepository; otherwise it returns
+	// ErrHistoryNotConfigured rather than silently running without persistence.
+	// To manage History yourself, use the primitive Generate with WithHistory.
+	// See ADR-0017.
+	SessionGenerate(ctx context.Context, input []gollem.Input, opts ...GenerateOption) (*GenerateResult, error)
+	// SessionHistory returns the managed conversation's current history (loading
+	// the stored one on first use). Requires WithHistoryRepository, else
+	// ErrHistoryNotConfigured.
+	SessionHistory(ctx context.Context) (*gollem.History, error)
 
 	// --- tool execution (Limiter before, Metrics after; no approval gate) ---
 	CallTool(ctx context.Context, call gollem.FunctionCall) (map[string]any, error)
@@ -194,6 +207,15 @@ type syscalls struct {
 	toolByName map[string]gollem.Tool
 	awaits     map[AwaitKey]*Await
 
+	// hist is the claim-scoped committed History holder (shared across a claim's
+	// transitions). sessWorking/sessStarted/sessDirty are this transition's
+	// managed-conversation state (SessionGenerate/SessionHistory). See session.go
+	// / ADR-0017.
+	hist        *historyState
+	sessWorking *gollem.History
+	sessStarted bool
+	sessDirty   bool
+
 	// run accumulation (committed proc.Metrics is only the committed cumulative;
 	// this run's share is folded on any successful Apply, D44).
 	runMetrics Metrics
@@ -204,7 +226,7 @@ type syscalls struct {
 	pendingSpawnDone []func(error) // SpawnRequest.OnCommit callbacks (called by the worker after commit, #8).
 }
 
-func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool) *syscalls {
+func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool, hist *historyState) *syscalls {
 	byName := make(map[string]gollem.Tool, len(tools))
 	for _, t := range tools {
 		byName[t.Spec().Name] = t
@@ -215,7 +237,7 @@ func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool) *syscalls {
 			awaits[aw.Key] = aw
 		}
 	}
-	return &syscalls{k: k, proc: proc, seq: proc.StateSeq + 1, tools: tools, toolByName: byName, awaits: awaits}
+	return &syscalls{k: k, proc: proc, seq: proc.StateSeq + 1, tools: tools, toolByName: byName, awaits: awaits, hist: hist}
 }
 
 func (s *syscalls) ProcessID() ProcessID { return s.proc.ID }

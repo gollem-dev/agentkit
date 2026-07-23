@@ -20,7 +20,8 @@ per idea, and they run offline.
 ## Guides
 
 - **[Writing a strategy](writing-strategies.md)** — implementing
-  `Strategy[S, I, O]`: state design, transitions, waiting on humans and children.
+  `Strategy[S, I, O]`: state design, transitions, waiting on humans and
+  children, persisting conversation history.
 - **[Bundled strategies](bundled-strategies.md)** — `strategy/simple` and
   `strategy/planexec`.
 - **[Tools](tools.md)** — supplying `gollem.Tool`s, and the idempotency and

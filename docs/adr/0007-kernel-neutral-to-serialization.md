@@ -85,3 +85,4 @@ The bundled strategies choose JSON, but that is `strategy/simple` and
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D36, D39, D40, D41, D42). |
 | 2026-07-20 | `Done` now takes the typed output and `Strategy.EncodeOutput` produces the bytes (ADR-0014). The decision is unchanged — the kernel still marshals nothing and parses nothing — so the rejected "Output contract validated by the kernel" was clarified to say what it does and does not cover. |
+| 2026-07-23 | Conversation History may now be persisted in a decoupled `HistoryRepository` ([ADR-0017](0017-history-is-a-decoupled-best-effort-store.md)) rather than only inside strategy state. The decision here is unchanged: the kernel still marshals nothing; the `HistoryRepository` implementation serializes `*gollem.History`, exactly as a `Repository` serializes a row. |

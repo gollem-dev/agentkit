@@ -149,6 +149,51 @@ Both paths include the process row in their `Apply`, so they serialize on its
 `Rev`. Whichever commits first settles the await; the other sees it is no longer
 `open`.
 
+## History is a separate, best-effort store
+
+Conversation History (`*gollem.History`) is the one piece of durable state that
+does **not** ride the atomic `Apply`. When an agent opts in with
+`WithHistoryRepository`, the worker persists History to a separate blob store
+(keyed by `ProcessID`) *before* each transition commits — including terminal
+commits — because the commit is the completion marker
+([ADR-0017](../adr/0017-history-is-a-decoupled-best-effort-store.md)). History is
+append-only and can outgrow what a transactional row should hold, which is why it
+is decoupled from the Process row.
+
+The two guarantees above therefore do **not** extend to History; its save is an
+at-least-once effect ([ADR-0003](../adr/0003-at-least-once-replay-no-effect-journal.md)):
+
+- **A crash between the History save and the commit** leaves a saved History for
+  a transition that did not commit. The next claim reads that superseded History
+  back and the re-run appends to it, so the conversation can carry a duplicated
+  turn. This window is accepted, not closed.
+- **Save-before-commit removes the opposite "amnesia" window** (History lagging
+  State): once a transition commits, its History is already durable, so a
+  post-commit crash loses nothing.
+- **Same-lease conflict retries do not duplicate.** The committed baseline is
+  held in memory per claim and advanced only on a successful `Apply`; a retry
+  re-seeds from that baseline, not from the repo, so only a real crash — never an
+  in-process retry — reaches the duplication window.
+- **A worker that lost its lease cannot clobber a newer worker's committed
+  History.** The blob store has no Rev/LeaseToken fence of its own, so right
+  before the save the worker re-reads the row and skips the write when the lease
+  token changed (`ownsLease` in `worker.go`). Without it, a stalled old worker's
+  late save would overwrite a newer worker's committed History — a regression,
+  not just a duplicate. The re-check narrows that window to the gap between the
+  read and the write; with a single-key store it is narrowed, not fully closed.
+
+Because the save precedes the commit, a History-store outage prevents the
+transition from committing at all, and the Process eventually fails
+`retry_exhausted`: liveness is coupled to the History store when an agent opts
+in.
+
+Keeping the next LLM request well-formed across a duplication is the strategy's
+responsibility. A `SessionGenerate`-using strategy must keep a tool-call round within one
+Step, so a persisted History never ends on a dangling `tool_use`; a strategy that
+splits a round across steps keeps History in its own State instead (raw
+`Generate` + `WithHistory`). The kernel does not inspect History
+([ADR-0011](../adr/0011-kernel-has-no-tenancy.md)).
+
 ## What a Repository implementation must provide
 
 The mechanisms above are only as strong as the store beneath them. The full
