@@ -2,6 +2,7 @@ package agentkit_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -53,12 +54,11 @@ func histLen(h *gollem.History) int {
 // then Dones. seen captures the carried-in lengths across transitions/attempts.
 func sessionStep(seen *[]int, mu *sync.Mutex, turns int) stepFn {
 	return func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		sess := sys.Session()
-		h, _ := sess.History(ctx)
+		h, _ := sys.SessionHistory(ctx)
 		mu.Lock()
 		*seen = append(*seen, histLen(h))
 		mu.Unlock()
-		if _, err := sess.Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		st.N++
@@ -184,42 +184,39 @@ func TestSession_PersistsAcrossClaims(t *testing.T) {
 	gt.Value(t, histLen(stored)).Equal(3)
 }
 
-func TestSession_OptOutCarriesWithinClaim(t *testing.T) {
+// TestSession_WithoutRepositoryErrors verifies that using the managed
+// conversation on an agent NOT registered with WithHistoryRepository fails
+// loudly (ErrHistoryNotConfigured) instead of silently running without
+// persistence — for both SessionGenerate and SessionHistory.
+func TestSession_WithoutRepositoryErrors(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
-	var seen []int
-	// No WithHistoryRepository: Session still carries history within a claim.
-	k, repo, ag := setupScript(t, sessionStep(&seen, &mu, 3), growingLLM())
+	var genErr, histErr error
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		_, he := sys.SessionHistory(ctx)
+		_, ge := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")})
+		mu.Lock()
+		histErr, genErr = he, ge
+		mu.Unlock()
+		return st, agentkit.Decision[[]byte]{}, ge
+	}
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}) // no WithHistoryRepository.
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
 
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
-	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
-	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepAttempts(1))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
 
 	mu.Lock()
-	got := append([]int(nil), seen...)
+	ge, he := genErr, histErr
 	mu.Unlock()
-	gt.Value(t, got).Equal([]int{0, 1, 2})
-}
-
-// TestSession_OptOutLosesHistoryAcrossClaims proves that without a repository the
-// carried history is claim-local: one transition per claim means every claim
-// starts from an empty history.
-func TestSession_OptOutLosesHistoryAcrossClaims(t *testing.T) {
-	ctx := context.Background()
-	var mu sync.Mutex
-	var seen []int
-	k, repo, ag := setupScript(t, sessionStep(&seen, &mu, 3), growingLLM())
-
-	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
-	gt.NoError(t, err)
-	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepsPerClaim(1))
-	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
-
-	mu.Lock()
-	got := append([]int(nil), seen...)
-	mu.Unlock()
-	gt.Value(t, got).Equal([]int{0, 0, 0}) // nothing persisted across claims.
+	gt.Value(t, errors.Is(ge, agentkit.ErrHistoryNotConfigured)).Equal(true)
+	gt.Value(t, errors.Is(he, agentkit.ErrHistoryNotConfigured)).Equal(true)
 }
 
 // ---- error paths ----
@@ -244,7 +241,7 @@ func TestSession_HistoryMethodSurfacesLoadError(t *testing.T) {
 	ctx := context.Background()
 	hr := &probeHistoryRepo{inner: histmem.New(), loadErr: gollemErr("load boom")}
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		if _, herr := sys.Session().History(ctx); herr != nil {
+		if _, herr := sys.SessionHistory(ctx); herr != nil {
 			return st, agentkit.Decision[[]byte]{}, herr
 		}
 		return st, agentkit.Done([]byte("x")), nil
@@ -335,15 +332,14 @@ func TestSession_SameLeaseConflictReseeds(t *testing.T) {
 	hr := histmem.New()
 	reg := agentkit.NewRegistry()
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		sess := sys.Session()
-		h, _ := sess.History(ctx)
+		h, _ := sys.SessionHistory(ctx)
 		mu.Lock()
 		seen = append(seen, histLen(h))
 		mu.Unlock()
 		if st.N == 1 {
 			repo.armed.Store(true) // arm the one-shot conflict on entering the 2nd transition.
 		}
-		if _, err := sess.Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		st.N++
@@ -389,15 +385,14 @@ func TestSession_CrashBetweenSaveAndCommitDuplicates(t *testing.T) {
 	hr := histmem.New()
 	reg := agentkit.NewRegistry()
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		sess := sys.Session()
-		h, _ := sess.History(ctx)
+		h, _ := sys.SessionHistory(ctx)
 		mu.Lock()
 		seen = append(seen, histLen(h))
 		mu.Unlock()
 		if st.N == 1 {
 			repo.armed.Store(true) // crash the 2nd transition's commit (after its History save).
 		}
-		if _, err := sess.Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		st.N++
@@ -441,7 +436,7 @@ func TestSession_StaleWorkerSaveSkipped(t *testing.T) {
 	reg := agentkit.NewRegistry()
 	var stole atomic.Bool
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		// On the first attempt, simulate a newer worker reclaiming this Process by
@@ -476,7 +471,7 @@ func TestSession_FailTerminalSavesHistory(t *testing.T) {
 	ctx := context.Background()
 	hr := histmem.New()
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Fail[[]byte](agentkit.FailureStrategyError, "boom"), nil
@@ -515,7 +510,7 @@ func TestSession_InjectsClaimTools(t *testing.T) {
 		},
 	}
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("done")), nil

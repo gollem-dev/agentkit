@@ -59,14 +59,15 @@ func WithOnFinish[O any](h FinishHandler[O]) RegisterOption[O] {
 }
 
 // WithHistoryRepository opts this agent into runtime-managed conversation
-// History persistence. When set, the worker lazily loads History (keyed by the
-// ProcessID string) the first time the strategy uses sys.Session(), and saves it
-// to hr before each transition commit — including terminal commits, so a later
-// restart/handoff can read the final transcript (ADR-0017). Without it,
-// sys.Session() still works but its History lives only for the duration of one
-// claim (not durable across steps). The store is a SEPARATE port (blob storage)
-// from the Kernel's Repository, injected here per agent rather than on the
-// Kernel.
+// History persistence, enabling sys.SessionGenerate / sys.SessionHistory. When
+// set, the worker lazily loads History (keyed by the ProcessID string) on first
+// use and saves it to hr before each transition commit — including terminal
+// commits, so a later restart/handoff can read the final transcript (ADR-0017).
+// Without it, SessionGenerate/SessionHistory return ErrHistoryNotConfigured (the
+// managed conversation is not silently run without persistence); a strategy that
+// manages History itself uses the primitive Generate instead. The store is a
+// SEPARATE port (blob storage) from the Kernel's Repository, injected here per
+// agent rather than on the Kernel.
 func WithHistoryRepository[O any](hr gollem.HistoryRepository) RegisterOption[O] {
 	return func(c *registerConfig[O]) { c.historyRepo = hr }
 }

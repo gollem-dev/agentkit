@@ -221,9 +221,10 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 		return claimStopped
 	}
 	// One History holder per claim: the committed baseline is loaded once (on
-	// first Session use) and advanced only when a transition commits, so it is
-	// shared across this claim's transitions (ADR-0017). repo is nil when the
-	// agent did not opt in, in which case Session runs claim-local only.
+	// first SessionGenerate/SessionHistory use) and advanced only when a
+	// transition commits, so it is shared across this claim's transitions
+	// (ADR-0017). repo is nil when the agent did not opt in, in which case
+	// SessionGenerate/SessionHistory return ErrHistoryNotConfigured.
 	hs := &historyState{repo: b.historyRepo, pid: proc.ID}
 	var toolList []gollem.Tool
 	if k.toolFactory != nil {

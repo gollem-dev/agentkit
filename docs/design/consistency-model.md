@@ -188,7 +188,7 @@ transition from committing at all, and the Process eventually fails
 in.
 
 Keeping the next LLM request well-formed across a duplication is the strategy's
-responsibility. A `Session`-using strategy must keep a tool-call round within one
+responsibility. A `SessionGenerate`-using strategy must keep a tool-call round within one
 Step, so a persisted History never ends on a dangling `tool_use`; a strategy that
 splits a round across steps keeps History in its own State instead (raw
 `Generate` + `WithHistory`). The kernel does not inspect History

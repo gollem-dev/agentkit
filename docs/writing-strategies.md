@@ -195,9 +195,9 @@ gollem's own generate options (temperature and friends) through.
 Threading `History` through your own state (above) works, but you write the
 carrying, the folding, and the checkpointing by hand. If your strategy just
 needs a running conversation — no need to split a tool round across steps —
-register with `agentkit.WithHistoryRepository` and call `sys.Session()`
-instead; agentkit carries `History` across `Generate` calls for you, and
-persists it across steps and crashes too.
+register with `agentkit.WithHistoryRepository` and call `sys.SessionGenerate`
+instead; agentkit carries `History` across calls for you, and persists it across
+steps and crashes too.
 
 ```go
 import histmem "github.com/gollem-dev/agentkit/historystore/memory"
@@ -209,7 +209,7 @@ agent, err := agentkit.Register(reg, "chat", 1, &chatStrategy{},
 
 ```go
 func (s *chatStrategy) Step(ctx context.Context, sys agentkit.Syscalls, st chatState) (chatState, agentkit.Decision[Output], error) {
-    res, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text(st.Prompt)})
+    res, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text(st.Prompt)})
     if err != nil {
         return st, agentkit.Decision[Output]{}, err
     }
@@ -221,28 +221,27 @@ func (s *chatStrategy) Step(ctx context.Context, sys agentkit.Syscalls, st chatS
 }
 ```
 
-`Session.Generate` injects the carried `History` and `sys.Tools()` for you —
-no `WithHistory`/`WithTools` to pass by hand. `Session.History(ctx)` returns the
-current history (loading the stored one on first use) if you need to inspect it. `historystore/memory.New()`
-(non-persistent) and `historystore/filesystem.New(dir)` (single-process,
-persistent) are the reference stores.
+`SessionGenerate` injects the carried `History` and `sys.Tools()` for you — no
+`WithHistory`/`WithTools` to pass by hand. `sys.SessionHistory(ctx)` returns the
+current history (loading the stored one on first use) if you need to inspect it.
+`historystore/memory.New()` (non-persistent) and `historystore/filesystem.New(dir)`
+(single-process, persistent) are the reference stores.
 
 Two obligations come with this, and you hit both immediately:
 
 - **Keep a tool round inside one `Step`.** History persisted through
-  `sys.Session()` is saved outside the atomic transition commit
+  `SessionGenerate` is saved outside the atomic transition commit
   ([ADR-0017](adr/0017-history-is-a-decoupled-best-effort-store.md)). If a
   `tool_use` is committed in one `Step` and its `tool_result` only in a later
   one, a crash in between leaves the stored History with a dangling
   `tool_use`. Run the call and feed its result back to the model within the
-  same `Step` whenever you use `sys.Session()`.
+  same `Step` whenever you use `SessionGenerate`.
 - **The option is opt-in, and persistence is best-effort.** Without
-  `WithHistoryRepository`, `sys.Session()` still works, but its `History` lives
-  only for the duration of one claim — it does not survive a suspend or a
-  crash. If your strategy needs to split a tool round across steps, as
-  `strategy/simple` does, keep `History` in your own checkpointed state via the
-  raw `sys.Generate` + `agentkit.WithHistory(...)` pattern shown above instead
-  of `sys.Session()`.
+  `WithHistoryRepository`, `SessionGenerate`/`SessionHistory` return
+  `ErrHistoryNotConfigured` — they do not silently run without persistence. If
+  your strategy needs to split a tool round across steps, as `strategy/simple`
+  does, keep `History` in your own checkpointed state via the raw `sys.Generate`
+  + `agentkit.WithHistory(...)` pattern shown above instead.
 
 See [ADR-0017](adr/0017-history-is-a-decoupled-best-effort-store.md) for the
 save-before-commit ordering and the duplication window it trades against.

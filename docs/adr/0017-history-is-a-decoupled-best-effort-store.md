@@ -4,14 +4,15 @@
 
 Conversation History (`*gollem.History`) is persisted **outside the Process
 row**, in a separate blob store, opted into **per agent**. `Register` accepts
-`WithHistoryRepository(gollem.HistoryRepository)`; when set, the worker lazily
-loads History (keyed by `ProcessID.String()`) the first time a strategy uses
-`sys.Session()`, and saves it **before every transition commit, including
-terminal ones**. History is *not* part of the atomic `Repository.Apply`: its save
-is an at-least-once effect ordered before the commit, so a crash between save and
-commit can leave a superseded (duplicate) History — this is tolerated. The
-kernel's `Repository` never carries History. Without the option, `sys.Session()`
-still works but its History lives only for the duration of one claim.
+`WithHistoryRepository(gollem.HistoryRepository)`, which enables
+`sys.SessionGenerate` / `sys.SessionHistory`; when set, the worker lazily loads
+History (keyed by `ProcessID.String()`) on first use, and saves it **before every
+transition commit, including terminal ones**. History is *not* part of the atomic
+`Repository.Apply`: its save is an at-least-once effect ordered before the commit,
+so a crash between save and commit can leave a superseded (duplicate) History —
+this is tolerated. The kernel's `Repository` never carries History. Without the
+option, `SessionGenerate`/`SessionHistory` return `ErrHistoryNotConfigured`
+rather than silently running without persistence.
 
 ## Context
 
@@ -36,12 +37,15 @@ learning to (un)marshal caller data (ADR-0007).
   on the `StrategyBinding`. `Kernel.New(repo, ...)` is unchanged; the
   transactional `Repository` and the blob `HistoryRepository` are injected
   through different channels.
-- **`Syscalls.Session()`** returns a `Session` that carries History across
-  `Generate` calls and injects the claim's tools (`sys.Tools()`). The
-  claim-scoped committed baseline (`historyState`) is loaded once, lazily, and
-  advanced only when a transition commits; a per-transition working copy is
-  discarded if the transition does not commit, so a same-lease conflict retry
-  re-seeds from committed state rather than from the abandoned attempt.
+- **`Syscalls.SessionGenerate` / `SessionHistory`** — flat methods, no exposed
+  handle type — carry History across calls and inject the claim's tools
+  (`sys.Tools()`). They require a repository (`ErrHistoryNotConfigured`
+  otherwise), so the managed conversation never silently runs without
+  persistence. The claim-scoped committed baseline (`historyState`) is loaded
+  once, lazily, and advanced only when a transition commits; a per-transition
+  working copy is discarded if the transition does not commit, so a same-lease
+  conflict retry re-seeds from committed state rather than from the abandoned
+  attempt.
 - **Save precedes commit.** In `worker.go` the History save runs ahead of both
   the `Apply` on the Continue/Suspend path and the `commitTerminal` on the
   Done/Fail path, because the commit is the completion marker: durable work comes
@@ -84,7 +88,7 @@ learning to (un)marshal caller data (ADR-0007).
 
 - History and a strategy's own tool bookkeeping (pending calls / results, held in
   State) can diverge across a crash. To keep the next request well-formed, a
-  strategy that uses `sys.Session()` must keep a tool round **within one Step**
+  strategy that uses `SessionGenerate` must keep a tool round **within one Step**
   (never persist a dangling `tool_use`). A strategy that splits a tool round
   across steps should instead keep History in its own State via raw
   `Syscalls.Generate` + `WithHistory` — still fully supported, and what
@@ -99,7 +103,7 @@ learning to (un)marshal caller data (ADR-0007).
   serializes `*gollem.History` (ADR-0007 unchanged). `gollem.History` carries a
   version gate, so a load of an incompatible stored version surfaces as an error
   rather than silent data loss.
-- Tools are bound into the `Session` from `sys.Tools()` (the `ToolFactory`
+- Tools are bound into `SessionGenerate` from `sys.Tools()` (the `ToolFactory`
   output, keyed on `proc.Agent`/`proc.Metadata`); a stable per-process tool set
   is also what prompt caching needs.
 
