@@ -9,7 +9,12 @@ terminal state and that state has been committed. It fires for `succeeded`,
 Delivery is **best-effort**: the handler never fires twice, but a crash between
 the commit and the call loses it permanently, and nothing retries. Anything that
 must not be lost belongs in a parent Process waiting on `WaitChildren`, where
-every step is part of a committed transition.
+every step is part of a committed transition — or, when the destination is an
+external system that a child's tool call cannot reach idempotently, in an outbox
+written inside the caller's own `Repository.Apply`
+([ADR-0018](0018-durable-delivery-is-built-in-repository-apply.md)). This
+handler is the cheapest of those three tiers and the right one whenever losing
+the notification is acceptable.
 
 The handler is bound at registration, not at spawn. It is code replicated across
 every worker, so whichever instance commits the terminal transition can run it.
@@ -94,10 +99,15 @@ be generic.
 - **A callback passed to `Spawn`.** A closure lives in one instance's memory.
   The worker that finishes the Process is frequently a different instance, so
   the callback would silently never run.
-- **An outbox with retries, for real at-least-once delivery.** This is the
-  effect journal ADR-0003 removed, reintroduced under another name. The cost is
-  not the table; it is that every guarantee agentkit offers would then need to
-  say which of two delivery models it means.
+- **An outbox with retries *in the kernel*, for real at-least-once delivery.**
+  This is the effect journal ADR-0003 removed, reintroduced under another name.
+  The cost is not the table; it is that every guarantee agentkit offers would
+  then need to say which of two delivery models it means, and every `Repository`
+  implementation would have to support the port it arrives through. The same
+  outbox built inside the caller's own `Apply` carries none of that cost and is
+  the recorded path for durable delivery — see
+  [ADR-0018](0018-durable-delivery-is-built-in-repository-apply.md), which also
+  places this handler among the three tiers a caller chooses from.
 - **Failing the Process when the handler errors.** Rewriting a committed
   terminal state is a second write to close a window, which ADR-0009 rules out.
   The handler's failure is the handler's problem.
@@ -123,3 +133,4 @@ be generic.
 | Date | Change |
 |---|---|
 | 2026-07-20 | Initial record. |
+| 2026-07-26 | Handler placed among the three delivery tiers of ADR-0018. The rejected outbox is now scoped to the kernel: the same outbox inside the caller's `Apply` is the recorded durable path, and removing this handler in its favour was considered and declined. |

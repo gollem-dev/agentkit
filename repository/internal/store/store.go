@@ -128,14 +128,35 @@ func (s *State) ListAwaits(pid agentkit.ProcessID) []*agentkit.Await {
 	return out
 }
 
-// ListEvents returns deep copies of a Process's events in append order.
-func (s *State) ListEvents(pid agentkit.ProcessID) []*agentkit.Event {
+// ListEvents returns deep copies of a Process's events in append order, starting
+// after the cursor and capped at limit. See the Repository contract for the
+// cursor semantics; an unknown after is agentkit.ErrEventNotFound.
+func (s *State) ListEvents(pid agentkit.ProcessID, q agentkit.EventQuery) ([]*agentkit.Event, error) {
 	es := s.events[pid]
+	start := 0
+	if q.After != "" {
+		found := false
+		for i, e := range es {
+			if e.ID == q.After {
+				start = i + 1
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, goerr.Wrap(agentkit.ErrEventNotFound, "unknown ListEvents cursor",
+				goerr.V("process", pid), goerr.V("after", q.After))
+		}
+	}
+	es = es[start:]
+	if q.Limit > 0 && len(es) > q.Limit {
+		es = es[:q.Limit]
+	}
 	out := make([]*agentkit.Event, len(es))
 	for i, e := range es {
 		out[i] = cloneEvent(e)
 	}
-	return out
+	return out, nil
 }
 
 // checkPreconditions verifies Guards (read-only Rev CAS) and Processes (Rev CAS)
@@ -407,6 +428,9 @@ func cloneChildResults(rs []agentkit.ChildResult) []agentkit.ChildResult {
 		if r.Failure != nil {
 			f := *r.Failure
 			out[i].Failure = &f
+		}
+		if r.Metrics != nil {
+			out[i].Metrics = maps.Clone(r.Metrics)
 		}
 	}
 	return out

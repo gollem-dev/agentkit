@@ -27,9 +27,11 @@ tree correlates under one id.
 
 `Process.Metadata` is an optional, kernel-opaque `map[string]string` set at
 spawn, meant for infrastructure — a `ToolFactory` deciding which database client
-to hand out, for instance. **It is data, not a credential:** derive it
-server-side from a validated principal before spawning, never trust it as proof
-of anything ([ADR-0011](adr/0011-kernel-has-no-tenancy.md)).
+to hand out, for instance. A child inherits its parent's unless the spawner names
+a different one, so a subtree runs under one scope by default. **It is data, not
+a credential:** derive it server-side from a validated principal before spawning,
+never trust it as proof of anything
+([ADR-0011](adr/0011-kernel-has-no-tenancy.md)).
 
 ## Strategy
 
@@ -190,12 +192,14 @@ See [persistence.md](persistence.md).
 ## Metrics, Limiter, Event, Middleware
 
 - **`Metrics`** — counters the kernel maintains: input/output tokens, LLM calls,
-  tool calls, steps, spawns.
+  tool calls, steps, spawns. A child adds its counters to its parent's when it
+  terminates, once each, so a root's are the tree's.
 - **`Limiter`** — your closure deciding whether to continue, called before every
-  effect and at every transition boundary. The kernel measures; you decide.
+  effect and at every transition boundary. The kernel measures; you decide. It
+  is a veto, not a place to wait.
 - **`Event`** — an append-only record written durably inside the transition
-  commit. Read per process with `ListEvents`; delivering them anywhere is your
-  job.
+  commit, carrying an `EventID`. Read per process with `ListEvents`, from the
+  start or after an id you already have; delivering them anywhere is your job.
 - **Middleware** — `next`-chain hooks at `Init`, `Step`, `Generate`, `CallTool`
   and `SpawnChild`, registered on the `Kernel`. Unlike the others, a middleware
   can rewrite the request or refuse the call outright; nothing is persisted by

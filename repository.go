@@ -38,7 +38,10 @@ import (
 //  5. Uniqueness is maintained: idempotency_key / open Process subject /
 //     (process_id, await_key). An insert violation writes nothing and returns
 //     ErrConflict.
-//  6. ListEvents preserves per-Process append order.
+//  6. ListEvents preserves per-Process append order, and round-trips each
+//     Event's kernel-assigned ID verbatim. An implementation never mints or
+//     rewrites one: the ID is what a caller holds as a cursor, so a value that
+//     changed between write and read would resume from the wrong place.
 type Repository interface {
 	// GetProcess returns the Process. Absent -> ErrProcessNotFound.
 	GetProcess(ctx context.Context, pid ProcessID) (*Process, error)
@@ -55,12 +58,28 @@ type Repository interface {
 
 	// ListAwaits returns all awaits of a Process.
 	ListAwaits(ctx context.Context, pid ProcessID) ([]*Await, error)
-	// ListEvents returns a Process's events in append order.
-	ListEvents(ctx context.Context, pid ProcessID) ([]*Event, error)
+	// ListEvents returns a Process's events in append order, narrowed by q. A
+	// zero EventQuery returns all of them.
+	ListEvents(ctx context.Context, pid ProcessID, q EventQuery) ([]*Event, error)
 
 	// Apply applies a ChangeSet atomically (see the contract above). On any
 	// precondition failure it writes nothing and returns ErrConflict.
 	Apply(ctx context.Context, cs ChangeSet) error
+}
+
+// EventQuery narrows a ListEvents read. Every field is optional, so the zero
+// value means "all of this Process's events" — it is a struct rather than
+// options so an implementation reads fields instead of resolving closures
+// (ADR-0019).
+type EventQuery struct {
+	// After is a cursor. "" starts from the first event; otherwise the result is
+	// the events appended strictly after the one with this ID. An ID this Process
+	// has no event for is ErrEventNotFound and returns no events — returning the
+	// whole list instead would reach the caller as a burst of new events, which
+	// it has no way to tell from the real thing.
+	After EventID
+	// Limit caps how many events are returned. <= 0 means no cap.
+	Limit int
 }
 
 // ProcessGuard is a write-free precondition on a Process row (a read-set Rev

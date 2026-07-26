@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"sync"
 	"time"
@@ -571,7 +572,7 @@ func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte
 				Question: spec.payload, Deadline: spec.deadline, CreatedAt: now,
 			})
 			if !existed {
-				cs.Events = append(cs.Events, &Event{ProcessID: proc.ID, Type: EventAwaitCreated, Key: spec.key, At: now})
+				cs.Events = append(cs.Events, newEvent(proc.ID, EventAwaitCreated, spec.key, nil, now))
 			}
 			openAwaits++
 			if spec.deadline != nil {
@@ -594,6 +595,8 @@ func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte
 			awaitRows = append(awaitRows, row)
 			cs.Guards = append(cs.Guards, guards...)
 			if allTerminal {
+				// No fold here: each of these children already reported its usage to
+				// this Process when it terminated (reportToParent).
 				elided++
 			} else {
 				openAwaits++
@@ -685,7 +688,13 @@ func pendingChild(cid ProcessID, pending []*Process) bool {
 }
 
 func childResultOf(cp *Process) ChildResult {
-	return ChildResult{ProcessID: cp.ID, Status: cp.Status, Output: cp.Output, Failure: cp.Failure}
+	return ChildResult{
+		ProcessID: cp.ID,
+		Status:    cp.Status,
+		Output:    cp.Output,
+		Failure:   cp.Failure,
+		Metrics:   maps.Clone(cp.Metrics),
+	}
 }
 
 func minTime(ts []time.Time) *time.Time {
@@ -765,7 +774,7 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 		p.LeaseUntil = nil
 
 		cs := ChangeSet{Processes: []*Process{p}}
-		cs.Events = append(cs.Events, &Event{ProcessID: p.ID, Type: EventProcessFinished, At: now})
+		cs.Events = append(cs.Events, newEvent(p.ID, EventProcessFinished, "", nil, now))
 		if sys != nil {
 			cs.Processes = append(cs.Processes, sys.pendingChildren...)
 			cs.Events = append(cs.Events, sys.pendingEvents...)
@@ -781,9 +790,10 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 				cs.Awaits = append(cs.Awaits, aw)
 			}
 		}
-		// Wake the parent if this completes an open children await.
+		// Fold this Process's usage into its parent, and wake the parent if this
+		// completes an open children await.
 		if p.ParentID != nil {
-			if err := k.wakeParentIfComplete(ctx, *p.ParentID, p, &cs, now); err != nil {
+			if err := k.reportToParent(ctx, *p.ParentID, p, &cs, now); err != nil {
 				return k.abortFinal(sys, err)
 			}
 		}
@@ -861,14 +871,24 @@ func (k *Kernel) abortFinal(sys *syscalls, err error) error {
 	return err
 }
 
-// wakeParentIfComplete, on a child finalize, always includes the parent row as a
-// CAS target when an open children await contains this child (serializing
-// siblings on the parent Rev, closing the #3c write skew), and responds+wakes
-// the parent when all children are terminal (with this child's terminal state
-// overlaid). Any required read failure returns an error so the caller aborts the
-// finalize (never a partial commit that would lose the wakeup, #2). A parent
-// that no longer exists is treated as "nothing to wake".
-func (k *Kernel) wakeParentIfComplete(ctx context.Context, parentID ProcessID, child *Process, cs *ChangeSet, now time.Time) error {
+// reportToParent, on a child finalize, does two things in the child's own
+// terminal ChangeSet: it folds the child's usage into the parent, and it
+// responds+wakes any open children await this child completes (with this
+// child's terminal state overlaid).
+//
+// The fold is here, at the child's single terminal transition, rather than where
+// an await resolves. Keying it to the await made it run once per await instead
+// of once per child, so a child named by two await keys was counted twice and a
+// child nobody waited on — which ADR-0009 permits — was never counted at all.
+// A Process terminates once, so counting there is right by construction rather
+// than by a dedup check.
+//
+// The parent row is a CAS target whenever a parent exists, which also serializes
+// sibling finalizes on the parent Rev (closing the #3c write skew). Any required
+// read failure returns an error so the caller aborts the finalize (never a
+// partial commit that would lose the wakeup, #2). A parent that no longer exists
+// is treated as "nothing to report to".
+func (k *Kernel) reportToParent(ctx context.Context, parentID ProcessID, child *Process, cs *ChangeSet, now time.Time) error {
 	parent, err := k.repo.GetProcess(ctx, parentID)
 	if err != nil {
 		if errors.Is(err, ErrProcessNotFound) {
@@ -880,13 +900,13 @@ func (k *Kernel) wakeParentIfComplete(ctx context.Context, parentID ProcessID, c
 	if err != nil {
 		return goerr.Wrap(err, "list parent awaits for wakeup", goerr.V("parent", parentID))
 	}
-	touched := false
 	pClone := parent.clone()
+	// One Process, one terminal transition, one fold.
+	pClone.Metrics = addMetrics(pClone.Metrics, child.Metrics)
 	for _, aw := range awaits {
 		if aw.Kind != AwaitChildren || aw.Status != AwaitOpen || !containsID(aw.Children, child.ID) {
 			continue
 		}
-		touched = true
 		allTerminal := true
 		var results []ChildResult
 		for _, cid := range aw.Children {
@@ -917,11 +937,11 @@ func (k *Kernel) wakeParentIfComplete(ctx context.Context, parentID ProcessID, c
 			cs.Awaits = append(cs.Awaits, aw)
 		}
 	}
-	if touched {
-		// Always CAS the parent row (a no-op write if not all terminal) so sibling
-		// finalizes serialize on the parent Rev (#3c).
-		cs.Processes = append(cs.Processes, pClone)
-	}
+	// The parent row is always a CAS target: it carries the fold, and CASing it
+	// unconditionally is what serializes sibling finalizes on the parent Rev
+	// (#3c). A parent that spawned this child and never waited is written too —
+	// that is the case the fold exists for.
+	cs.Processes = append(cs.Processes, pClone)
 	return nil
 }
 

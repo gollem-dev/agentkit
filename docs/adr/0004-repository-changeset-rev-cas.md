@@ -48,7 +48,10 @@ Firestore, DynamoDB, an in-memory map.
 5. Uniqueness is maintained on `idempotency_key`, on an open process's
    `Subject`, and on `(process_id, await_key)`. A violation writes nothing and
    returns `ErrConflict`.
-6. `ListEvents` preserves per-process append order.
+6. `ListEvents` preserves per-process append order and round-trips each event's
+   kernel-assigned `ID` verbatim; an implementation never mints or rewrites one.
+   It honours the `EventQuery`: `After` is an exclusive cursor (unknown is
+   `ErrEventNotFound` with no events) and `Limit` caps the count.
 7. `ClaimNextProcess` and `Apply`'s per-row `Rev` CAS (item 2) are mutually
    linearizable on the same `Process` row: if a claim and a CAS `Apply` both
    read the row at the same `Rev`, exactly one of them advances it to `Rev+1`
@@ -113,3 +116,4 @@ conditional write, or a mutex around an immutable snapshot.
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D3, D34). |
 | 2026-07-21 | Contract item 4 gained the `unclean_reclaims` counting rule (ADR-0015). It belongs here rather than only in ADR-0015 because this is the contract a third-party `Repository` author implements against; without it they could conform to the letter and still leave crash replay unbounded. |
 | 2026-07-22 | Added contract item 7: `ClaimNextProcess` and `Apply` are mutually linearizable on the same `Process` row. It belongs here rather than only in ADR-0016 because it is a property of this SPI's `Rev` CAS itself, not of the eager-dispatch feature that first needed it stated explicitly — a third-party `Repository` could otherwise conform to items 1–6 and still let a claim and a racing `Apply` both succeed on one row. |
+| 2026-07-26 | `ListEvents` gained an `EventQuery` (exclusive `After` cursor, `Limit` cap), and contract item 6 now requires an implementation to round-trip `Event.ID` verbatim rather than assigning one (ADR-0019). Breaking for existing implementations: a new persisted column and a changed signature. Recorded here because this is the contract a third-party author implements against — an implementation that minted its own ids would satisfy every other item and still resume a caller at the wrong place. |

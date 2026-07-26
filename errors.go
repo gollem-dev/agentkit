@@ -26,6 +26,10 @@ var (
 	// ErrAwaitClosed is returned when responding to an await that is not open
 	// (first-writer-wins; the second Respond always gets this).
 	ErrAwaitClosed = goerr.New("await closed")
+	// ErrEventNotFound is returned when a ListEvents cursor names an event the
+	// Process does not have. It is the signal that a stored cursor went stale,
+	// which is why it is not silently treated as "start from the beginning".
+	ErrEventNotFound = goerr.New("event not found")
 	// ErrToolNotFound is returned by CallTool for an unknown tool name.
 	ErrToolNotFound = goerr.New("tool not found")
 	// ErrLimitExceeded is returned to a strategy when a Limiter stops execution

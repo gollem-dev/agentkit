@@ -71,11 +71,12 @@ func (r *Repository) ListAwaits(ctx context.Context, pid agentkit.ProcessID) ([]
 	return r.state.ListAwaits(pid), nil
 }
 
-// ListEvents returns a Process's events in append order.
-func (r *Repository) ListEvents(ctx context.Context, pid agentkit.ProcessID) ([]*agentkit.Event, error) {
+// ListEvents returns a Process's events in append order, after the cursor and
+// capped at limit.
+func (r *Repository) ListEvents(ctx context.Context, pid agentkit.ProcessID, q agentkit.EventQuery) ([]*agentkit.Event, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.state.ListEvents(pid), nil
+	return r.state.ListEvents(pid, q)
 }
 
 // Apply applies a ChangeSet atomically. On any precondition failure it writes

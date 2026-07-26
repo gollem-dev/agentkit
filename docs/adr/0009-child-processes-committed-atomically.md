@@ -82,10 +82,12 @@ worse than retrying after the lease expires.
 - `Repository.Apply` must support several process rows in one change set, and
   `ChangeSet.Guards` must be honoured as write-free preconditions. Both are in
   the contract (ADR-0004) and exercised by `repotest`.
-- Metrics are **not** rolled up from child to parent. Each process meters
-  independently; a `Limiter` sees `ParentID` and `RootID` and can aggregate
-  across a tree itself. Sharing a budget would need a distributed counter, which
-  is not worth the complexity here.
+- Metrics roll up from child to parent, in the child's own terminal `Apply` —
+  which already writes the parent row, so this needs no second write and no
+  distributed counter ([ADR-0010](0010-limiter-is-one-function.md)). It is keyed
+  to the child rather than to an await precisely so that a child spawned and
+  never waited on, which the point above permits, still reaches the total. A
+  child still running does not.
 - `RootID` is inherited by every descendant, so a whole tree is queryable and
   correlatable by one id.
 - A parent that spawns children and then does *not* wait on them is legal; the
@@ -96,3 +98,4 @@ worse than retrying after the lease expires.
 | Date | Change |
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D15, D20, D46, D48). |
+| 2026-07-26 | Metrics now roll up from child to parent (ADR-0010). The earlier consequence said they do not, on the reasoning that sharing a budget needs a distributed counter — it does not, because the await's own commit already writes the parent row. |

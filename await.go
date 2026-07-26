@@ -51,4 +51,9 @@ type ChildResult struct {
 	Status    ProcessStatus
 	Output    []byte // the child's Output verbatim (format/type is known to the spawner).
 	Failure   *Failure
+	// Metrics is the child's cumulative usage at the moment it finished, which
+	// already includes any children it folded in. The kernel adds these into the
+	// parent when the await resolves, so a Limiter high in the tree sees what the
+	// tree below it spent rather than only the row it was called for.
+	Metrics Metrics
 }

@@ -104,6 +104,12 @@ derived that value server-side from an already-validated principal before
 spawning. Validate first, then establish scope — never load a scope from input
 and verify it afterwards.
 
+The map descends: `SpawnChild` copies the parent's unless the spawner names its
+own, so the whole subtree resolves tools under one scope. Since none of it is a
+credential, that is data propagation rather than privilege propagation — but a
+key you would not want a subagent's factory to read has to be stripped in a
+`SpawnMiddleware`, or kept out of the map.
+
 ## The strategy author's obligations
 
 Beyond the above:
