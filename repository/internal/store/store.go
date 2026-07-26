@@ -286,8 +286,16 @@ const (
 func claimKindOf(p *agentkit.Process, now time.Time) claimKind {
 	switch p.Status {
 	case agentkit.ProcessPending:
-		return cleanClaim
+		// A pending row may carry a WakeAt: the worker's requeue writes one as the
+		// retry backoff. Without this gate the backoff is inert and a Process that
+		// keeps failing is re-claimed as fast as the poll loop can go.
+		if p.WakeAt == nil || !p.WakeAt.After(now) {
+			return cleanClaim
+		}
+		return notClaimable
 	case agentkit.ProcessWaiting:
+		// Not the same condition as pending: a waiting row with no deadline is
+		// waiting on a response and must never wake on its own.
 		if p.WakeAt != nil && !p.WakeAt.After(now) {
 			return cleanClaim
 		}

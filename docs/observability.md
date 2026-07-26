@@ -275,12 +275,12 @@ anywhere to put the row.
 
 ## Middleware
 
-Five `next`-chain hooks, one per point where the kernel calls out: `Init`,
-`Step`, `Generate`, `CallTool`, `SpawnChild`. Registered on the `Kernel` with
-`WithInitMiddleware` and its four siblings, so one registration runs for every
-agent. A middleware receives the next handler and returns a replacement, which
-lets it observe, rewrite the request, refuse by not calling `next`, or call
-`next` more than once (`StepMiddleware` excepted — see below):
+Six `next`-chain hooks: `Claim`, `Init`, `Step`, `Generate`, `CallTool`,
+`SpawnChild`. Registered on the `Kernel` with `WithClaimMiddleware` and its five
+siblings, so one registration runs for every agent. A middleware receives the
+next handler and returns a replacement, which lets it observe, rewrite the
+request, refuse by not calling `next`, or call `next` more than once
+(`StepMiddleware` and `ClaimMiddleware` excepted — see below):
 
 ```go
 agentkit.WithToolCallMiddleware(func(next agentkit.ToolCallHandler) agentkit.ToolCallHandler {
@@ -297,6 +297,54 @@ agentkit.WithToolCallMiddleware(func(next agentkit.ToolCallHandler) agentkit.Too
 }),
 ```
 
+### Tracing across workers
+
+A `Process` outlives any one worker, so there is no live span to keep open
+across a suspend. What there is, is the **claim**: one worker, one lease, one
+continuous stretch of work. `ClaimMiddleware` brackets exactly that, and the
+`ctx` it hands to `next` reaches the `ToolFactory` and every transition in the
+run — so a span opened there is the root of everything below it, and it is timed
+by what actually happened rather than by inference.
+
+```go
+agentkit.WithClaimMiddleware(func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+    return func(ctx context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+        ctx, span := tracer.Start(ctx, "claim",
+            attribute.String("process", string(req.Process.ID)),
+            attribute.String("root", string(req.Process.RootID)),
+            attribute.String("worker", req.Process.LeaseOwner))
+        defer span.End()
+        outcome, err := next(ctx, req)
+        span.SetAttributes(attribute.String("outcome", string(outcome)))
+        return outcome, err
+    }
+}),
+```
+
+Correlate the claims of one Process by `ProcessID`, and a whole tree by
+`RootID`. Do not try to make them one span: the gap between two claims is the
+Process waiting, not a worker working, and a span drawn over it would report
+time nobody spent.
+
+`ClaimOutcome` names how the run ended — `finished`, `suspended`, `requeued`,
+`released`, `abandoned` — including the ends no strategy code is present for,
+such as a `ToolFactory` failure or a lost lease. The kernel reports what the
+claim really did; a middleware cannot substitute a different value.
+
+A claim is also the only scope with a teardown, so it is where a per-claim
+resource belongs. `ToolFactory` runs once per claim and has no closing hook of
+its own; if it opens an MCP connection or a sandbox, close it in a `defer` here.
+
+Returning without calling `next` **refuses** the claim: the Process goes back to
+`pending` with a retry backoff and is picked up again once it elapses. That is a
+throttle (a circuit breaker, a staged rollout), not a way to drop work. It is
+not an authorization gate either — see below.
+
+`examples/tracing` wires all of this against gollem's own trace handler and
+saves the result.
+
+### What the request carries
+
 `EffectContext` is enough to key an audit row and to correlate a whole process
 tree: which Process, which agent, which transition, how many attempts it has
 already taken, and `Metadata` — a copy of what `WithMetadata` set at spawn, so a
@@ -308,6 +356,14 @@ Properties to design around, all detailed in `middleware.go` and
 [ADR-0012](adr/0012-kernel-hooks-are-composable-middleware.md):
 
 - **Nothing is persisted by the framework.** Whatever you want kept, you keep.
+  A trace held in memory dies with the worker, which is the trade `Event` exists
+  for when a record has to survive.
+- **`ClaimMiddleware` and `StepMiddleware` must call `next` at most once.** For
+  a claim, the first call settles the row; the second returns
+  `ErrInvalidRequest`.
+- **A panic in `ClaimMiddleware` fails the claim, not the worker.** It is the one
+  hook that runs outside the transition, where a panic would otherwise take the
+  poll goroutine — and the process — down with it.
 - **A middleware is a real chokepoint, not a security gate.** `Generate`,
   `CallTool` and `SpawnChild` middleware is the outermost layer of its syscall —
   it wraps the `Limiter` check and, for tool calls, name resolution and argument
@@ -367,7 +423,11 @@ panic in it is recovered and logged rather than becoming a transition error.
 - **Telling something outside about a finished run** → pick a tier in
   [Delivering a result](#delivering-a-result). Best-effort is the default answer;
   reach past it only when a miss actually costs something.
-- **Distributed tracing / metrics export / tool policy** → middleware.
+- **Distributed tracing / metrics export / tool policy** → middleware. Time it
+  from `Claim`, which is the one hook that brackets a stretch of real work on one
+  worker; the rest bracket a single call.
+- **Releasing something a `ToolFactory` opened** → `ClaimMiddleware`. It is the
+  only scope with a teardown.
 - **Enforcing a budget** → `Limiter`.
 - **Reporting usage** → `Metrics`.
 

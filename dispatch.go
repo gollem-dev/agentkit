@@ -102,7 +102,7 @@ func (d *dispatcher) submit(pid ProcessID) {
 			if !ok {
 				return // another worker claimed it, or it is no longer pending.
 			}
-			resubmit = d.k.runClaim(d.ctx, d.cfg, proc) == claimReleased
+			resubmit = d.k.runClaim(d.ctx, d.cfg, proc) == ClaimReleased
 		}()
 		if resubmit {
 			d.submit(pid) // slot already freed above; falls back to polling if full.

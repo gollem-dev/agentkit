@@ -54,8 +54,9 @@ the contract against a shared store.
 3. **Each `ProcessGuard` in `cs.Guards` is a read-only precondition** — its `Rev`
    is checked, nothing is written, and its `Rev` is not advanced.
 4. **`ClaimNextProcess` never double-claims.** It claims one runnable process
-   atomically — `pending`, or `waiting` with `WakeAt` in the past, or `running`
-   with an expired lease — and mints a **fresh `LeaseToken` on every claim**,
+   atomically — `pending` with no `WakeAt` or one in the past, or `waiting` with
+   `WakeAt` in the past, or `running` with an expired lease — and mints a
+   **fresh `LeaseToken` on every claim**,
    including a re-claim by the same worker. No candidate means `(nil, nil)`, not
    an error. When the row it took was `running`, it also **increments
    `unclean_reclaims`**: that case means the previous claim died mid-transition,
@@ -128,6 +129,11 @@ your job — that boundary is exactly where serialization is supposed to live
 **Claim ordering.** The bundled implementations claim the oldest eligible
 process by `CreatedAt`. Nothing in the contract requires that ordering; pick
 whatever your store makes cheap and fair.
+
+**`WakeAt` gates a `pending` row too**, not only a `waiting` one — that is what
+makes the worker's retry backoff real. A `waiting` row differs in one way: it
+needs a `WakeAt` to be eligible at all, since one without a deadline is waiting
+for a response and must never wake by itself.
 
 **Indexes worth having.** The claim predicate (status, `WakeAt`, `LeaseUntil`),
 `idempotency_key`, `Subject` restricted to open processes, and

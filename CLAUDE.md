@@ -75,6 +75,7 @@ agentkit/                  root package: kernel + every port definition
 examples/                  a SEPARATE module (its own go.mod, replace ../)
   internal/demo/           live-or-stub model, and a Process poll helper
   quickstart/ tools/ human-in-the-loop/ durable-worker/ fanout/ middleware/
+  tracing/
 ```
 
 `examples/` is a second module on purpose: it needs an LLM provider's SDK, and

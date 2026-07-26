@@ -22,6 +22,7 @@ type Kernel struct {
 	agents       *Registry
 	toolFactory  ToolFactory
 	limiter      Limiter
+	claimMW      []ClaimMiddleware
 	initMW       []InitMiddleware
 	stepMW       []StepMiddleware
 	generateMW   []GenerateMiddleware
@@ -41,6 +42,7 @@ type kernelConfig struct {
 	roleBindings []roleBinding
 	toolFactory  ToolFactory
 	limiter      Limiter
+	claimMW      []ClaimMiddleware
 	initMW       []InitMiddleware
 	stepMW       []StepMiddleware
 	generateMW   []GenerateMiddleware
@@ -104,6 +106,11 @@ func New(repo Repository, model gollem.LLMClient, agents *Registry, opts ...Kern
 	for _, o := range opts {
 		o(&cfg)
 	}
+	for i, mw := range cfg.claimMW {
+		if mw == nil {
+			return nil, goerr.Wrap(ErrInvalidConfig, "nil claim middleware", goerr.V("index", i))
+		}
+	}
 	for i, mw := range cfg.initMW {
 		if mw == nil {
 			return nil, goerr.Wrap(ErrInvalidConfig, "nil init middleware", goerr.V("index", i))
@@ -146,6 +153,7 @@ func New(repo Repository, model gollem.LLMClient, agents *Registry, opts ...Kern
 		agents:       agents,
 		toolFactory:  cfg.toolFactory,
 		limiter:      cfg.limiter,
+		claimMW:      cfg.claimMW,
 		initMW:       cfg.initMW,
 		stepMW:       cfg.stepMW,
 		generateMW:   cfg.generateMW,
@@ -319,6 +327,11 @@ func (k *Kernel) Respond(ctx context.Context, pid ProcessID, key AwaitKey, respo
 		wake := proc.clone()
 		if wake.Status == ProcessWaiting {
 			wake.Status = ProcessPending
+			// Clear the wake time with the status. WakeAt gates when a pending row
+			// may be claimed, so leaving the suspended deadline behind would hold the
+			// response back until it passed. Nothing is lost: the next Suspend
+			// recomputes WakeAt from the awaits still open (see buildCommit).
+			wake.WakeAt = nil
 		}
 		err = k.repo.Apply(ctx, ChangeSet{Processes: []*Process{wake}, Awaits: []*Await{aw}})
 		if errors.Is(err, ErrConflict) {

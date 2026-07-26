@@ -232,6 +232,31 @@ agent, set `WithMaxUncleanReclaims(0)` — the Process then fails as
 Details in [process-lifecycle.md](design/process-lifecycle.md) and
 [ADR-0015](adr/0015-unclean-reclaims-are-counted-and-bounded.md).
 
+### How soon a retry happens
+
+Those two bound *whether* a retry happens. `WithRetryBackoff` decides *how
+soon*: it is handed the attempt count and returns the wait before the Process
+becomes claimable again. The default doubles from a second and caps at a minute.
+
+The reason to replace it is usually jitter. A fleet whose calls to one provider
+all failed at once will otherwise all retry at once, and the second wave fails
+for the same reason as the first:
+
+```go
+k.Serve(ctx, agentkit.WithRetryBackoff(func(attempts int) time.Duration {
+	base := min(time.Duration(1<<min(attempts, 6))*time.Second, time.Minute)
+	return base + time.Duration(rand.Int64N(int64(base/4)))
+}))
+```
+
+The wait is stored on the Process as its wake time, so it only holds if your
+`Repository` honours it — the reference implementations do, and
+[persistence.md](persistence.md) states the rule for your own.
+
+Its precision is bounded by `WithPollInterval`, not by the value you return: a
+requeued Process is deliberately passed over by eager dispatch, so a poll is what
+picks it back up. Timers wake the same way, for the same reason.
+
 ## Next
 
 - [examples/](../examples/) — the same shape as a program you can run, plus one

@@ -196,9 +196,10 @@ The whole runtime is five moving parts, in the order you meet them:
    a set of child processes. The `Process` leaves memory entirely and comes back
    when the await is satisfied.
 
-Around all of that, **middleware** wraps the five points where the kernel calls
-out (`Init`, `Step`, `Generate`, `CallTool`, `SpawnChild`) — that is where a
-concern that spans every agent goes.
+Around all of that, **middleware** wraps six points (`Claim`, `Init`, `Step`,
+`Generate`, `CallTool`, `SpawnChild`) — that is where a concern that spans every
+agent goes. `Claim` is the outermost: it brackets a worker's whole run on one
+`Process`, which is where a trace span or a per-claim resource belongs.
 
 Concepts in full: [docs/concepts.md](./docs/concepts.md). Writing your own
 strategy: [docs/writing-strategies.md](./docs/writing-strategies.md).
@@ -237,10 +238,16 @@ hour, and the process that asked may be long gone.
 
 ## Middleware
 
-Five points where the kernel calls out are wrapped by a `next`-chain, registered
-on the `Kernel`: `Init` and `Step` (the strategy boundary) and `Generate`,
-`CallTool` and `SpawnChild` (the effects). One registration covers every agent,
-which makes this the place for audit, tracing, redaction, retry and tool policy.
+Six points are wrapped by a `next`-chain, registered on the `Kernel`: `Claim`
+(one worker's whole run on a Process), `Init` and `Step` (the strategy boundary)
+and `Generate`, `CallTool` and `SpawnChild` (the effects). One registration
+covers every agent, which makes this the place for audit, tracing, redaction,
+retry and tool policy.
+
+`Claim` is the outermost, and the only one that brackets a stretch of real time
+on one worker rather than a single call into your code — so a trace span or a
+resource that must be released belongs there. See
+[examples/tracing](examples/tracing).
 
 An effect middleware is the outermost layer of its syscall — it wraps the
 `Limiter` check, tool resolution and argument validation — so a refused call is
@@ -366,7 +373,7 @@ touches the outside world; it is short and it is the part people get wrong.
 
 ## Documentation
 
-- [examples/](./examples/) — six runnable programs, one per idea. They are a
+- [examples/](./examples/) — seven runnable programs, one per idea. They are a
   separate module, so the LLM SDK they need stays out of this one's dependency
   graph, and they work offline: `cd examples && go run ./quickstart` needs no
   credentials.

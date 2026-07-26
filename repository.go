@@ -29,6 +29,10 @@ import (
 //     A claim from pending or waiting leaves it unchanged, and ClaimNextProcess
 //     never writes step_attempts. This is what bounds re-execution after a
 //     crash; an implementation that skips it degrades to unbounded replay.
+//     A pending row whose wake_at is still in the future is NOT a target: that
+//     is the retry backoff the worker writes when it puts a failed transition
+//     back. An implementation that claims it anyway still runs correctly, but
+//     retries as fast as it polls.
 //     ClaimNextProcess and Apply are mutually linearizable on the same Process
 //     row: a claim and a Rev-CAS Apply that both read the row at Rev N cannot
 //     both succeed — exactly one advances it to N+1 and the other observes the
@@ -51,9 +55,14 @@ type Repository interface {
 	FindOpenProcessBySubject(ctx context.Context, subject SubjectRef) (*Process, error)
 
 	// ClaimNextProcess atomically claims one runnable Process. Targets:
-	// status=pending, or status=waiting with wake_at<=now, or status=running
-	// with lease_until<now (lease expired). No target -> (nil, nil) (not an error).
-	// A claim from status=running also increments unclean_reclaims (contract 4).
+	// status=pending with wake_at unset or <=now, or status=waiting with
+	// wake_at<=now, or status=running with lease_until<now (lease expired). No
+	// target -> (nil, nil) (not an error). A claim from status=running also
+	// increments unclean_reclaims (contract 4).
+	//
+	// The two wake_at conditions differ on purpose: a pending row without one is
+	// runnable now, whereas a waiting row without one is waiting for a response
+	// and must never wake by itself.
 	ClaimNextProcess(ctx context.Context, workerID string, leaseUntil time.Time, now time.Time) (*Process, error)
 
 	// ListAwaits returns all awaits of a Process.
