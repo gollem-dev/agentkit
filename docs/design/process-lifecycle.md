@@ -307,7 +307,7 @@ be used to fence.
 re-read the process
   ├─ lease token changed?  → abandon, another worker owns it now
   └─ cancel requested?     → finalize as cancelled
-Limiter check              → failed(limit_exceeded) if it stops; otherwise its
+Limit check                → failed(limit_exceeded) if it stops; otherwise its
                              verdict seeds Syscalls.LimitStatus()
 DecodeState(version, bytes)
 Step(ctx, sys, state)      → new state, Decision

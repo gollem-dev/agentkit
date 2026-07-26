@@ -60,7 +60,7 @@ rule about what keys mean.
 | | `Input` (via `Init`) | `Metadata` (via `WithMetadata`) |
 |---|---|---|
 | Lifetime | folded into `State`, transient | persisted on the process row |
-| Audience | the strategy | infrastructure (`ToolFactory`, a `Limiter`, middleware); also readable by a strategy via `Syscalls.Metadata()` |
+| Audience | the strategy | infrastructure (`ToolFactory`, middleware) and the strategy's own `Limit`; also readable inside `Step` via `Syscalls.Metadata()` |
 | Typing | typed `I` | `map[string]string` |
 
 This generalizes to a standing rule: **agentkit does not ship vocabulary it does

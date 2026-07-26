@@ -30,6 +30,20 @@ type Strategy[S, I, O any] interface {
 	// state (the first transition too, since Init's result was persisted at
 	// insert). The input I is folded into State and does not appear here.
 	Step(ctx context.Context, sys Syscalls, state S) (S, Decision[O], error)
+	// Limit decides whether this Process may continue. The kernel measures
+	// (Metrics); this method is where the budget policy lives (ADR-0010). It runs
+	// at each transition boundary, before every Generate, CallTool and SpawnChild,
+	// and again after each of those has been metered.
+	//
+	// It takes no S: the boundary evaluation happens before the state is decoded,
+	// and a limit that has to read the algorithm's own state is a branch in Step,
+	// not a budget. What it must be is cheap, read-only and non-blocking — see the
+	// Limiter type, whose shape this method has, for what that rules out.
+	//
+	// Returning LimitPass() means unlimited. There is no way to opt out of
+	// answering, which is the point: a budget nobody configured used to read as no
+	// budget at all.
+	Limit(ctx context.Context, proc *Process, metrics Metrics) LimitDecision
 	// EncodeState / DecodeState fully own state serialization — the format is
 	// free (JSON/gob/protobuf/...). agentkit only stores the bytes.
 	EncodeState(state S) ([]byte, error)
@@ -49,8 +63,12 @@ type StrategyBinding struct {
 	version int
 	init    func(input any) (any, error)
 	step    func(ctx context.Context, sys Syscalls, state any) (any, decision, error)
-	encode  func(state any) ([]byte, error)
-	decode  func(version int, raw []byte) (any, error)
+	// limit is the strategy's Limit method. It touches none of S, I or O, so it
+	// needs no erasing closure — the method value is already a Limiter. Always
+	// non-nil, because Strategy requires the method.
+	limit  Limiter
+	encode func(state any) ([]byte, error)
+	decode func(version int, raw []byte) (any, error)
 	// encodeOutput runs after the Step middleware chain, not inside step: a
 	// StepMiddleware can replace the Decision (NewStepResult) and has no way to
 	// encode, so the erased decision carries the typed value and the worker
@@ -66,7 +84,8 @@ type StrategyBinding struct {
 
 // BindStrategy erases the type of a Strategy by folding Init/Step/EncodeState/
 // DecodeState/EncodeOutput into closures, plus the completion handler when one
-// was registered. Exported for building fake strategies in tests.
+// was registered. Limit is carried as the method value itself, having no typed
+// argument to erase. Exported for building fake strategies in tests.
 func BindStrategy[S, I, O any](s Strategy[S, I, O], opts ...RegisterOption[O]) StrategyBinding {
 	var cfg registerConfig[O]
 	for _, o := range opts {
@@ -96,6 +115,7 @@ func BindStrategy[S, I, O any](s Strategy[S, I, O], opts ...RegisterOption[O]) S
 			}
 			return state, d.erase(), nil
 		},
+		limit: s.Limit,
 		encode: func(st any) ([]byte, error) {
 			typed, ok := st.(S)
 			if !ok {

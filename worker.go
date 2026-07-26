@@ -372,9 +372,9 @@ func (k *Kernel) settleFailedClaim(ctx context.Context, cfg serveConfig, proc *P
 }
 
 // recoverClaim runs fn and turns a panic into an error. runTransition already
-// recovers a panic raised inside a transition; this covers the claim scope
-// around it — chain construction, the ToolFactory, the Limiter, a caller's
-// RetryBackoff — none of which serveLoop guards.
+// recovers a panic raised inside a transition, and callLimit the one at the
+// boundary; this covers the rest of the claim scope — chain construction, the
+// ToolFactory, a caller's RetryBackoff — none of which serveLoop guards.
 func (k *Kernel) recoverClaim(fn func() error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -461,17 +461,23 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		// The verdict is kept, not just tested: a notice seeds Syscalls.LimitStatus()
 		// for this transition, which is how a strategy learns the budget is running
 		// out before anything refuses it.
-		var limit LimitDecision
-		if k.limiter != nil {
-			d := k.limiter(ctx, proc, proc.Metrics)
-			if d.Kind() == LimitKindStop {
-				return k.finalizeClaimed(ctx, proc,
-					failWithMessage(FailureLimitExceeded, d.Message()), claimToken, Metrics{})
-			}
-			limit = d
+		//
+		// Limit is the strategy's own method and this call is outside the recover in
+		// runTransition, so a panic goes through failOrRequeue like any other failed
+		// transition. recoverClaim would catch it too, but as a claim panic —
+		// requeued as infrastructure, which does not spend StepAttempts, so a Limit
+		// that always panics would requeue forever. Charging it to the strategy
+		// bounds it at retry_exhausted. No effect has run yet, hence Metrics{}.
+		limit, lerr := callLimit(ctx, b.limit, proc, proc.Metrics)
+		if lerr != nil {
+			return k.failOrRequeue(ctx, cfg, proc, claimToken, lerr, Metrics{})
+		}
+		if limit.Kind() == LimitKindStop {
+			return k.finalizeClaimed(ctx, proc,
+				failWithMessage(FailureLimitExceeded, limit.Message()), claimToken, Metrics{})
 		}
 
-		sys := newSyscalls(k, proc, toolList, hs, limit)
+		sys := newSyscalls(k, proc, toolList, hs, b.limit, limit)
 		rawState, dec, terr := k.runTransition(ctx, sys, b, proc)
 		if terr != nil {
 			// This transition did not commit; its buffered children are dropped.
@@ -712,7 +718,7 @@ func failWith(code FailureCode, err error) terminalMutator {
 }
 
 // failWithMessage is the form for a reason that was never an error to begin
-// with — a Limiter's, which is a string by design (the error type would be
+// with — a Limit verdict's, which is a string by design (the error type would be
 // discarded here anyway).
 func failWithMessage(code FailureCode, msg string) terminalMutator {
 	return func(p *Process) { p.Status = ProcessFailed; p.Failure = &Failure{Code: code, Message: msg} }

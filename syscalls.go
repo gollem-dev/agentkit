@@ -12,7 +12,7 @@ import (
 )
 
 // Syscalls is the path by which a strategy (a user program) touches the outside
-// world. It runs metering (Metrics) and Limiter checks and offers spawn, wait
+// world. It runs metering (Metrics) and Limit checks and offers spawn, wait
 // reads, and event emission. The implementation (a private struct) is assembled
 // by the worker per claim. The naming is an OS metaphor: ProcessID()=getpid,
 // Now()=clock, SpawnChild=fork.
@@ -23,7 +23,7 @@ import (
 //
 // Generate, CallTool and SpawnChild each run through their middleware chain
 // first, if the Kernel was given one. The chain is the outermost layer: it wraps
-// the Limiter check, tool resolution and argument validation, and a middleware
+// the Limit check, tool resolution and argument validation, and a middleware
 // that returns without calling next stops the call before any of them.
 type Syscalls interface {
 	// --- execution context ---
@@ -43,7 +43,7 @@ type Syscalls interface {
 	// was called, not verified here (ADR-0011).
 	Metadata() map[string]string
 
-	// --- LLM (via gollem; Limiter before, Metrics after) ---
+	// --- LLM (via gollem; Limit before, Metrics after) ---
 	Tools() []gollem.Tool // the tools the ToolFactory built (to declare to the LLM).
 	Generate(ctx context.Context, input []gollem.Input, opts ...GenerateOption) (*GenerateResult, error)
 	// SessionGenerate runs one LLM turn as part of the Process's managed
@@ -60,7 +60,7 @@ type Syscalls interface {
 	// ErrHistoryNotConfigured.
 	SessionHistory(ctx context.Context) (*gollem.History, error)
 
-	// --- tool execution (Limiter before, Metrics after; no approval gate) ---
+	// --- tool execution (Limit before, Metrics after; no approval gate) ---
 	CallTool(ctx context.Context, call gollem.FunctionCall) (map[string]any, error)
 
 	// --- subagents ---
@@ -75,16 +75,16 @@ type Syscalls interface {
 	// --- observation ---
 	Emit(ctx context.Context, typ EventType, payload []byte) error // flushed on commit. Encoding is the caller's.
 	Metrics() Metrics                                              // proc.Metrics (committed) + this run's accumulation.
-	// LimitStatus reports the Limiter's most recent verdict, or the zero
-	// LimitDecision (which reads as LimitKindPass) when there is no Limiter.
-	// Switch on Kind() and read Message().
+	// LimitStatus reports this Strategy's most recent Limit verdict, starting
+	// with the one taken at the transition boundary. Switch on Kind() and read
+	// Message().
 	//
-	// It moves in lockstep with Metrics(): the Limiter runs again before and
+	// It moves in lockstep with Metrics(): Limit runs again before and
 	// after every Generate, CallTool and SpawnChild, so reading this right after
 	// a Generate reflects the tokens that Generate just spent — including a
 	// refusal the Generate itself provoked by crossing the cap.
 	//
-	// A LimitKindStop here means the Limiter is refusing, NOT that this Process
+	// A LimitKindStop here means Limit is refusing, NOT that this Process
 	// has stopped. An effect that already ran is not undone, and a strategy is
 	// free to finish with what it has; enforcement happens at the next effect's
 	// check or the next transition boundary.
@@ -278,10 +278,14 @@ type syscalls struct {
 	// this run's share is folded on any successful Apply, D44).
 	runMetrics Metrics
 
-	// limit is the Limiter's latest verdict: seeded with the transition
-	// boundary's, then rewritten by every checkLimit and every meter. It moves in
-	// lockstep with runMetrics so LimitStatus() and Metrics() never describe
-	// different moments.
+	// limiter is this Process's Strategy.Limit, handed over by the worker from the
+	// binding it already resolved. Always non-nil: Strategy requires the method.
+	limiter Limiter
+
+	// limit is limiter's latest verdict: seeded with the transition boundary's,
+	// then rewritten by every checkLimit and every meter. It moves in lockstep
+	// with runMetrics so LimitStatus() and Metrics() never describe different
+	// moments.
 	limit LimitDecision
 
 	// transition buffers (folded into the commit ChangeSet).
@@ -290,7 +294,7 @@ type syscalls struct {
 	pendingSpawnDone []func(error) // SpawnRequest.OnCommit callbacks (called by the worker after commit, #8).
 }
 
-func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool, hist *historyState, limit LimitDecision) *syscalls {
+func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool, hist *historyState, limiter Limiter, limit LimitDecision) *syscalls {
 	byName := make(map[string]gollem.Tool, len(tools))
 	for _, t := range tools {
 		byName[t.Spec().Name] = t
@@ -302,7 +306,7 @@ func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool, hist *historySta
 		}
 	}
 	return &syscalls{k: k, proc: proc, seq: proc.StateSeq + 1, tools: tools, toolByName: byName,
-		awaits: awaits, hist: hist, limit: limit}
+		awaits: awaits, hist: hist, limiter: limiter, limit: limit}
 }
 
 func (s *syscalls) ProcessID() ProcessID { return s.proc.ID }
@@ -323,7 +327,7 @@ func (s *syscalls) Metrics() Metrics { return s.proc.Metrics.add(s.runMetrics) }
 func (s *syscalls) LimitStatus() LimitDecision { return s.limit }
 
 // meter folds an effect's usage into this run's metrics and re-evaluates the
-// Limiter, so LimitStatus() and Metrics() always describe the same moment: a
+// Limit, so LimitStatus() and Metrics() always describe the same moment: a
 // strategy reading either one right after a Generate sees the tokens that
 // Generate just spent.
 //
@@ -334,15 +338,12 @@ func (s *syscalls) LimitStatus() LimitDecision { return s.limit }
 // later. Enforcement stays with the next checkLimit and the next transition
 // boundary.
 //
-// A stored refusal therefore means "the Limiter is refusing", not "this Process
+// A stored refusal therefore means "Limit is refusing", not "this Process
 // has stopped" — the same thing it means after checkLimit refused and a strategy
 // chose to carry on.
 func (s *syscalls) meter(ctx context.Context, m Metrics) {
 	s.runMetrics = s.runMetrics.add(m)
-	if s.k.limiter == nil {
-		return
-	}
-	s.limit = s.k.limiter(ctx, s.proc, s.Metrics())
+	s.limit = s.limiter(ctx, s.proc, s.Metrics())
 }
 
 // notifySpawnDone calls every buffered OnCommit callback exactly once
@@ -373,15 +374,12 @@ func (s *syscalls) ec() EffectContext {
 		StateSeq: s.seq, Attempt: s.Attempt(), Metadata: s.Metadata(), Limit: s.limit}
 }
 
-// checkLimit runs the Limiter with the live snapshot (committed + this run) and
+// checkLimit runs Limit with the live snapshot (committed + this run) and
 // refuses the effect if it says so. Like meter, it stores the verdict whichever
 // way it goes: a strategy that catches ErrLimitExceeded and carries on can then
 // read the reason off LimitStatus() instead of parsing the error's text.
 func (s *syscalls) checkLimit(ctx context.Context) error {
-	if s.k.limiter == nil {
-		return nil
-	}
-	d := s.k.limiter(ctx, s.proc, s.Metrics())
+	d := s.limiter(ctx, s.proc, s.Metrics())
 	s.limit = d
 	if d.Kind() == LimitKindStop {
 		return goerr.Wrap(ErrLimitExceeded, d.Message())
@@ -390,7 +388,7 @@ func (s *syscalls) checkLimit(ctx context.Context) error {
 }
 
 // Generate runs the middleware chain around generateBase. The chain is the
-// outermost layer: a middleware sees calls the Limiter later refuses, and one
+// outermost layer: a middleware sees calls Limit later refuses, and one
 // that returns without calling next consumes neither quota nor metrics.
 func (s *syscalls) Generate(ctx context.Context, input []gollem.Input, opts ...GenerateOption) (*GenerateResult, error) {
 	req := &GenerateRequest{Effect: s.ec(), Input: input}

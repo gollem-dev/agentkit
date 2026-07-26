@@ -62,6 +62,7 @@ type config struct {
 	systemPrompt     string
 	maxRounds        int
 	maxParallelTasks int
+	limiter          agentkit.Limiter
 	registerOpts     []agentkit.RegisterOption[Output]
 }
 
@@ -74,6 +75,15 @@ func WithMaxRounds(n int) Option { return func(c *config) { c.maxRounds = n } }
 // WithMaxParallelTasks caps tasks per round (reflected as the plan schema maxItems).
 // Default: 5.
 func WithMaxParallelTasks(n int) Option { return func(c *config) { c.maxParallelTasks = n } }
+
+// WithLimiter sets this agent's execution budget, which Strategy.Limit answers
+// with. Default: none, i.e. LimitPass at every check.
+//
+// This is a different question from WithMaxRounds: that one is an algorithm
+// parameter the planner is even told about, while a limiter sees the kernel's
+// counters. Those include every terminated child, so on a planexec parent one
+// limiter is a budget for the whole fan-out.
+func WithLimiter(f agentkit.Limiter) Option { return func(c *config) { c.limiter = f } }
 
 // WithOnFinish wires a completion handler for this agent. Delivery is
 // best-effort; see agentkit.WithOnFinish.
@@ -106,6 +116,7 @@ func Register[T any](r *agentkit.Registry, name agentkit.AgentName, version int,
 		systemPrompt:     cfg.systemPrompt,
 		maxRounds:        cfg.maxRounds,
 		maxParallelTasks: cfg.maxParallelTasks,
+		limiter:          cfg.limiter,
 	}, cfg.registerOpts...)
 }
 
@@ -137,9 +148,17 @@ type strategy[T any] struct {
 	systemPrompt     string
 	maxRounds        int
 	maxParallelTasks int
+	limiter          agentkit.Limiter
 }
 
 func (s *strategy[T]) Version() int { return s.version }
+
+func (s *strategy[T]) Limit(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+	if s.limiter == nil {
+		return agentkit.LimitPass()
+	}
+	return s.limiter(ctx, proc, m)
+}
 
 func (s *strategy[T]) Init(in Input) (state, error) {
 	if in.Prompt == "" {

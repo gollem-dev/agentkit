@@ -915,8 +915,8 @@ func TestMiddlewareObservesLimitExceeded(t *testing.T) {
 		return []gollem.Tool{tool}, nil
 	}
 
-	k, repo, ag := setupScript(t, step, model,
-		agentkit.WithToolCallMiddleware(mw), agentkit.WithToolFactory(tf), agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter,
+		agentkit.WithToolCallMiddleware(mw), agentkit.WithToolFactory(tf))
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithMetadata(map[string]string{"seed": "1"}))
 	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
@@ -927,7 +927,8 @@ func TestMiddlewareObservesLimitExceeded(t *testing.T) {
 }
 
 // EffectContext carries the verdict so a budget warning can reach the model
-// through one Kernel registration, without any strategy being changed.
+// through one middleware registration, without the strategy that answered Limit
+// having to put the notice into a prompt itself.
 func TestGenerateMiddlewareReadsLimitFromEffectContext(t *testing.T) {
 	ctx := context.Background()
 	model, _ := mockLLM(textResponse("x"))
@@ -951,8 +952,8 @@ func TestGenerateMiddlewareReadsLimitFromEffectContext(t *testing.T) {
 	limiter := func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
 		return agentkit.LimitNotice("wrap up")
 	}
-	k, repo, ag := setupScript(t, step, model,
-		agentkit.WithGenerateMiddleware(mw), agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter,
+		agentkit.WithGenerateMiddleware(mw))
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 

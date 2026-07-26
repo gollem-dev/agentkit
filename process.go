@@ -34,7 +34,7 @@ type FailureCode string
 const (
 	// FailureStrategyError: Decision=Fail or an unrecoverable Step error.
 	FailureStrategyError FailureCode = "strategy_error"
-	// FailureLimitExceeded: stopped by a Limiter.
+	// FailureLimitExceeded: stopped by the Strategy's Limit.
 	FailureLimitExceeded FailureCode = "limit_exceeded"
 	// FailureRetryExhausted: step retry limit exceeded.
 	FailureRetryExhausted FailureCode = "retry_exhausted"

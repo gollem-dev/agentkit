@@ -169,10 +169,16 @@ stronger model at planning and a cheaper one at the tasks. Offline, giving each
 its own client also keeps the run deterministic, since children execute in
 parallel and would otherwise race over one script.
 
-Note what the budget in this example does **not** do: a `Limiter` sees one
-Process's metrics, so it caps the planner and each child separately, not the
-tree as a whole. A tree-wide budget needs your own accounting keyed by
-`proc.RootID`.
+The same closure goes to both agents, and on the planner it is a budget for the
+whole fan-out rather than for the planner's own calls: a child folds its metrics
+into its parent when it terminates, so the parent's next check sees what the
+subtree spent. No accounting keyed by `proc.RootID` is needed.
+
+What it does **not** do is track a child still running. The case to design
+around: the parent passes a check, spawns children that spend the rest of the
+budget, and trips on its very next transition — by which point its recorded
+`LLMCalls` is above the cap. The cap bounds what the parent goes on to do, not
+what its subtree already did.
 
 The comparison is `>=`, because the limiter runs *before* the call it is
 deciding about. With `>`, a budget of N would allow N+1 calls — an off-by-one
@@ -206,7 +212,7 @@ Four things that trail is showing:
 
 - **Refusing.** The tool policy returns without calling `next`, so the tool
   never runs. Effect middleware is the *outermost* layer of its syscall — it
-  wraps the `Limiter` check, tool resolution and argument validation — so it
+  wraps the `Limit` check, tool resolution and argument validation — so it
   stops a call before any of those, and still sees a call refused deeper in.
 - **Rewriting.** The `Init` middleware prefixes a house style onto the prompt.
   It runs for every agent and cannot know any one strategy's input type:

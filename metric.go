@@ -8,7 +8,7 @@ package agentkit
 // consumed" and is a valid Metrics.
 //
 // Process.Metrics counts a Process's own effects plus every child that has
-// terminated, once each, so a Limiter high in a tree sees what the subtree
+// terminated, once each, so a Limit high in a tree sees what the subtree
 // spent rather than only the row it was called for.
 //
 // The json tags match the keys the previous map form produced, so a snapshot

@@ -83,11 +83,11 @@ around the whole run. Three rules shape it:
   the poll goroutine. It is converted into a claim failure and requeued.
 
 Effect middleware (`Generate`, `CallTool`, `Spawn`) is the **outermost** layer of
-its syscall: it wraps the `Limiter` check, tool resolution and argument
+its syscall: it wraps the `Limit` check, tool resolution and argument
 validation. A refused call is therefore visible to it — which is the point,
 since a rejected attempt is the interesting row in an audit log — and a
 middleware that returns without calling `next` consumes neither quota nor
-metrics. `Observer` fired inside the `Limiter` check and could not see any of
+metrics. `Observer` fired inside the `Limit` check and could not see any of
 this.
 
 `StepMiddleware` wraps the `Step` **call**, between `DecodeState` and
@@ -143,9 +143,10 @@ support.
   would appear at five points in the public API — the spine of the design, not a
   corner of it — which is too much to carve out of an invariant.
 - **Middleware around `Kernel.Respond` / `Kernel.Cancel` / `ToolFactory` /
-  `Limiter`.** The first two are called by the application itself, which already
-  has a service layer to put authorization and audit in. The last two are
-  already injected as function values and compose without kernel support.
+  `Strategy.Limit`.** The first two are called by the application itself, which
+  already has a service layer to put authorization and audit in. A `ToolFactory`
+  is an injected function value and `Limit` is the strategy's own method; both
+  compose in the code that supplies them, without kernel support.
   Middleware belongs only where the kernel owns the call site.
 - **Wrap a whole `runClaim` iteration (Step *plus* commit).** That would be a
   true transition span, but the loop carries retry, lease loss and conflict

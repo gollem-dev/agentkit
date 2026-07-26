@@ -32,6 +32,14 @@ type scriptState struct {
 type scriptStrategy struct {
 	version int
 	step    func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error)
+	limit   agentkit.Limiter // nil = unlimited.
+}
+
+func (s *scriptStrategy) Limit(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+	if s.limit == nil {
+		return agentkit.LimitPass()
+	}
+	return s.limit(ctx, proc, m)
 }
 
 func (s *scriptStrategy) Version() int {
@@ -149,9 +157,17 @@ func isTerminal(p *agentkit.Process) bool { return p.Status.Terminal() }
 // script strategy "main" with the given step. Returns kernel, repo, handle.
 func setupScript(t *testing.T, step stepFn, model gollem.LLMClient, opts ...agentkit.KernelOption) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput]) {
 	t.Helper()
+	return setupScriptLimited(t, step, model, nil, opts...)
+}
+
+// setupScriptLimited is setupScript with a budget. The limiter goes on the
+// strategy, not the Kernel, so a test that wants one has to register with it.
+func setupScriptLimited(t *testing.T, step stepFn, model gollem.LLMClient, limit agentkit.Limiter,
+	opts ...agentkit.KernelOption) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput]) {
+	t.Helper()
 	repo := memory.New()
 	reg := agentkit.NewRegistry()
-	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step, limit: limit})
 	gt.NoError(t, err)
 	k, err := agentkit.New(repo, model, reg, opts...)
 	gt.NoError(t, err)
@@ -219,7 +235,7 @@ func TestE7_LimiterMetricsFoldNoBypass(t *testing.T) {
 		}
 		return agentkit.LimitPass()
 	}
-	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
@@ -231,6 +247,137 @@ func TestE7_LimiterMetricsFoldNoBypass(t *testing.T) {
 	// llm_calls==1 at the next boundary and stops. No bypass, no re-call.
 	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
 	gt.Value(t, *count).Equal(1)
+}
+
+// Limit runs at the transition boundary, which is outside runTransition's
+// recover. A panic there must become a transition error like any other piece of
+// strategy code that blew up -- never a dead worker.
+func TestLimitPanicAtBoundaryIsATransitionError(t *testing.T) {
+	ctx := context.Background()
+	model, count := mockLLM(textResponse("x"))
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("unreachable")), nil
+	}
+	limiter := func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+		panic("budget lookup exploded")
+	}
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+
+	// maxStepAttempts=0 turns the first failure into the last one, so this also
+	// proves the panic went down the ordinary retry path rather than some
+	// separate handling.
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	// Step never ran: the boundary refused before the strategy was reached.
+	gt.Value(t, *count).Equal(0)
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(0))
+}
+
+// One Serve, two Processes: the panicking one must not stop the loop from
+// driving the other. Both are waited for inside a single serveUntil, because
+// serveUntil cancels its Serve on return — two calls would prove only that a
+// fresh worker works, which is not the claim.
+func TestLimitPanicDoesNotKillTheWorker(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	doneStep := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("fine")), nil
+	}
+	boom, err := agentkit.Register(reg, "boom", 1, &scriptStrategy{
+		step: doneStep,
+		limit: func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+			panic("budget lookup exploded")
+		},
+	})
+	gt.NoError(t, err)
+	healthy, err := agentkit.Register(reg, "healthy", 1, &scriptStrategy{step: doneStep})
+	gt.NoError(t, err)
+
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	badPID, err := boom.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	goodPID, err := healthy.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+
+	good := serveUntil(t, k, repo, goodPID, 3*time.Second, func(p *agentkit.Process) bool {
+		if !p.Status.Terminal() {
+			return false
+		}
+		bad, err := repo.GetProcess(ctx, badPID)
+		return err == nil && bad.Status.Terminal()
+	}, agentkit.WithMaxStepAttempts(0))
+	gt.Value(t, good.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(good.Output)).Equal("fine")
+
+	bad := gt.R1(repo.GetProcess(ctx, badPID)).NoError(t)
+	gt.Value(t, bad.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, bad.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+}
+
+// The other two call sites run inside runTransition, so their panics are the
+// recover there rather than callLimit. These assert that the asymmetry actually
+// holds -- and that a panic AFTER an effect still folds that effect's metrics in.
+func TestLimitPanicInsideAnEffect(t *testing.T) {
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	// Call 1 is the transition boundary, 2 is checkLimit before Generate, 3 is
+	// meter after it.
+	panicOnCall := func(n int) agentkit.Limiter {
+		var mu sync.Mutex
+		calls := 0
+		return func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+			mu.Lock()
+			calls++
+			c := calls
+			mu.Unlock()
+			if c == n {
+				panic("budget lookup exploded")
+			}
+			return agentkit.LimitPass()
+		}
+	}
+
+	t.Run("before the effect: nothing ran, nothing counted", func(t *testing.T) {
+		ctx := context.Background()
+		model, count := mockLLM(textResponse("x"))
+		k, repo, ag := setupScriptLimited(t, step, model, panicOnCall(2))
+		pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		gt.NoError(t, err)
+
+		p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+		gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+		gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+		gt.Value(t, *count).Equal(0)
+		gt.Value(t, p.Metrics.LLMCalls).Equal(int64(0))
+	})
+
+	t.Run("after the effect: the Generate is counted anyway", func(t *testing.T) {
+		ctx := context.Background()
+		model, count := mockLLM(textResponse("x"))
+		k, repo, ag := setupScriptLimited(t, step, model, panicOnCall(3))
+		pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		gt.NoError(t, err)
+
+		p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+		gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+		gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+		// The call happened and cost real tokens, so it is on the row even though
+		// the transition never committed a state change.
+		gt.Value(t, *count).Equal(1)
+		gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
+	})
 }
 
 // A notice reaches the strategy and does not end the Process. This is the whole
@@ -250,7 +397,7 @@ func TestLimitNoticeReachesStrategyWithoutStopping(t *testing.T) {
 	limiter := func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
 		return agentkit.LimitNotice("careful")
 	}
-	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
@@ -299,7 +446,7 @@ func TestLimitStatusRefreshesRightAfterGenerate(t *testing.T) {
 		}
 		return agentkit.LimitPass()
 	}
-	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
@@ -329,7 +476,7 @@ func TestLimitStopAfterEffectDoesNotFailTheEffect(t *testing.T) {
 		}
 		return agentkit.LimitPass()
 	}
-	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
@@ -361,7 +508,7 @@ func TestStrategyCanWrapUpOnCrossingTheCap(t *testing.T) {
 		}
 		return agentkit.LimitPass()
 	}
-	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
@@ -391,7 +538,7 @@ func TestLimitStopBeforeEffectIsReadableAfterCatching(t *testing.T) {
 		}
 		return agentkit.LimitStop("over")
 	}
-	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
@@ -420,7 +567,7 @@ func TestLimitNoticeClears(t *testing.T) {
 		}
 		return agentkit.LimitPass()
 	}
-	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
@@ -449,7 +596,7 @@ func TestFailedGenerateUpdatesNeitherMetricsNorLimitStatus(t *testing.T) {
 		}
 		return agentkit.LimitPass()
 	}
-	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
@@ -806,9 +953,17 @@ type finishOut struct {
 type finishStrategy struct {
 	step      func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[finishOut], error)
 	encodeErr error
+	limit     agentkit.Limiter // nil = unlimited.
 }
 
 func (*finishStrategy) Version() int { return 1 }
+
+func (s *finishStrategy) Limit(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+	if s.limit == nil {
+		return agentkit.LimitPass()
+	}
+	return s.limit(ctx, proc, m)
+}
 
 func (*finishStrategy) Init(in scriptInput) (scriptState, error) {
 	if in.Seed == "" {
@@ -861,9 +1016,16 @@ func (r *finishRecorder) snapshot() (int, []agentkit.FinishResult[finishOut]) {
 
 func setupFinish(t *testing.T, step finishStepFn, h agentkit.FinishHandler[finishOut], opts ...agentkit.KernelOption) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput]) {
 	t.Helper()
+	return setupFinishLimited(t, step, h, nil, opts...)
+}
+
+// setupFinishLimited is setupFinish with a budget on the strategy.
+func setupFinishLimited(t *testing.T, step finishStepFn, h agentkit.FinishHandler[finishOut],
+	limit agentkit.Limiter, opts ...agentkit.KernelOption) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput]) {
+	t.Helper()
 	repo := memory.New()
 	reg := agentkit.NewRegistry()
-	ag, err := agentkit.Register(reg, "main", 1, &finishStrategy{step: step}, agentkit.WithOnFinish(h))
+	ag, err := agentkit.Register(reg, "main", 1, &finishStrategy{step: step, limit: limit}, agentkit.WithOnFinish(h))
 	gt.NoError(t, err)
 	model, _ := mockLLM(textResponse("x"))
 	k, err := agentkit.New(repo, model, reg, opts...)
@@ -937,7 +1099,7 @@ func TestFinishHandlerOnLimitExceeded(t *testing.T) {
 		}
 		return agentkit.LimitPass()
 	}
-	k, repo, ag := setupFinish(t, step, rec.handler, agentkit.WithLimiter(limiter))
+	k, repo, ag := setupFinishLimited(t, step, rec.handler, limiter)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
@@ -2037,9 +2199,6 @@ func TestLimiterObservesFoldedChildMetrics(t *testing.T) {
 		}
 		return st, agentkit.Done([]byte("done")), nil
 	}
-	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
-	gt.NoError(t, err)
-
 	var mu sync.Mutex
 	maxSeenOnParent := int64(-1)
 	limiter := func(_ context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
@@ -2052,9 +2211,11 @@ func TestLimiterObservesFoldedChildMetrics(t *testing.T) {
 		}
 		return agentkit.LimitPass()
 	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep, limit: limiter})
+	gt.NoError(t, err)
 
 	model, _ := mockLLM(textResponse("x"), textResponse("x"), textResponse("x"))
-	k, err := agentkit.New(repo, model, reg, agentkit.WithLimiter(limiter))
+	k, err := agentkit.New(repo, model, reg)
 	gt.NoError(t, err)
 
 	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})

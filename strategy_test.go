@@ -28,6 +28,9 @@ func (bindStrat) Init(in bindInput) (bindState, error) {
 func (bindStrat) Step(_ context.Context, _ agentkit.Syscalls, st bindState) (bindState, agentkit.Decision[[]byte], error) {
 	return st, agentkit.Done([]byte("x")), nil
 }
+func (bindStrat) Limit(context.Context, *agentkit.Process, agentkit.Metrics) agentkit.LimitDecision {
+	return agentkit.LimitPass()
+}
 func (bindStrat) EncodeOutput(out []byte) ([]byte, error)  { return out, nil }
 func (bindStrat) EncodeState(st bindState) ([]byte, error) { return json.Marshal(st) }
 func (bindStrat) DecodeState(_ int, raw []byte) (bindState, error) {
@@ -85,6 +88,9 @@ func (s outStrat) Step(_ context.Context, _ agentkit.Syscalls, st bindState) (bi
 	d, err := s.step(st)
 	return st, d, err
 }
+func (outStrat) Limit(context.Context, *agentkit.Process, agentkit.Metrics) agentkit.LimitDecision {
+	return agentkit.LimitPass()
+}
 func (s outStrat) EncodeOutput(out bindOut) ([]byte, error) {
 	if s.encodeCalls != nil {
 		*s.encodeCalls++
@@ -107,6 +113,9 @@ func (anyOutStrat) Init(in bindInput) (bindState, error) { return bindState(in),
 func (s anyOutStrat) Step(_ context.Context, _ agentkit.Syscalls, st bindState) (bindState, agentkit.Decision[any], error) {
 	d, err := s.step(st)
 	return st, d, err
+}
+func (anyOutStrat) Limit(context.Context, *agentkit.Process, agentkit.Metrics) agentkit.LimitDecision {
+	return agentkit.LimitPass()
 }
 func (s anyOutStrat) EncodeOutput(out any) ([]byte, error) {
 	if s.onEncode != nil {
