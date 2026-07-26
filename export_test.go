@@ -64,8 +64,8 @@ func WrapOutputForTest[O any](out O) any { return typedOutput[O]{value: out} }
 // This file exposes internal helpers for white-box testing (package agentkit),
 // consumed by the black-box test package agentkit_test.
 
-// AddMetrics is the exported form of addMetrics for testing.
-func AddMetrics(a, b Metrics) Metrics { return addMetrics(a, b) }
+// AddMetrics is the exported form of Metrics.add for testing.
+func AddMetrics(a, b Metrics) Metrics { return a.add(b) }
 
 // CloneProcess is the exported form of (*Process).clone for testing.
 func CloneProcess(p *Process) *Process { return p.clone() }

@@ -786,7 +786,7 @@ func TestGenerateMiddlewareRetriesNext(t *testing.T) {
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
 	gt.Value(t, *count).Equal(2)
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(2))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(2))
 }
 
 func TestToolCallMiddlewareRewritesRequest(t *testing.T) {
@@ -846,7 +846,7 @@ func TestToolCallMiddlewareShortCircuit(t *testing.T) {
 
 	gt.Value(t, errors.Is(got, denied)).Equal(true)
 	gt.Value(t, toolCalls.get()).Equal(0)
-	gt.Value(t, p.Metrics[agentkit.MetricToolCalls]).Equal(int64(0))
+	gt.Value(t, p.Metrics.ToolCalls).Equal(int64(0))
 }
 
 // E9: rewriting to an unknown tool surfaces ErrToolNotFound.
@@ -899,12 +899,12 @@ func TestMiddlewareObservesLimitExceeded(t *testing.T) {
 	// then again inside CallTool. Let the boundary through so the transition
 	// actually starts, and refuse from the effect check onward.
 	limitCalls := &int32Box{}
-	limiter := func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) error {
+	limiter := func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
 		limitCalls.inc()
 		if limitCalls.get() == 1 {
-			return nil // the transition boundary.
+			return agentkit.LimitPass() // the transition boundary.
 		}
-		return gollemErr("over budget")
+		return agentkit.LimitStop("over budget")
 	}
 	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		_, _ = sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "t", Arguments: map[string]any{}})
@@ -923,6 +923,63 @@ func TestMiddlewareObservesLimitExceeded(t *testing.T) {
 	defer mu.Unlock()
 	gt.Value(t, errors.Is(observed, agentkit.ErrLimitExceeded)).Equal(true)
 	gt.Value(t, toolCalls.get()).Equal(0) // the tool never ran.
+}
+
+// EffectContext carries the verdict so a budget warning can reach the model
+// through one Kernel registration, without any strategy being changed.
+func TestGenerateMiddlewareReadsLimitFromEffectContext(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+
+	var prompt string
+	mw := func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+		return func(c context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+			if req.Effect.Limit.Kind() == agentkit.LimitKindNotice {
+				req.SystemPrompt = req.Effect.Limit.Message()
+			}
+			prompt = req.SystemPrompt
+			return next(c, req)
+		}
+	}
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	limiter := func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+		return agentkit.LimitNotice("wrap up")
+	}
+	k, repo, ag := setupScript(t, step, model,
+		agentkit.WithGenerateMiddleware(mw), agentkit.WithLimiter(limiter))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	gt.Value(t, prompt).Equal("wrap up")
+}
+
+func TestGenerateMiddlewareSeesZeroLimitWithoutLimiter(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+
+	var kind agentkit.LimitKind
+	mw := func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+		return func(c context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+			kind = req.Effect.Limit.Kind()
+			return next(c, req)
+		}
+	}
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithGenerateMiddleware(mw))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	gt.Value(t, kind).Equal(agentkit.LimitKindPass)
 }
 
 // --- SpawnChild -------------------------------------------------------------

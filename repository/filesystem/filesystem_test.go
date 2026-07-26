@@ -91,6 +91,71 @@ func TestLeftoverTempIgnored(t *testing.T) {
 	gt.Value(t, got.ID).Equal(pid)
 }
 
+// Metrics used to be a map[Metric]int64 and is now a struct with the same JSON
+// keys. A snapshot written by the map version has to keep loading, through both
+// paths that persist it: Process.Metrics and Await.Results[].Metrics.
+//
+// The fixture is hand-written rather than produced by an older binary, so it
+// asserts what that binary emitted: lowercase counter keys, a null for a
+// Process that had spent nothing, and — since the map type could hold one — a
+// key outside the six.
+func TestLoadsSnapshotWrittenWhenMetricsWasAMap(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	const legacy = `{
+	  "processes": {
+	    "parent-1": {
+	      "ID": "parent-1", "Agent": "fs-test", "Status": "waiting", "RootID": "parent-1",
+	      "Metrics": {"llm_calls": 4, "input_tokens": 120, "cost_micro_usd": 999},
+	      "Rev": 1, "CreatedAt": "2026-07-01T00:00:00Z", "UpdatedAt": "2026-07-01T00:00:00Z"
+	    },
+	    "fresh-1": {
+	      "ID": "fresh-1", "Agent": "fs-test", "Status": "pending", "RootID": "fresh-1",
+	      "Metrics": null,
+	      "Rev": 1, "CreatedAt": "2026-07-01T00:00:00Z", "UpdatedAt": "2026-07-01T00:00:00Z"
+	    }
+	  },
+	  "awaits": {
+	    "parent-1": {
+	      "kids": {
+	        "ProcessID": "parent-1", "Key": "kids", "Kind": "children", "Status": "responded",
+	        "Children": ["child-1"],
+	        "Results": [
+	          {"ProcessID": "child-1", "Status": "succeeded",
+	           "Metrics": {"llm_calls": 3, "output_tokens": 7}}
+	        ],
+	        "CreatedAt": "2026-07-01T00:00:00Z"
+	      }
+	    }
+	  },
+	  "events": {}
+	}`
+	gt.NoError(t, os.WriteFile(filepath.Join(dir, "state.json"), []byte(legacy), 0o600))
+
+	repo, err := filesystem.New(dir)
+	gt.NoError(t, err)
+	defer func() { gt.NoError(t, repo.Close()) }()
+
+	parent, err := repo.GetProcess(ctx, "parent-1")
+	gt.NoError(t, err)
+	gt.Value(t, parent.Metrics.LLMCalls).Equal(int64(4))
+	gt.Value(t, parent.Metrics.InputTokens).Equal(int64(120))
+	// A counter the struct does not have is dropped rather than rejected.
+	gt.Value(t, parent.Metrics.Steps).Equal(int64(0))
+
+	fresh, err := repo.GetProcess(ctx, "fresh-1")
+	gt.NoError(t, err)
+	gt.Value(t, fresh.Metrics).Equal(agentkit.Metrics{})
+
+	awaits, err := repo.ListAwaits(ctx, "parent-1")
+	gt.NoError(t, err)
+	gt.Array(t, awaits).Length(1)
+	gt.Array(t, awaits[0].Results).Length(1)
+	gt.Value(t, awaits[0].Results[0].Metrics.LLMCalls).Equal(int64(3))
+	gt.Value(t, awaits[0].Results[0].Metrics.OutputTokens).Equal(int64(7))
+}
+
 func TestLockRejectsSecondOpen(t *testing.T) {
 	dir := t.TempDir()
 	r1, err := filesystem.New(dir)

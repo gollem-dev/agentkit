@@ -138,9 +138,6 @@ func (p *Process) clone() *Process {
 		s := *p.Subject
 		cp.Subject = &s
 	}
-	if p.Metrics != nil {
-		cp.Metrics = maps.Clone(p.Metrics)
-	}
 	if p.ParentID != nil {
 		id := *p.ParentID
 		cp.ParentID = &id

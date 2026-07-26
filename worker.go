@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"sync"
 	"time"
@@ -218,7 +217,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 	b, err := k.agents.binding(proc.Agent)
 	if err != nil {
 		// Unknown agent: a permanent config mismatch (e.g. a binary generation skew).
-		_ = k.finalize(ctx, proc, failWith(FailureStrategyError, err), claimToken, nil)
+		_ = k.finalize(ctx, proc, failWith(FailureStrategyError, err), claimToken, Metrics{})
 		return claimStopped
 	}
 	// One History holder per claim: the committed baseline is loaded once (on
@@ -246,7 +245,7 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 			return claimStopped // lost the lease between transitions.
 		}
 		if fresh.CancelRequested {
-			_ = k.finalize(ctx, fresh, cancelledWith(fresh.CancelReason), claimToken, nil)
+			_ = k.finalize(ctx, fresh, cancelledWith(fresh.CancelReason), claimToken, Metrics{})
 			return claimStopped
 		}
 		proc = fresh
@@ -261,17 +260,24 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 			cause := goerr.New("unclean reclaim limit exceeded",
 				goerr.V("unclean_reclaims", proc.UncleanReclaims),
 				goerr.V("limit", cfg.maxUncleanReclaims))
-			_ = k.finalize(ctx, proc, failWith(FailureUncleanReclaim, cause), claimToken, nil)
+			_ = k.finalize(ctx, proc, failWith(FailureUncleanReclaim, cause), claimToken, Metrics{})
 			return claimStopped
 		}
+		// The verdict is kept, not just tested: a notice seeds Syscalls.LimitStatus()
+		// for this transition, which is how a strategy learns the budget is running
+		// out before anything refuses it.
+		var limit LimitDecision
 		if k.limiter != nil {
-			if lerr := k.limiter(ctx, proc, proc.Metrics); lerr != nil {
-				_ = k.finalize(ctx, proc, failWith(FailureLimitExceeded, lerr), claimToken, nil)
+			d := k.limiter(ctx, proc, proc.Metrics)
+			if d.Kind() == LimitKindStop {
+				_ = k.finalize(ctx, proc, failWithMessage(FailureLimitExceeded, d.Message()),
+					claimToken, Metrics{})
 				return claimStopped
 			}
+			limit = d
 		}
 
-		sys := newSyscalls(k, proc, toolList, hs)
+		sys := newSyscalls(k, proc, toolList, hs, limit)
 		rawState, dec, terr := k.runTransition(ctx, sys, b, proc)
 		if terr != nil {
 			// This transition did not commit; its buffered children are dropped.
@@ -517,7 +523,14 @@ func cancelledWith(reason string) terminalMutator {
 }
 
 func failWith(code FailureCode, err error) terminalMutator {
-	return func(p *Process) { p.Status = ProcessFailed; p.Failure = &Failure{Code: code, Message: err.Error()} }
+	return failWithMessage(code, err.Error())
+}
+
+// failWithMessage is the form for a reason that was never an error to begin
+// with — a Limiter's, which is a string by design (the error type would be
+// discarded here anyway).
+func failWithMessage(code FailureCode, msg string) terminalMutator {
+	return func(p *Process) { p.Status = ProcessFailed; p.Failure = &Failure{Code: code, Message: msg} }
 }
 
 // commitResult carries a built non-terminal commit plus how the worker should proceed.
@@ -538,8 +551,7 @@ func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte
 	p.StateSeq = seq
 	p.StepAttempts = 0
 	p.UncleanReclaims = 0
-	p.Metrics = addMetrics(p.Metrics, sys.runMetrics)
-	p.Metrics = addMetrics(p.Metrics, Metrics{MetricSteps: 1})
+	p.Metrics = p.Metrics.add(sys.runMetrics).add(Metrics{Steps: 1})
 	p.UpdatedAt = now
 
 	cs := ChangeSet{}
@@ -693,7 +705,7 @@ func childResultOf(cp *Process) ChildResult {
 		Status:    cp.Status,
 		Output:    cp.Output,
 		Failure:   cp.Failure,
-		Metrics:   maps.Clone(cp.Metrics),
+		Metrics:   cp.Metrics,
 	}
 }
 
@@ -719,8 +731,7 @@ func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []b
 		p.StateSeq = seq
 		p.StepAttempts = 0
 		p.UncleanReclaims = 0
-		p.Metrics = addMetrics(p.Metrics, sys.runMetrics)
-		p.Metrics = addMetrics(p.Metrics, Metrics{MetricSteps: 1})
+		p.Metrics = p.Metrics.add(sys.runMetrics).add(Metrics{Steps: 1})
 		if dec.kind == DecisionDone {
 			p.Status = ProcessSucceeded
 			p.Output = dec.output
@@ -737,9 +748,7 @@ func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []b
 func (k *Kernel) finalize(ctx context.Context, proc *Process, mut terminalMutator, fenceToken string, foldMetrics Metrics) error {
 	return k.commitFinal(ctx, proc, fenceToken, func(p *Process) {
 		mut(p)
-		if foldMetrics != nil {
-			p.Metrics = addMetrics(p.Metrics, foldMetrics)
-		}
+		p.Metrics = p.Metrics.add(foldMetrics)
 	}, nil, nil)
 }
 
@@ -902,7 +911,7 @@ func (k *Kernel) reportToParent(ctx context.Context, parentID ProcessID, child *
 	}
 	pClone := parent.clone()
 	// One Process, one terminal transition, one fold.
-	pClone.Metrics = addMetrics(pClone.Metrics, child.Metrics)
+	pClone.Metrics = pClone.Metrics.add(child.Metrics)
 	for _, aw := range awaits {
 		if aw.Kind != AwaitChildren || aw.Status != AwaitOpen || !containsID(aw.Children, child.ID) {
 			continue
@@ -965,7 +974,7 @@ func (k *Kernel) requeueTransition(ctx context.Context, cfg serveConfig, proc *P
 // attempt here would also make the next transition look like a replay through
 // Syscalls.Attempt(), which it is not: Step never ran.
 func (k *Kernel) requeueInfra(ctx context.Context, cfg serveConfig, proc *Process, fenceToken string, cause error) {
-	k.requeue(ctx, cfg, proc, fenceToken, cause, nil, false)
+	k.requeue(ctx, cfg, proc, fenceToken, cause, Metrics{}, false)
 }
 
 // requeue puts the Process back to pending with a backoff, folding this run's
@@ -997,9 +1006,7 @@ func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, fe
 		p.WakeAt = &wake
 		p.LeaseUntil = nil
 		p.UpdatedAt = now
-		if foldMetrics != nil {
-			p.Metrics = addMetrics(p.Metrics, foldMetrics)
-		}
+		p.Metrics = p.Metrics.add(foldMetrics)
 		err := k.repo.Apply(ctx, ChangeSet{Processes: []*Process{p}})
 		if errors.Is(err, ErrConflict) {
 			fresh, gerr := k.repo.GetProcess(ctx, proc.ID)

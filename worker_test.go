@@ -3,6 +3,7 @@ package agentkit_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -172,9 +173,9 @@ func TestUC1_GenerateThenDone(t *testing.T) {
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 	gt.Value(t, string(p.Output)).Equal("the answer")
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
-	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(5))
-	gt.Value(t, p.Metrics[agentkit.MetricSteps]).Equal(int64(1))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
+	gt.Value(t, p.Metrics.InputTokens).Equal(int64(5))
+	gt.Value(t, p.Metrics.Steps).Equal(int64(1))
 	gt.Value(t, *count).Equal(1)
 	events, _ := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
 	gt.Bool(t, hasEvent(events, agentkit.EventProcessCreated)).True()
@@ -195,7 +196,7 @@ func TestE6_RetryExhausted(t *testing.T) {
 	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
 	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
 	// The consumed generate metric was folded onto the terminal Process (#5).
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
 }
 
 func TestE7_LimiterMetricsFoldNoBypass(t *testing.T) {
@@ -208,21 +209,248 @@ func TestE7_LimiterMetricsFoldNoBypass(t *testing.T) {
 		}
 		return st, agentkit.Continue[[]byte](), nil
 	}
-	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) error {
-		if m[agentkit.MetricLLMCalls] >= 1 {
-			return gollemErr("llm cap reached")
+	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+		if m.LLMCalls >= 1 {
+			return agentkit.LimitStop("llm cap reached")
 		}
-		return nil
+		return agentkit.LimitPass()
 	}
 	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
 	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureLimitExceeded)
+	// The reason reaches the row verbatim: the Limiter hands over a string and
+	// the kernel is the only thing that ever makes it an error.
+	gt.Value(t, p.Failure.Message).Equal("llm cap reached")
 	// #5: the one Generate's metric was folded (committed), so the limiter sees
 	// llm_calls==1 at the next boundary and stops. No bypass, no re-call.
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
 	gt.Value(t, *count).Equal(1)
+}
+
+// A notice reaches the strategy and does not end the Process. This is the whole
+// point of the third verdict: a budget can warn without refusing.
+func TestLimitNoticeReachesStrategyWithoutStopping(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	var seen []string
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		d := sys.LimitStatus()
+		seen = append(seen, string(d.Kind())+":"+d.Message())
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	limiter := func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+		return agentkit.LimitNotice("careful")
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Array(t, seen).Length(1)
+	gt.Value(t, seen[0]).Equal("notice:careful")
+}
+
+// Without a Limiter the verdict is the zero value, which has to read as a pass
+// rather than as an empty kind.
+func TestLimitStatusWithoutLimiterIsPass(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	var kind agentkit.LimitKind
+	var msg string
+	step := func(_ context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		kind, msg = sys.LimitStatus().Kind(), sys.LimitStatus().Message()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	k, repo, ag := setupScript(t, step, model)
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	gt.Value(t, kind).Equal(agentkit.LimitKindPass)
+	gt.Value(t, msg).Equal("")
+}
+
+// The verdict has to advance with Metrics(), not lag a call behind it: a
+// Limiter that only warns once the tokens are spent is useless if the strategy
+// cannot see the warning until its next effect.
+func TestLimitStatusRefreshesRightAfterGenerate(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	var before, after agentkit.LimitDecision
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		before = sys.LimitStatus()
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		after = sys.LimitStatus()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+		if m.LLMCalls >= 1 {
+			return agentkit.LimitNotice("nearly out")
+		}
+		return agentkit.LimitPass()
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, before.Kind()).Equal(agentkit.LimitKindPass)
+	gt.Value(t, after.Kind()).Equal(agentkit.LimitKindNotice)
+	gt.Value(t, after.Message()).Equal("nearly out")
+}
+
+// An effect that crosses the cap is not undone, but the strategy has to be able
+// to see that it crossed it — that is the difference between finishing with the
+// result in hand and discovering the refusal one effect later.
+func TestLimitStopAfterEffectDoesNotFailTheEffect(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	var genErr error
+	var after agentkit.LimitDecision
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		_, genErr = sys.Generate(c, []gollem.Input{gollem.Text("go")})
+		after = sys.LimitStatus()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	// Passes before the call (llm_calls == 0), refuses after it (llm_calls == 1).
+	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+		if m.LLMCalls >= 1 {
+			return agentkit.LimitStop("cap crossed")
+		}
+		return agentkit.LimitPass()
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	// The Generate itself stands: it had already run when the Limiter refused.
+	gt.NoError(t, genErr)
+	// But the refusal is visible, so the strategy can act on it.
+	gt.Value(t, after.Kind()).Equal(agentkit.LimitKindStop)
+	gt.Value(t, after.Message()).Equal("cap crossed")
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+}
+
+// The point of making a post-effect refusal visible: a strategy can wrap up with
+// the result it already paid for, instead of spending another effect to find out.
+func TestStrategyCanWrapUpOnCrossingTheCap(t *testing.T) {
+	ctx := context.Background()
+	model, count := mockLLM(textResponse("first"), textResponse("second"))
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if sys.LimitStatus().Kind() == agentkit.LimitKindStop {
+			return st, agentkit.Done([]byte("wrapped up")), nil
+		}
+		return st, agentkit.Continue[[]byte](), nil
+	}
+	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+		if m.LLMCalls >= 1 {
+			return agentkit.LimitStop("cap crossed")
+		}
+		return agentkit.LimitPass()
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	// Succeeded rather than failed(limit_exceeded): the strategy got to decide.
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.String(t, string(p.Output)).Contains("wrapped up")
+	gt.Value(t, *count).Equal(1) // no second Generate was spent finding out.
+}
+
+// A strategy is allowed to catch ErrLimitExceeded and carry on, so the refusal
+// it caught has to remain readable without parsing the error's text.
+func TestLimitStopBeforeEffectIsReadableAfterCatching(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	var genErr error
+	var after agentkit.LimitDecision
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		_, genErr = sys.Generate(c, []gollem.Input{gollem.Text("go")})
+		after = sys.LimitStatus()
+		return st, agentkit.Done([]byte("ok")), nil // swallow it, as a strategy may.
+	}
+	calls := &int32Box{}
+	limiter := func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+		calls.inc()
+		if calls.get() == 1 {
+			return agentkit.LimitNotice("warned") // the transition boundary.
+		}
+		return agentkit.LimitStop("over")
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	gt.Value(t, errors.Is(genErr, agentkit.ErrLimitExceeded)).Equal(true)
+	gt.Value(t, after.Kind()).Equal(agentkit.LimitKindStop)
+	gt.Value(t, after.Message()).Equal("over")
+}
+
+// A Limiter that stops warning has to be able to say so.
+func TestLimitNoticeClears(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	var after agentkit.LimitDecision
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		after = sys.LimitStatus()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	calls := &int32Box{}
+	limiter := func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+		calls.inc()
+		if calls.get() == 1 {
+			return agentkit.LimitNotice("x")
+		}
+		return agentkit.LimitPass()
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	gt.Value(t, after.Kind()).Equal(agentkit.LimitKindPass)
+	gt.Value(t, after.Message()).Equal("")
+}
+
+// meter runs only where addMetrics used to, so a failed Generate charges
+// nothing and refreshes nothing.
+func TestFailedGenerateUpdatesNeitherMetricsNorLimitStatus(t *testing.T) {
+	ctx := context.Background()
+	model := &mock.LLMClientMock{
+		NewSessionFunc: func(_ context.Context, _ ...gollem.SessionOption) (gollem.Session, error) {
+			return nil, gollemErr("model down")
+		},
+	}
+	var after agentkit.LimitDecision
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		_, _ = sys.Generate(c, []gollem.Input{gollem.Text("go")})
+		after = sys.LimitStatus()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+		if m.LLMCalls >= 1 {
+			return agentkit.LimitNotice("spent")
+		}
+		return agentkit.LimitPass()
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithLimiter(limiter))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	gt.Value(t, after.Kind()).Equal(agentkit.LimitKindPass)
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(0))
 }
 
 func TestE8_SuspendWithoutAwait(t *testing.T) {
@@ -699,11 +927,11 @@ func TestFinishHandlerOnLimitExceeded(t *testing.T) {
 		}
 		return st, agentkit.Continue[finishOut](), nil
 	}
-	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) error {
-		if m[agentkit.MetricLLMCalls] >= 1 {
-			return gollemErr("llm cap reached")
+	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+		if m.LLMCalls >= 1 {
+			return agentkit.LimitStop("llm cap reached")
 		}
-		return nil
+		return agentkit.LimitPass()
 	}
 	k, repo, ag := setupFinish(t, step, rec.handler, agentkit.WithLimiter(limiter))
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
@@ -1478,12 +1706,12 @@ func TestChildMetricsFoldIntoParent(t *testing.T) {
 	})
 
 	// Three children, one Generate each (mockLLM reports 5 in / 7 out per call).
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(3))
-	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(15))
-	gt.Value(t, p.Metrics[agentkit.MetricOutputTokens]).Equal(int64(21))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(3))
+	gt.Value(t, p.Metrics.InputTokens).Equal(int64(15))
+	gt.Value(t, p.Metrics.OutputTokens).Equal(int64(21))
 	// The parent's own counters are still its own: it spawned 3 and never
 	// generated, so the LLM calls above came entirely from the fold.
-	gt.Value(t, p.Metrics[agentkit.MetricSpawns]).Equal(int64(3))
+	gt.Value(t, p.Metrics.Spawns).Equal(int64(3))
 }
 
 // Siblings finalize concurrently, but only the last one closes the await, so the
@@ -1499,8 +1727,8 @@ func TestChildMetricsFoldOnlyOnce(t *testing.T) {
 		return p.Status == agentkit.ProcessSucceeded
 	}, agentkit.WithPollConcurrency(4))
 
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(3))
-	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(15))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(3))
+	gt.Value(t, p.Metrics.InputTokens).Equal(int64(15))
 }
 
 // A transition that does not commit leaves nothing behind, so the fold on the
@@ -1530,8 +1758,8 @@ func TestChildMetricsFoldSurvivesFailedCommit(t *testing.T) {
 	})
 
 	gt.Value(t, rejected).Equal(true)
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(2))
-	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(10))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(2))
+	gt.Value(t, p.Metrics.InputTokens).Equal(int64(10))
 }
 
 // A children await with nothing in it resolves immediately and adds nothing.
@@ -1557,7 +1785,7 @@ func TestChildMetricsFoldWithNoChildren(t *testing.T) {
 	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
 		return p.Status == agentkit.ProcessSucceeded
 	})
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(0))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(0))
 }
 
 // When every waited child is already terminal at declaration time the await is
@@ -1623,9 +1851,9 @@ func TestChildMetricsFoldOnDeclarationTimeElision(t *testing.T) {
 	gt.NoError(t, err)
 	gt.Value(t, kid.Status).Equal(agentkit.ProcessSucceeded)
 
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
-	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(5))
-	gt.Value(t, p.Metrics[agentkit.MetricOutputTokens]).Equal(int64(7))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
+	gt.Value(t, p.Metrics.InputTokens).Equal(int64(5))
+	gt.Value(t, p.Metrics.OutputTokens).Equal(int64(7))
 }
 
 // Folding is keyed to the child's own terminal transition, so naming the same
@@ -1684,9 +1912,9 @@ func TestChildMetricsFoldOncePerChildAcrossAwaitKeys(t *testing.T) {
 	})
 
 	// One child, one Generate. Two awaits naming it must not make it two.
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
-	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(5))
-	gt.Value(t, p.Metrics[agentkit.MetricOutputTokens]).Equal(int64(7))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
+	gt.Value(t, p.Metrics.InputTokens).Equal(int64(5))
+	gt.Value(t, p.Metrics.OutputTokens).Equal(int64(7))
 }
 
 // Same reasoning for a duplicate inside one spec.
@@ -1727,7 +1955,7 @@ func TestChildMetricsFoldOnceWithDuplicateIDInOneAwait(t *testing.T) {
 	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
 		return p.Status == agentkit.ProcessSucceeded
 	})
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
 }
 
 // ADR-0009 permits spawning a child and never waiting on it. Its usage still has
@@ -1771,7 +1999,7 @@ func TestChildMetricsFoldForAnUnwaitedChild(t *testing.T) {
 	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
 		return p.Status == agentkit.ProcessSucceeded
 	})
-	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
 }
 
 // The Limiter is the reason the fold exists, so assert it actually observes the
@@ -1810,15 +2038,15 @@ func TestLimiterObservesFoldedChildMetrics(t *testing.T) {
 
 	var mu sync.Mutex
 	maxSeenOnParent := int64(-1)
-	limiter := func(_ context.Context, proc *agentkit.Process, m agentkit.Metrics) error {
+	limiter := func(_ context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
 		if proc.Agent == "parent" {
 			mu.Lock()
-			if v := m[agentkit.MetricLLMCalls]; v > maxSeenOnParent {
+			if v := m.LLMCalls; v > maxSeenOnParent {
 				maxSeenOnParent = v
 			}
 			mu.Unlock()
 		}
-		return nil
+		return agentkit.LimitPass()
 	}
 
 	model, _ := mockLLM(textResponse("x"), textResponse("x"), textResponse("x"))

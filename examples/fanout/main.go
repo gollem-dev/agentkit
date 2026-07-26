@@ -117,18 +117,22 @@ func newFanout(ctx context.Context, w io.Writer, maxLLMCalls int) (*agentkit.Ker
 	// The consequence to design around: a parent can pass this check, spawn
 	// children that spend the rest of the budget, and then trip on its very next
 	// transition. That is the limiter working -- the tree really did spend it --
-	// but it means a parent's recorded MetricLLMCalls can end up above the cap.
+	// but it means a parent's recorded LLMCalls can end up above the cap.
 	//
 	// The comparison is >= because the limiter runs *before* the call it is
 	// deciding about: at maxLLMCalls calls already spent, the next one is the
 	// one over the line.
-	budget := func(_ context.Context, proc *agentkit.Process, m agentkit.Metrics) error {
-		if m[agentkit.MetricLLMCalls] >= int64(maxLLMCalls) {
-			return goerr.New("llm call budget exhausted",
-				goerr.V("process", proc.ID), goerr.V("calls", m[agentkit.MetricLLMCalls]),
-				goerr.V("budget", maxLLMCalls))
+	//
+	// LimitStop takes the reason as a string rather than an error: the kernel is
+	// what turns it into ErrLimitExceeded or a Failure message, so a limiter
+	// never has to decide which error type to raise.
+	budget := func(_ context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+		if m.LLMCalls >= int64(maxLLMCalls) {
+			return agentkit.LimitStop(fmt.Sprintf(
+				"llm call budget exhausted: process %s spent %d of %d",
+				proc.ID, m.LLMCalls, maxLLMCalls))
 		}
-		return nil
+		return agentkit.LimitPass()
 	}
 
 	k, err := agentkit.New(memory.New(), taskModel, reg,

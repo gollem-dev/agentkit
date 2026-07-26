@@ -120,8 +120,8 @@ func TestSimpleE2E(t *testing.T) {
 	tmu.Unlock()
 	gt.Number(t, *llmCount).GreaterOrEqual(2)
 
-	gt.Number(t, p.Metrics[agentkit.MetricLLMCalls]).GreaterOrEqual(int64(2))
-	gt.Number(t, p.Metrics[agentkit.MetricToolCalls]).GreaterOrEqual(int64(1))
+	gt.Number(t, p.Metrics.LLMCalls).GreaterOrEqual(int64(2))
+	gt.Number(t, p.Metrics.ToolCalls).GreaterOrEqual(int64(1))
 }
 
 // TestSimpleEmptyPromptInitError verifies Init's empty-prompt rejection surfaces

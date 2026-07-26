@@ -128,7 +128,7 @@ func TestBudgetIsNeverExceeded(t *testing.T) {
 		// child has no children of its own, so its count is its own spend and the
 		// limiter ran before each of those calls.
 		for _, child := range childrenOf(t, k, proc) {
-			gt.Number(t, child.Metrics[agentkit.MetricLLMCalls]).LessOrEqual(int64(budget))
+			gt.Number(t, child.Metrics.LLMCalls).LessOrEqual(int64(budget))
 		}
 
 		if proc.Status != agentkit.ProcessSucceeded {
@@ -143,7 +143,7 @@ func TestBudgetIsNeverExceeded(t *testing.T) {
 			continue
 		}
 		// A parent that still succeeded stayed within the cap for the whole tree.
-		gt.Number(t, proc.Metrics[agentkit.MetricLLMCalls]).LessOrEqual(int64(budget))
+		gt.Number(t, proc.Metrics.LLMCalls).LessOrEqual(int64(budget))
 	}
 }
 
@@ -159,20 +159,20 @@ func TestParentMetricsCountEachChildExactlyOnce(t *testing.T) {
 
 	var childCalls, childIn, childOut int64
 	for _, child := range children {
-		childCalls += child.Metrics[agentkit.MetricLLMCalls]
-		childIn += child.Metrics[agentkit.MetricInputTokens]
-		childOut += child.Metrics[agentkit.MetricOutputTokens]
+		childCalls += child.Metrics.LLMCalls
+		childIn += child.Metrics.InputTokens
+		childOut += child.Metrics.OutputTokens
 	}
 	gt.Number(t, childCalls).Greater(int64(0))
 
 	// The planner's own calls are what remains once the children are subtracted,
 	// and it made at least one (it produced a plan).
-	ownCalls := proc.Metrics[agentkit.MetricLLMCalls] - childCalls
+	ownCalls := proc.Metrics.LLMCalls - childCalls
 	gt.Number(t, ownCalls).Greater(int64(0))
 	// Tokens have to subtract cleanly by the same accounting, which they cannot
 	// do if any child were folded in twice.
-	gt.Number(t, proc.Metrics[agentkit.MetricInputTokens]-childIn).Greater(int64(0))
-	gt.Number(t, proc.Metrics[agentkit.MetricOutputTokens]-childOut).Greater(int64(0))
+	gt.Number(t, proc.Metrics.InputTokens-childIn).Greater(int64(0))
+	gt.Number(t, proc.Metrics.OutputTokens-childOut).Greater(int64(0))
 }
 
 // childrenOf reads the task children off the parent's children await, which

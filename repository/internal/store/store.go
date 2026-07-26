@@ -370,9 +370,6 @@ func cloneProcess(p *agentkit.Process) *agentkit.Process {
 		sub := *p.Subject
 		cp.Subject = &sub
 	}
-	if p.Metrics != nil {
-		cp.Metrics = maps.Clone(p.Metrics)
-	}
 	if p.ParentID != nil {
 		id := *p.ParentID
 		cp.ParentID = &id
@@ -429,9 +426,7 @@ func cloneChildResults(rs []agentkit.ChildResult) []agentkit.ChildResult {
 			f := *r.Failure
 			out[i].Failure = &f
 		}
-		if r.Metrics != nil {
-			out[i].Metrics = maps.Clone(r.Metrics)
-		}
+		// Metrics needs no copy: it is a struct of scalars, copied by out[i] = r.
 	}
 	return out
 }

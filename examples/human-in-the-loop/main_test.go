@@ -79,7 +79,7 @@ func TestRefusalCostsNothing(t *testing.T) {
 
 	proc, err := demo.WaitProcess(ctx, k, pid, demo.Terminal, time.Minute)
 	gt.NoError(t, err)
-	gt.Number(t, proc.Metrics[agentkit.MetricLLMCalls]).Equal(0)
+	gt.Number(t, proc.Metrics.LLMCalls).Equal(0)
 }
 
 func TestRunEmitsTheApprovalRequest(t *testing.T) {
@@ -131,7 +131,7 @@ func TestExpiredQuestionIsARefusal(t *testing.T) {
 	gt.String(t, res.Note).Contains("deadline")
 
 	// No LLM call: an unanswered question never reaches the acting branch.
-	gt.Number(t, proc.Metrics[agentkit.MetricLLMCalls]).Equal(0)
+	gt.Number(t, proc.Metrics.LLMCalls).Equal(0)
 }
 
 func TestInitRejectsAnEmptyRequest(t *testing.T) {

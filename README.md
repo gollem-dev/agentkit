@@ -25,7 +25,8 @@ lease, and a wait queue — nothing more.
 - **Child processes** — a strategy spawns children and waits for their results;
   the children and the parent's new state commit in one atomic write.
 - **Usage metering and limits** — token and tool usage accumulates on the
-  `Process`, and a `Limiter` decides when a run has had enough.
+  `Process`, and a `Limiter` decides when a run has had enough — or tells the
+  agent the budget is nearly gone and lets it finish on its own terms.
 - **Idempotent spawning** — an idempotency key or a `subject` prevents a retried
   request from starting a second run.
 - **Middleware** — a `next`-chain around `Init`, `Step`, `Generate`, `CallTool`

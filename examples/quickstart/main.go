@@ -97,6 +97,9 @@ func run(ctx context.Context, w io.Writer, prompt string) error {
 	for _, text := range out.Texts {
 		fmt.Fprintf(w, "answer:  %s\n", text)
 	}
-	fmt.Fprintf(w, "metrics: %v\n", proc.Metrics)
+	// Named rather than %v: Metrics is a struct of six counters, and printing it
+	// bare gives six unlabelled numbers.
+	fmt.Fprintf(w, "metrics: llm_calls=%d input_tokens=%d output_tokens=%d\n",
+		proc.Metrics.LLMCalls, proc.Metrics.InputTokens, proc.Metrics.OutputTokens)
 	return nil
 }

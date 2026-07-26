@@ -12,9 +12,18 @@ Four separate mechanisms, easy to confuse. They differ in one property —
 
 ## Metrics
 
-The kernel maintains six counters per process:
+The kernel maintains six counters per process, as the fields of `Metrics`:
+`InputTokens`, `OutputTokens`, `LLMCalls`, `ToolCalls`, `Steps`, `Spawns`.
 
-`input_tokens`, `output_tokens`, `llm_calls`, `tool_calls`, `steps`, `spawns`.
+The set is closed — there is no way to add a seventh — which is why `Metrics` is
+a struct rather than a map. Its JSON field names are the lowercase forms
+(`input_tokens` and so on), the same keys the map used, so a `Repository` that
+stores a process as JSON reads back what it wrote before the type changed
+without a migration.
+
+The bytes are not identical, though: metrics that are all zero used to be `null`
+and are now `{}`. A key outside the six is dropped when read and does not survive
+the next write — the kernel never wrote one, but the map type could hold one.
 
 Read the committed totals from `proc.Metrics`, or the live value inside a
 strategy with `sys.Metrics()` — which returns committed totals plus what the
@@ -34,27 +43,37 @@ running is not in it yet.
 
 ## Limiter
 
-The kernel measures; you decide. One closure:
+The kernel measures; you decide. One closure, returning one of three verdicts:
 
 ```go
-agentkit.WithLimiter(func(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) error {
-    if m[agentkit.MetricLLMCalls] > 50 {
-        return goerr.New("llm call budget exhausted")
+agentkit.WithLimiter(func(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+    switch {
+    case m.LLMCalls >= 50:
+        return agentkit.LimitStop("llm call budget exhausted")
+    case m.LLMCalls >= 40:
+        return agentkit.LimitNotice(fmt.Sprintf(
+            "Budget is nearly exhausted: %d of 50 LLM calls used. "+
+                "Finish with what you have rather than starting new work.", m.LLMCalls))
+    default:
+        return agentkit.LimitPass()
     }
-    if m[agentkit.MetricInputTokens]+m[agentkit.MetricOutputTokens] > 1_000_000 {
-        return goerr.New("token budget exhausted")
-    }
-    return nil
 })
 ```
 
-It runs **before every `Generate`, `CallTool` and `SpawnChild`, and again at
-every transition boundary.** Nil means continue; non-nil means stop:
+`LimitStop` refuses. Where the refusal surfaces depends on where the check ran:
 
 - before an effect, it reaches the strategy as `ErrLimitExceeded`, so a strategy
   may catch it, checkpoint what it has, and suspend;
 - at a transition boundary, it finalizes the process as `failed` with
-  `FailureLimitExceeded`.
+  `FailureLimitExceeded`, carrying the reason as the failure message.
+
+The reason is a string, not an error. The kernel is the only thing that turns it
+into either form, so every refusal a strategy sees is an `ErrLimitExceeded` and
+`errors.Is` is enough to recognise one.
+
+`LimitNotice` does not refuse. It hands a message to the strategy and lets
+execution continue — see [Telling the agent the budget is running
+out](#telling-the-agent-the-budget-is-running-out).
 
 No `Limiter` means unlimited.
 
@@ -85,16 +104,77 @@ across a tree from `proc.RootID`, rate limits from your own limiter (a tree
 budget needs none of that, since the counters already roll up):
 
 ```go
-agentkit.WithLimiter(func(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) error {
-    budget := budgetFor(proc.Agent)
-    if m[agentkit.MetricLLMCalls] > budget {
-        return goerr.New("agent budget exhausted", goerr.V("agent", proc.Agent))
+agentkit.WithLimiter(func(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+    if m.LLMCalls > budgetFor(proc.Agent) {
+        return agentkit.LimitStop("agent budget exhausted: " + string(proc.Agent))
     }
-    return myRateLimiter.Check(ctx, string(proc.RootID))
+    // Ask, do not take: this runs more than once per effect, so drawing a token
+    // here would charge several times for one call — and once for a call that
+    // has already happened. Leave the drawing to whatever owns the bucket.
+    if !myRateLimiter.HasHeadroom(string(proc.RootID)) {
+        return agentkit.LimitStop("rate limited")
+    }
+    return agentkit.LimitPass()
 })
 ```
 
-Keep it cheap and non-blocking — it is on the hot path.
+Two rules follow from how often it runs — roughly `1 + 2×effects` times per
+attempt:
+
+- **Read-only.** A call is an enquiry, not an acquisition. The same effect is
+  asked about more than once, and once after the work is done, so a `Limiter`
+  that consumes a token or charges a quota over-charges and then refuses work
+  nobody performed.
+- **Cheap and non-blocking.** It is on the hot path and the claim holds its lease
+  throughout. Waiting turns a throttle into a lease expiry.
+
+## Telling the agent the budget is running out
+
+Stopping is not the only useful answer. A `LimitNotice` lets a budget say "you
+are nearly out" while execution continues, and the agent decides what to do with
+that — wrap up, drop the expensive tools, put it in the next prompt.
+
+agentkit never acts on the message itself. Nothing reads it unless you ask for
+it, so a notice nobody looks at costs nothing beyond the `Limiter` call.
+
+**From a strategy**, through `Syscalls.LimitStatus()`:
+
+```go
+func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[Output], error) {
+    if d := sys.LimitStatus(); d.Kind() == agentkit.LimitKindNotice {
+        // Answer with what we have rather than starting another tool round.
+        if len(st.Pending) == 0 && st.History != nil {
+            return st, agentkit.Done(Output{Texts: st.LastTexts}), nil
+        }
+    }
+    // ...
+}
+```
+
+The verdict tracks `sys.Metrics()`: the `Limiter` runs again after each effect is
+counted, so reading it straight after a `Generate` reflects the tokens that
+`Generate` just spent. Do not fold it into checkpointed state — like `Now()`, it
+depends on how far the attempt got and does not reproduce on a replay.
+
+**From middleware**, through `EffectContext.Limit`, which applies to every agent
+from a single registration and needs no strategy change:
+
+```go
+agentkit.WithGenerateMiddleware(func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+    return func(ctx context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+        if d := req.Effect.Limit; d.Kind() == agentkit.LimitKindNotice {
+            req.SystemPrompt = strings.TrimSpace(req.SystemPrompt + "\n\n" + d.Message())
+        }
+        return next(ctx, req)
+    }
+})
+```
+
+A middleware wraps its own syscall's `Limiter` check, so `Effect.Limit` is the
+verdict from *before* this call, and it does not change while the handler runs —
+calling `next` and reading it again returns the same value. That is the right
+reading for prompt injection anyway: "the budget looked like this going into this
+call".
 
 ## Events
 

@@ -359,7 +359,7 @@ func (k *Kernel) Cancel(ctx context.Context, pid ProcessID, reason string) error
 		// so it uses externalFence: a conflict is propagated, and the loop re-reads
 		// and re-decides (the Process may have just been claimed and be running, in
 		// which case the next iteration sets CancelRequested) (#1).
-		if err := k.finalize(ctx, proc, cancelledWith(reason), externalFence, nil); err != nil {
+		if err := k.finalize(ctx, proc, cancelledWith(reason), externalFence, Metrics{}); err != nil {
 			if errors.Is(err, ErrConflict) {
 				continue
 			}

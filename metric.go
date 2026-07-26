@@ -1,46 +1,42 @@
 package agentkit
 
-import "context"
-
-// Metric is a measurement key. The Kernel measures usage; a Limiter decides
-// whether to continue.
-type Metric string
-
-const (
-	MetricInputTokens  Metric = "input_tokens"
-	MetricOutputTokens Metric = "output_tokens"
-	MetricLLMCalls     Metric = "llm_calls"
-	MetricToolCalls    Metric = "tool_calls"
-	MetricSteps        Metric = "steps"
-	MetricSpawns       Metric = "spawns"
-)
-
-// Metrics is a set of measurements.
-type Metrics map[Metric]int64
-
-// add returns the element-wise sum of a and b without mutating either. A nil
-// map is treated as empty.
-func addMetrics(a, b Metrics) Metrics {
-	if len(a) == 0 && len(b) == 0 {
-		return nil
-	}
-	out := make(Metrics, len(a)+len(b))
-	for k, v := range a {
-		out[k] += v
-	}
-	for k, v := range b {
-		out[k] += v
-	}
-	return out
+// Metrics is the fixed set of counters the Kernel maintains. The set is closed
+// (ADR-0010): a caller cannot add one, which is why this is a struct rather
+// than a map — a map would advertise a key space that does not exist.
+//
+// Every field is cumulative and never decreases. The zero value means "nothing
+// consumed" and is a valid Metrics.
+//
+// Process.Metrics counts a Process's own effects plus every child that has
+// terminated, once each, so a Limiter high in a tree sees what the subtree
+// spent rather than only the row it was called for.
+//
+// The json tags match the keys the previous map form produced, so a snapshot
+// written before this became a struct still reads back: known counters keep
+// their values, and a null (a nil map) becomes the zero value. No migration is
+// needed for that.
+//
+// The wire form is not byte-identical, though. Zero metrics used to marshal as
+// null and now marshal as {}, and a key outside this set — which the old map
+// type could hold, even though the kernel never wrote one — is dropped on read
+// and gone on the next write.
+type Metrics struct {
+	InputTokens  int64 `json:"input_tokens,omitempty"`
+	OutputTokens int64 `json:"output_tokens,omitempty"`
+	LLMCalls     int64 `json:"llm_calls,omitempty"`
+	ToolCalls    int64 `json:"tool_calls,omitempty"`
+	Steps        int64 `json:"steps,omitempty"`
+	Spawns       int64 `json:"spawns,omitempty"`
 }
 
-// Limiter decides whether a Process may continue. Measurement (Metrics) is the
-// Kernel's job; the decision logic is the caller's closure. It is invoked just
-// before each LLM/tool call and at transition boundaries. A nil return means
-// continue; a non-nil return means stop — before-call it surfaces as
-// ErrLimitExceeded to the strategy, at a transition boundary it finalizes the
-// Process as failed(limit_exceeded) with the returned error's message.
-//
-// metrics is a snapshot of "committed cumulative (proc.Metrics) + what this run
-// has accumulated so far". A nil Limiter means unlimited.
-type Limiter func(ctx context.Context, proc *Process, metrics Metrics) error
+// add returns the element-wise sum without mutating either operand.
+func (m Metrics) add(o Metrics) Metrics {
+	return Metrics{
+		InputTokens:  m.InputTokens + o.InputTokens,
+		OutputTokens: m.OutputTokens + o.OutputTokens,
+		LLMCalls:     m.LLMCalls + o.LLMCalls,
+		ToolCalls:    m.ToolCalls + o.ToolCalls,
+		Steps:        m.Steps + o.Steps,
+		Spawns:       m.Spawns + o.Spawns,
+	}
+}

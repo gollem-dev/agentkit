@@ -310,7 +310,8 @@ func runStatus(ctx context.Context, w io.Writer, dir string, pid agentkit.Proces
 	// error tells you how far the last attempt got, a vanished claim tells you
 	// nothing at all.
 	fmt.Fprintf(w, "unclean rec.:  %d\n", proc.UncleanReclaims)
-	fmt.Fprintf(w, "metrics:       %v\n", proc.Metrics)
+	fmt.Fprintf(w, "metrics:       llm_calls=%d tool_calls=%d steps=%d\n",
+		proc.Metrics.LLMCalls, proc.Metrics.ToolCalls, proc.Metrics.Steps)
 	if proc.Failure != nil {
 		fmt.Fprintf(w, "failure:       %s %s\n", proc.Failure.Code, proc.Failure.Message)
 	}
