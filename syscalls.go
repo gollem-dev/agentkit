@@ -75,6 +75,24 @@ type Syscalls interface {
 	// --- observation ---
 	Emit(ctx context.Context, typ EventType, payload []byte) error // flushed on commit. Encoding is the caller's.
 	Metrics() Metrics                                              // proc.Metrics (committed) + this run's accumulation.
+	// LimitStatus reports the Limiter's most recent verdict, or the zero
+	// LimitDecision (which reads as LimitKindPass) when there is no Limiter.
+	// Switch on Kind() and read Message().
+	//
+	// It moves in lockstep with Metrics(): the Limiter runs again before and
+	// after every Generate, CallTool and SpawnChild, so reading this right after
+	// a Generate reflects the tokens that Generate just spent — including a
+	// refusal the Generate itself provoked by crossing the cap.
+	//
+	// A LimitKindStop here means the Limiter is refusing, NOT that this Process
+	// has stopped. An effect that already ran is not undone, and a strategy is
+	// free to finish with what it has; enforcement happens at the next effect's
+	// check or the next transition boundary.
+	//
+	// Do NOT fold it into checkpointed state. Like Now() and Metrics(), it
+	// depends on how far this attempt got and does not reproduce across a replay
+	// (ADR-0003).
+	LimitStatus() LimitDecision
 }
 
 // GenerateResult is the journalable/checkpointable result of a Generate. It is
@@ -260,13 +278,19 @@ type syscalls struct {
 	// this run's share is folded on any successful Apply, D44).
 	runMetrics Metrics
 
+	// limit is the Limiter's latest verdict: seeded with the transition
+	// boundary's, then rewritten by every checkLimit and every meter. It moves in
+	// lockstep with runMetrics so LimitStatus() and Metrics() never describe
+	// different moments.
+	limit LimitDecision
+
 	// transition buffers (folded into the commit ChangeSet).
 	pendingChildren  []*Process    // SpawnChild children (atomic insert on commit, D48).
 	pendingEvents    []*Event      // Emit / await.created.
 	pendingSpawnDone []func(error) // SpawnRequest.OnCommit callbacks (called by the worker after commit, #8).
 }
 
-func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool, hist *historyState) *syscalls {
+func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool, hist *historyState, limit LimitDecision) *syscalls {
 	byName := make(map[string]gollem.Tool, len(tools))
 	for _, t := range tools {
 		byName[t.Spec().Name] = t
@@ -277,7 +301,8 @@ func newSyscalls(k *Kernel, proc *Process, tools []gollem.Tool, hist *historySta
 			awaits[aw.Key] = aw
 		}
 	}
-	return &syscalls{k: k, proc: proc, seq: proc.StateSeq + 1, tools: tools, toolByName: byName, awaits: awaits, hist: hist}
+	return &syscalls{k: k, proc: proc, seq: proc.StateSeq + 1, tools: tools, toolByName: byName,
+		awaits: awaits, hist: hist, limit: limit}
 }
 
 func (s *syscalls) ProcessID() ProcessID { return s.proc.ID }
@@ -293,9 +318,32 @@ func (s *syscalls) ParentID() (ProcessID, bool) {
 	return *s.proc.ParentID, true
 }
 
-func (s *syscalls) Metrics() Metrics { return addMetrics(s.proc.Metrics, s.runMetrics) }
+func (s *syscalls) Metrics() Metrics { return s.proc.Metrics.add(s.runMetrics) }
 
-func (s *syscalls) addMetrics(m Metrics) { s.runMetrics = addMetrics(s.runMetrics, m) }
+func (s *syscalls) LimitStatus() LimitDecision { return s.limit }
+
+// meter folds an effect's usage into this run's metrics and re-evaluates the
+// Limiter, so LimitStatus() and Metrics() always describe the same moment: a
+// strategy reading either one right after a Generate sees the tokens that
+// Generate just spent.
+//
+// The verdict is stored whichever way it goes, a refusal included. What it does
+// NOT do is fail the effect: that one has already run and its cost cannot be
+// taken back. A refusal here is what lets a strategy notice it has just crossed
+// the cap and finish with the result in hand, instead of learning it one effect
+// later. Enforcement stays with the next checkLimit and the next transition
+// boundary.
+//
+// A stored refusal therefore means "the Limiter is refusing", not "this Process
+// has stopped" — the same thing it means after checkLimit refused and a strategy
+// chose to carry on.
+func (s *syscalls) meter(ctx context.Context, m Metrics) {
+	s.runMetrics = s.runMetrics.add(m)
+	if s.k.limiter == nil {
+		return
+	}
+	s.limit = s.k.limiter(ctx, s.proc, s.Metrics())
+}
 
 // notifySpawnDone calls every buffered OnCommit callback exactly once
 // with the transition outcome (nil = the child was committed; non-nil = the
@@ -322,16 +370,21 @@ func (s *syscalls) Metadata() map[string]string { return maps.Clone(s.proc.Metad
 // reach of a middleware on some implementations.
 func (s *syscalls) ec() EffectContext {
 	return EffectContext{ProcessID: s.proc.ID, RootID: s.proc.RootID, Agent: s.proc.Agent,
-		StateSeq: s.seq, Attempt: s.Attempt(), Metadata: s.Metadata()}
+		StateSeq: s.seq, Attempt: s.Attempt(), Metadata: s.Metadata(), Limit: s.limit}
 }
 
-// checkLimit runs the Limiter with the live snapshot (committed + this run).
+// checkLimit runs the Limiter with the live snapshot (committed + this run) and
+// refuses the effect if it says so. Like meter, it stores the verdict whichever
+// way it goes: a strategy that catches ErrLimitExceeded and carries on can then
+// read the reason off LimitStatus() instead of parsing the error's text.
 func (s *syscalls) checkLimit(ctx context.Context) error {
 	if s.k.limiter == nil {
 		return nil
 	}
-	if err := s.k.limiter(ctx, s.proc, s.Metrics()); err != nil {
-		return goerr.Wrap(ErrLimitExceeded, err.Error())
+	d := s.k.limiter(ctx, s.proc, s.Metrics())
+	s.limit = d
+	if d.Kind() == LimitKindStop {
+		return goerr.Wrap(ErrLimitExceeded, d.Message())
 	}
 	return nil
 }
@@ -376,10 +429,10 @@ func (s *syscalls) generateBase(ctx context.Context, req *GenerateRequest) (*Gen
 		OutputTokens:  resp.OutputToken,
 		History:       hist,
 	}
-	s.addMetrics(Metrics{
-		MetricInputTokens:  int64(resp.InputToken),
-		MetricOutputTokens: int64(resp.OutputToken),
-		MetricLLMCalls:     1,
+	s.meter(ctx, Metrics{
+		InputTokens:  int64(resp.InputToken),
+		OutputTokens: int64(resp.OutputToken),
+		LLMCalls:     1,
 	})
 	return result, nil // not journaled: a replay re-calls the LLM (re-charge allowed, D44).
 }
@@ -406,7 +459,7 @@ func (s *syscalls) toolCallBase(ctx context.Context, req *ToolCallRequest) (map[
 		return nil, err
 	}
 	out, terr := tool.Run(ctx, req.Call.Arguments)
-	s.addMetrics(Metrics{MetricToolCalls: 1})
+	s.meter(ctx, Metrics{ToolCalls: 1})
 	// A replay re-executes; side-effecting tools must be made idempotent by the
 	// author (D44/D45). Run errors are returned to the strategy (the Process is
 	// not dropped).
@@ -498,7 +551,7 @@ func (s *syscalls) spawnBase(ctx context.Context, req *SpawnRequest) (ProcessID,
 		UpdatedAt:    now,
 		Rev:          0,
 	})
-	s.addMetrics(Metrics{MetricSpawns: 1})
+	s.meter(ctx, Metrics{Spawns: 1})
 	return cid, nil
 }
 

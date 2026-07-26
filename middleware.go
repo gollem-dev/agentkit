@@ -37,6 +37,23 @@ type EffectContext struct {
 	// have been derived server-side from an already-validated principal before
 	// the spawn (ADR-0011).
 	Metadata map[string]string
+
+	// Limit is the Limiter's most recent verdict, or the zero LimitDecision when
+	// there is no Limiter. Read it through Kind() and Message().
+	//
+	// A middleware wraps its own syscall's Limiter check, so this carries the
+	// verdict from BEFORE this call: the transition boundary's for a
+	// transition's first effect, the previous effect's after that. That is the
+	// useful reading — "the budget looked like this going into this call".
+	//
+	// It does not change while the handler runs. This is a copy taken when the
+	// syscall started, so a middleware cannot see the post-effect re-evaluation
+	// by reading it again after calling next; a strategy reads that through
+	// Syscalls.LimitStatus().
+	//
+	// agentkit never acts on it. A middleware that wants a budget warning to
+	// reach the model appends Message() to GenerateRequest.SystemPrompt itself.
+	Limit LimitDecision
 }
 
 // This file defines the five next-chains the kernel calls out through: the

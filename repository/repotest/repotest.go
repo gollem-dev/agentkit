@@ -359,7 +359,7 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 				Results: []agentkit.ChildResult{{
 					ProcessID: kid,
 					Status:    agentkit.ProcessSucceeded,
-					Metrics:   agentkit.Metrics{agentkit.MetricLLMCalls: 3, agentkit.MetricInputTokens: 42},
+					Metrics:   agentkit.Metrics{LLMCalls: 3, InputTokens: 42},
 				}},
 				CreatedAt: time.Now(),
 			}},
@@ -368,14 +368,17 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		got, err := repo.ListAwaits(ctx, pid)
 		gt.NoError(t, err)
 		gt.Array(t, got).Length(1)
-		gt.Value(t, got[0].Results[0].Metrics[agentkit.MetricLLMCalls]).Equal(int64(3))
-		gt.Value(t, got[0].Results[0].Metrics[agentkit.MetricInputTokens]).Equal(int64(42))
+		gt.Value(t, got[0].Results[0].Metrics.LLMCalls).Equal(int64(3))
+		gt.Value(t, got[0].Results[0].Metrics.InputTokens).Equal(int64(42))
 
-		// Reads deep-copy: mutating what we got back must not reach stored state.
-		got[0].Results[0].Metrics[agentkit.MetricLLMCalls] = 999
+		// Reads must not alias stored state. Metrics is a struct of scalars now, so
+		// an implementation that copies the ChildResult at all satisfies this; the
+		// case still runs because one returning a pointer into its own storage
+		// would not.
+		got[0].Results[0].Metrics.LLMCalls = 999
 		again, err := repo.ListAwaits(ctx, pid)
 		gt.NoError(t, err)
-		gt.Value(t, again[0].Results[0].Metrics[agentkit.MetricLLMCalls]).Equal(int64(3))
+		gt.Value(t, again[0].Results[0].Metrics.LLMCalls).Equal(int64(3))
 	})
 
 	t.Run("ListEventsOnProcessWithNoEvents", func(t *testing.T) {

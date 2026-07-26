@@ -196,9 +196,11 @@ See [persistence.md](persistence.md).
 - **`Metrics`** — counters the kernel maintains: input/output tokens, LLM calls,
   tool calls, steps, spawns. A child adds its counters to its parent's when it
   terminates, once each, so a root's are the tree's.
-- **`Limiter`** — your closure deciding whether to continue, called before every
-  effect and at every transition boundary. The kernel measures; you decide. It
-  is a veto, not a place to wait.
+- **`Limiter`** — your closure deciding whether to continue, called at every
+  transition boundary and both before and after every effect. The kernel
+  measures; you decide. It is a veto, not a place to wait. Besides stopping a
+  run it can return a notice: the run continues, and the strategy can read the
+  message and wrap up on its own terms.
 - **`Event`** — an append-only record written durably inside the transition
   commit, carrying an `EventID`. Read per process with `ListEvents`, from the
   start or after an id you already have; delivering them anywhere is your job.

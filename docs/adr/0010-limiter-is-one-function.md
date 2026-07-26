@@ -3,18 +3,33 @@
 ## Summary
 
 The kernel **measures**; the caller **decides**. Measurement is a fixed set of
-counters in `Metrics` (input tokens, output tokens, LLM calls, tool calls, steps,
-spawns). The decision is one injected closure:
+counters — a `Metrics` struct of six `int64` fields (input tokens, output tokens,
+LLM calls, tool calls, steps, spawns). The decision is one injected closure:
 
 ```go
-type Limiter func(ctx context.Context, proc *Process, metrics Metrics) error
+type Limiter func(ctx context.Context, proc *Process, metrics Metrics) LimitDecision
 ```
 
-It is called before every `Generate`, `CallTool` and `SpawnChild`, and again at
-each transition boundary. A nil return continues. A non-nil return stops: before
-an effect it reaches the strategy as `ErrLimitExceeded`; at a transition boundary
-it finalizes the process as `failed` with `FailureLimitExceeded`. A nil `Limiter`
+A `LimitDecision` is one of three verdicts, built by `LimitPass`, `LimitNotice`
+or `LimitStop` and read back through `Kind()` and `Message()`. A nil `Limiter`
 means unlimited.
+
+- **`LimitStop(reason)`** refuses. Before an effect the reason reaches the
+  strategy wrapped in `ErrLimitExceeded`; at a transition boundary it finalizes
+  the process as `failed` with `FailureLimitExceeded` and that reason as the
+  message.
+- **`LimitNotice(msg)`** continues, carrying a message the strategy can read
+  through `Syscalls.LimitStatus()` and middleware through `EffectContext.Limit`.
+  The kernel never interprets it, never injects it anywhere, and nothing reads it
+  unless the caller asks.
+- **`LimitPass()`** continues with nothing to report.
+
+The closure runs at each transition boundary, before every `Generate`,
+`CallTool` and `SpawnChild`, and again after each of those has been counted. The
+first two refuse the work when it says stop; the third cannot, because the work
+is done, and only updates what `LimitStatus()` reports. Being called that often
+makes two demands on it: it must be **read-only** with respect to whatever it
+consults — an enquiry, never an acquisition — and it must not block.
 
 `Process.Metrics` counts a Process's own effects **plus every child that has
 terminated, once each**, so one closure expresses a subtree budget as well as a
@@ -40,6 +55,56 @@ of it in agentkit.
 `metrics` is a live snapshot: committed cumulative (`proc.Metrics`) plus what the
 current run has accumulated so far. There is no way for an effect to consume
 budget without the next check seeing it.
+
+**The counters are a struct, not a map.** The set is closed by this record, so
+`map[Metric]int64` advertised a key space that does not exist and made every
+read an index into something that might be missing. The json tags reproduce the
+map's former keys, so a snapshot written before the change reads back without a
+migration — not that the bytes are identical: all-zero metrics moved from `null`
+to `{}`, and a key outside the six is dropped on read.
+
+**The verdict is three-valued, because stopping is not the only useful answer.**
+A budget that can only refuse forces a run to end at the cap with no chance for
+the agent to wrap up on its own terms. `LimitNotice` lets a limiter say "nearly
+out" and leaves what to do about it — shorten the plan, drop expensive tools,
+answer now — to the strategy, which is the only party that knows what its work
+looks like. The kernel carries the message and does nothing else with it: acting
+on it would mean the kernel owning vocabulary for talking to a model
+(ADR-0011).
+
+Reading it is a pull, never a push. A strategy calls `LimitStatus()`, or a
+`GenerateMiddleware` reads `EffectContext.Limit` and appends to the system
+prompt itself; agentkit injects nothing. A caller who wants none of this pays
+one `Limiter` call and nothing else.
+
+**The verdict carries one kind and one message, not a bool and two strings.**
+The three verdicts are mutually exclusive, so a shape that can express "stopped,
+and also here is a notice" is a shape with unreachable states in it. `Kind()`
+plus `Message()` makes the exclusion structural, and matches `Failure{Code,
+Message}` and `DecisionKind`.
+
+**`LimitStop` takes a string, not an error.** Both call sites discarded the
+error type anyway — one wrapped `err.Error()` into `ErrLimitExceeded`, the other
+put it in `Failure.Message` — so accepting an `error` only invited callers to
+believe their type survived. With a string, every refusal a strategy observes is
+an `ErrLimitExceeded` and `errors.Is` is sufficient to recognise one.
+
+**The re-evaluation after an effect exists so the verdict and the counters
+describe the same moment.** `Metrics()` already moves as effects run; a verdict
+frozen at the transition boundary would report "plenty left" while `Metrics()`
+showed the budget nearly gone.
+
+A refusal returned by that post-effect evaluation is stored like any other. It
+does not fail the effect — that one has run and its cost cannot be taken back —
+but it is exactly the case worth seeing: the `Generate` that crossed the cap is
+also the one whose result the strategy could finish with, and hiding the refusal
+until the next effect would spend another one to learn it. Enforcement stays
+with the next pre-effect check and the next boundary.
+
+This means a stored `LimitKindStop` says "the `Limiter` is refusing", not "this
+Process has stopped". The same reading already applied after a pre-effect
+refusal that a strategy caught and chose to continue past, so there is one rule
+rather than two.
 
 **A whole-tree budget is the same closure, because the counters roll up.** A
 child adds its own `Metrics` to its parent in its terminal transition
@@ -83,7 +148,29 @@ statuses and puts the reason where every other failure reason already lives.
 - **Giving the `Limiter` a second argument for subtree totals**, or widening it
   into a request struct. Both reopen the shape question this record closed, to
   deliver something the existing `Metrics` argument can carry once the counters
-  roll up.
+  roll up. This is about the *arguments*: what a limiter needs in order to
+  decide is already there. Widening the *return* was a separate question, since
+  `error | nil` could not express "continue, and here is why you should hurry"
+  at all.
+- **A severity or a remaining-budget fraction on the verdict.** Both need a
+  denominator, and the kernel does not have one — a budget may be tokens, money,
+  a rate, or a whole-tree total. Putting a scale in the type is the static
+  `Limits` table returning in another form; a limiter that wants degrees can say
+  so in the notice text.
+- **A second port for the advisory channel** (`WithBudgetNotifier` or similar).
+  Exactly the `Governor` mistake again: two mechanisms answering one question.
+- **Injecting the notice into the prompt from the kernel.** It would make the
+  kernel own vocabulary for addressing a model, and the plumbing already exists
+  — `GenerateRequest.SystemPrompt` is writable from a `GenerateMiddleware`. What
+  was missing was only a way to read the verdict.
+- **Evaluating the verdict lazily, when `LimitStatus()` is called.** Attractive
+  because only readers would pay for it, but a limiter is allowed to consult a
+  rate limiter (this file's own example does), and a read that consumes a token
+  is a trap.
+- **Returning a bare `string` from `LimitStatus()`.** `Syscalls` is a public
+  interface, so both changing that signature and adding a second method are
+  breaking changes; returning an opaque struct keeps later additions to
+  accessors, which are not.
 - **A `Repository` query by `RootID`, so a caller can total the tree itself.**
   Another SPI method every implementer owes, to recompute on demand what the
   kernel can accumulate as it goes — and racy besides, since a sibling can
@@ -97,11 +184,23 @@ statuses and puts the reason where every other failure reason already lives.
 
 - Reading `Metrics` is meaningful; interpreting it is not the kernel's job. Cost,
   quota and fairness all live in caller code.
-- A `Limiter` must be cheap and non-blocking. It runs before every effect, on the
-  transition hot path.
-- A `Limiter` that returns an error mid-transition surfaces as `ErrLimitExceeded`
-  to the strategy, which may handle it (checkpoint what it has and `Suspend`) or
-  propagate it. That is the strategy author's call.
+- A `Limiter` must be cheap and non-blocking. It runs on the transition hot path,
+  **before and after every effect** — `1 + 2×effects` calls per attempt — so the
+  cost of a slow one is now paid roughly twice as often.
+- **A `Limiter` must not consume what it consults.** Drawing a rate-limit token
+  or charging a quota inside it over-charges every effect and refuses work that
+  has already happened. This was implicit while it ran once per effect and is
+  not implicit now; it is stated on the type.
+- A `Limiter` that refuses mid-transition surfaces as `ErrLimitExceeded` to the
+  strategy, which may handle it (checkpoint what it has and `Suspend`) or
+  propagate it. That is the strategy author's call. The verdict stays readable
+  through `LimitStatus()` afterwards, so a strategy that catches the error can
+  see the reason without parsing it out of the message.
+- `LimitStatus()` and `EffectContext.Limit` are not deterministic across a
+  replay: they depend on how far an attempt got, like `Now()` and `Metrics()`.
+  Folding one into checkpointed state is a bug.
+- A `Limiter` that only ever returns `LimitNotice` cannot end a run. That is the
+  point, but it means a misconfigured budget fails open rather than closed.
 - Metrics from a failed attempt are still folded in on requeue and on
   `retry_exhausted`, so a crash-looping process cannot consume unbounded budget
   invisibly.
@@ -120,3 +219,4 @@ statuses and puts the reason where every other failure reason already lives.
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D6, D9, D10, D33). |
 | 2026-07-26 | `Process.Metrics` now includes every terminated child, counted once each, so one `Limiter` expresses a subtree budget. Previously a tree budget needed the caller's own accounting keyed by `RootID`, which a fan-out strategy made mandatory. The signature is unchanged. The fold is keyed to the child's terminal transition rather than to await resolution — the first attempt keyed it to the await, which double-counted a child named by two await keys and missed one nobody waited on. |
+| 2026-07-26 | The `Limiter` returns a `LimitDecision` instead of an `error`, adding a third verdict: continue while telling the strategy the budget is running out. A two-valued return could only end a run at the cap, giving an agent no chance to wrap up on its own terms. The message is read through `Syscalls.LimitStatus()` or `EffectContext.Limit` and the kernel does nothing with it — injecting it would put model-facing vocabulary in the kernel. `LimitStop` takes a string because both call sites already discarded the error type. The verdict is re-evaluated after each effect is counted so it and `Metrics()` describe the same moment; a refusal there is stored but does not fail the effect, which is what lets a strategy finish with the result that crossed the cap. Being called twice per effect makes read-only-ness a stated requirement rather than an implicit one. `Metrics` became a struct: the counter set is closed by this record, so a map advertised keys that never existed. Its json tags reproduce the map's keys, so old snapshots read back without a migration — though all-zero metrics moved from `null` to `{}` and an unknown key is dropped. |

@@ -267,7 +267,7 @@ func runWith(ctx context.Context, w io.Writer, store *inMemoryDeployments) error
 
 	// Both calls are metered, including the one the policy refused: the kernel
 	// counts the attempt, not the outcome.
-	fmt.Fprintf(w, "tool calls attempted: %d\n", proc.Metrics[agentkit.MetricToolCalls])
+	fmt.Fprintf(w, "tool calls attempted: %d\n", proc.Metrics.ToolCalls)
 	fmt.Fprintf(w, "prod deploy applied:  %t\n",
 		store.applied(deploymentKey(map[string]any{"service": "api", "version": "v1.4.2", "env": "prod"})))
 	fmt.Fprintf(w, "staging deploy applied: %t\n",

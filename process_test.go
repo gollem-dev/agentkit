@@ -33,7 +33,7 @@ func TestProcessClone(t *testing.T) {
 			Output:   []byte("out"),
 			Failure:  &agentkit.Failure{Code: agentkit.FailureStrategyError, Message: "boom"},
 			Subject:  &agentkit.SubjectRef{Kind: "case", ID: "42"},
-			Metrics:  agentkit.Metrics{agentkit.MetricLLMCalls: 1},
+			Metrics:  agentkit.Metrics{LLMCalls: 1},
 			ParentID: &parent,
 			WakeAt:   &wake,
 		}
@@ -42,14 +42,14 @@ func TestProcessClone(t *testing.T) {
 		// mutate the clone's nested values
 		cp.Metadata["tenant"] = "other"
 		cp.State[0] = 'X'
-		cp.Metrics[agentkit.MetricLLMCalls] = 99
+		cp.Metrics.LLMCalls = 99
 		cp.Failure.Message = "changed"
 		*cp.ParentID = agentkit.ProcessID("p-other")
 
 		// original is untouched
 		gt.Value(t, orig.Metadata["tenant"]).Equal("acme")
 		gt.Value(t, string(orig.State)).Equal(`{"round":1}`)
-		gt.Value(t, orig.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+		gt.Value(t, orig.Metrics.LLMCalls).Equal(int64(1))
 		gt.Value(t, orig.Failure.Message).Equal("boom")
 		gt.Value(t, *orig.ParentID).Equal(parent)
 	})
