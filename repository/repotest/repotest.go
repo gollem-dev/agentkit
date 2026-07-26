@@ -415,6 +415,42 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		gt.Nil(t, none)
 	})
 
+	t.Run("ClaimPendingWakeAt", func(t *testing.T) {
+		repo := factory(t)
+		now := time.Now()
+
+		// pending, WakeAt in the future -> NOT claimable. This is the retry
+		// backoff: the worker writes it when it puts a failed transition back.
+		backoff := newPID()
+		pBackoff := mkProc(backoff)
+		past := now.Add(-time.Minute)
+		future := now.Add(time.Hour)
+		pBackoff.WakeAt = &future
+		// pending, WakeAt in the past -> claimable (the backoff elapsed).
+		elapsed := newPID()
+		pElapsed := mkProc(elapsed)
+		pElapsed.WakeAt = &past
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{
+			Processes: []*agentkit.Process{pBackoff, pElapsed},
+		}))
+
+		claimed, err := repo.ClaimNextProcess(ctx, "w", now.Add(time.Hour), now)
+		gt.NoError(t, err)
+		gt.NotNil(t, claimed)
+		gt.Value(t, claimed.ID).Equal(elapsed)
+
+		// The one still in backoff is not claimable.
+		none, err := repo.ClaimNextProcess(ctx, "w", now.Add(time.Hour), now)
+		gt.NoError(t, err)
+		gt.Nil(t, none)
+
+		// Once its wake time is due it becomes a target, without being written to.
+		later, err := repo.ClaimNextProcess(ctx, "w", future.Add(time.Hour), future.Add(time.Second))
+		gt.NoError(t, err)
+		gt.NotNil(t, later)
+		gt.Value(t, later.ID).Equal(backoff)
+	})
+
 	t.Run("ClaimWaitingWakeAt", func(t *testing.T) {
 		repo := factory(t)
 		now := time.Now()

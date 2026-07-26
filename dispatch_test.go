@@ -417,3 +417,41 @@ func TestClaimSpecific_PendingOnly(t *testing.T) {
 	gt.NoError(t, err)
 	gt.Value(t, stored.UncleanReclaims).Equal(0)
 }
+
+// Eager dispatch has to honour the same claim predicate as ClaimNextProcess. If
+// it did not, the retry backoff would only ever apply to polling and a failing
+// Process would be handed straight back to a worker.
+func TestClaimSpecific_HonoursRetryBackoff(t *testing.T) {
+	ctx := context.Background()
+	k, repo, ag := setupEager(t, immediateDoneStep)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+
+	// Put the row into the state requeue leaves behind: pending, with a wake time
+	// that has not arrived.
+	p, err := repo.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	future := time.Now().Add(time.Hour)
+	p.WakeAt = &future
+	gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{p}}))
+
+	_, ok := k.ClaimSpecificForTest(ctx, pid)
+	gt.Bool(t, ok).False()
+
+	// A poller does not take it either, and the row was not written to.
+	none, err := repo.ClaimNextProcess(ctx, "w", time.Now().Add(time.Minute), time.Now())
+	gt.NoError(t, err)
+	gt.Nil(t, none)
+	stored, err := repo.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.Value(t, stored.Status).Equal(agentkit.ProcessPending)
+
+	// Once the wake time has passed it is claimable again.
+	past := time.Now().Add(-time.Second)
+	stored.WakeAt = &past
+	gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{stored}}))
+	claimed, ok := k.ClaimSpecificForTest(ctx, pid)
+	gt.Bool(t, ok).True()
+	gt.Value(t, claimed.Status).Equal(agentkit.ProcessRunning)
+}

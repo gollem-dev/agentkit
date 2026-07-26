@@ -28,7 +28,9 @@ Two properties are worth stating explicitly:
 - **`pending` is the main parking state.** A process is put back to `pending`
   when it is answered (`Respond`) or requeued after an error, and claimed from
   there; the one exception is a process `waiting` on a deadline, which is claimed
-  straight from `waiting` once its `WakeAt` is due. Either way there is only one
+  straight from `waiting` once its `WakeAt` is due. A `pending` row can carry a
+  `WakeAt` too — that is the retry backoff, and it holds the row back from a
+  claim exactly as a `waiting` one is held. Either way there is only one
   claim mechanism (take the row to `running` with a fresh `LeaseToken`); what
   *triggers* it is either a poll loop's `ClaimNextProcess` or eager dispatch
   claiming a specific pending row in-process
@@ -237,6 +239,13 @@ ground truth and the fallback: when the hard concurrency limit is full, or no
 two-tier — `WithPollConcurrency` (poll loops) and `WithMaxConcurrent` (the hard
 ceiling shared by poll and eager).
 
+**A claim is also a hook point.** `ClaimMiddleware` wraps the whole of what
+follows, and the `ctx` it installs reaches the `ToolFactory` and every
+transition in the run — the only scope that brackets a worker's entire run on
+one Process ([ADR-0012](../adr/0012-kernel-hooks-are-composable-middleware.md)).
+Returning without calling `next` refuses the claim, which requeues the Process
+with a backoff rather than running it.
+
 A claim is not one transition. Having paid for the claim, the worker runs a
 bounded run of transitions, re-reading the process each time and stopping when
 the process suspends, terminates, or the budget runs out (at which point it
@@ -247,15 +256,17 @@ it settles any due awaits: a timer past its deadline becomes `responded` with
 **Timers therefore fire on the next claim, not on a scheduler.** The `WakeAt`
 field is what makes that claim happen; precision is bounded by the poll interval.
 
-A claim ends in one of four ways, and three of them clear the lease as they move
-the process off `running`:
+A claim ends in one of five ways, named by the `ClaimOutcome` a
+`ClaimMiddleware` receives. Four of them clear the lease as they move the
+process off `running`; only an abandon leaves it to lapse:
 
-| Ending | Result |
-|---|---|
-| `Suspend` | `waiting`, lease cleared |
-| `Done` / `Fail` | terminal, lease cleared |
-| step budget spent | `release` returns it to `pending`, lease cleared |
-| lease lost, or an error | abandon, or `requeue` to `pending` with backoff |
+| Ending | `ClaimOutcome` | Result |
+|---|---|---|
+| `Suspend` | `suspended` | `waiting`, lease cleared |
+| `Done` / `Fail`, or the kernel finalizing it | `finished` | terminal, lease cleared |
+| step budget spent | `released` | `release` returns it to `pending`, lease cleared |
+| an error, or a refused claim | `requeued` | `requeue` to `pending` with a backoff, lease cleared |
+| lease lost, or a `Repository` failure | `abandoned` | nothing written; a later claim recovers the row |
 
 That table is why a `running` row with a lapsed lease means something specific:
 no orderly ending leaves one behind, so encountering one means the previous
@@ -336,10 +347,13 @@ errors the worker saw; the fourth is the worker not being there any more.
 
 **Transition errors** — a failure in `DecodeState`, `Step`, or `EncodeState`,
 including a recovered panic from the strategy or its `StepMiddleware` chain.
-The process is requeued with an
-exponential backoff (doubling, capped at a minute) and an incremented attempt
-counter. When attempts exceed the limit, it terminates as `failed` with
-`FailureRetryExhausted`. Metrics consumed by the failed attempt are folded in
+The process is requeued with a backoff and an incremented attempt counter. When
+attempts exceed the limit, it terminates as `failed` with
+`FailureRetryExhausted`. The backoff defaults to doubling from a second, capped
+at a minute, and `WithRetryBackoff` replaces the curve — the attempt count goes
+in, the wait comes out. It is written to the row as its `WakeAt`, so it only
+holds because a `pending` row with a future `WakeAt` is not claimable; a
+`Repository` that ignores that retries as fast as it polls. Metrics consumed by the failed attempt are folded in
 either way, so a crash loop cannot burn budget invisibly.
 
 **Commit conflicts** — `ErrConflict` from `Apply`. The worker re-reads and asks

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1842,4 +1843,651 @@ func TestSpawnParentMetadataIsDistinctFromChilds(t *testing.T) {
 	gt.Value(t, obs.get("spawn.effect")).Equal(map[string]string{"tenant": "acme"})
 	gt.Value(t, obs.get("init.parent")).Equal(map[string]string{"tenant": "acme"})
 	gt.Value(t, obs.get("spawn.child")).Equal(map[string]string{"tenant": "child-co"})
+}
+
+// --- Claim ------------------------------------------------------------------
+
+// claimOutcomes collects what every claim reported, so a test can assert on the
+// value the kernel handed the middleware rather than only on the row left behind.
+type claimOutcomes struct {
+	mu   sync.Mutex
+	seen []agentkit.ClaimOutcome
+}
+
+func (c *claimOutcomes) add(o agentkit.ClaimOutcome) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seen = append(c.seen, o)
+}
+
+func (c *claimOutcomes) snapshot() []agentkit.ClaimOutcome {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]agentkit.ClaimOutcome(nil), c.seen...)
+}
+
+func (c *claimOutcomes) has(want agentkit.ClaimOutcome) bool {
+	for _, o := range c.snapshot() {
+		if o == want {
+			return true
+		}
+	}
+	return false
+}
+
+// recordClaims reports every claim's outcome into out.
+func recordClaims(out *claimOutcomes) agentkit.ClaimMiddleware {
+	return func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(ctx context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			o, err := next(ctx, req)
+			out.add(o)
+			return o, err
+		}
+	}
+}
+
+// serveUntilOutcome runs Serve until a claim reports want. It waits on the
+// outcome rather than on the Process because several outcomes (abandoned,
+// released) leave the row in a state no single predicate distinguishes.
+func serveUntilOutcome(t *testing.T, k *agentkit.Kernel, outs *claimOutcomes,
+	want agentkit.ClaimOutcome, timeout time.Duration, extra ...agentkit.ServeOption) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	opts := append([]agentkit.ServeOption{
+		agentkit.WithPollInterval(2 * time.Millisecond),
+		agentkit.WithLease(2 * time.Second),
+		agentkit.WithRetryBackoff(func(int) time.Duration { return time.Millisecond }),
+	}, extra...)
+	go func() { _ = k.Serve(ctx, opts...); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if outs.has(want) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("outcome %q not reported within %s (saw %v)", want, timeout, outs.snapshot())
+}
+
+type claimCtxKey struct{}
+
+// The point of a claim-scoped hook: the ctx it installs has to reach the
+// ToolFactory (built once per claim) and everything the transitions do.
+func TestClaimMiddlewareCarriesContextThroughTheWholeClaim(t *testing.T) {
+	ctx := context.Background()
+	rec := &recorder{}
+	tool, _, _ := countingTool("noop")
+
+	tag := func(c context.Context) string {
+		v, _ := c.Value(claimCtxKey{}).(string)
+		return v
+	}
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		rec.add("step:" + tag(c))
+		if _, err := sys.CallTool(c, gollem.FunctionCall{Name: "noop"}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	tf := func(c context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		rec.add("toolfactory:" + tag(c))
+		return []gollem.Tool{tool}, nil
+	}
+	toolMW := func(next agentkit.ToolCallHandler) agentkit.ToolCallHandler {
+		return func(c context.Context, req *agentkit.ToolCallRequest) (map[string]any, error) {
+			rec.add("toolcall:" + tag(c))
+			return next(c, req)
+		}
+	}
+	claimMW := func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(c context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			return next(context.WithValue(c, claimCtxKey{}, "claim"), req)
+		}
+	}
+
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model,
+		agentkit.WithToolFactory(tf),
+		agentkit.WithClaimMiddleware(claimMW),
+		agentkit.WithToolCallMiddleware(toolMW))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, rec.snapshot()).Equal([]string{
+		"toolfactory:claim", "step:claim", "toolcall:claim",
+	})
+}
+
+func TestClaimMiddlewareOrder(t *testing.T) {
+	ctx := context.Background()
+	rec := &recorder{}
+	mk := func(name string) agentkit.ClaimMiddleware {
+		return func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+			return func(c context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+				rec.add(name + "-in")
+				o, err := next(c, req)
+				rec.add(name + "-out")
+				return o, err
+			}
+		}
+	}
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		rec.add("base")
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model, agentkit.WithClaimMiddleware(mk("0"), mk("1")))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, rec.snapshot()).Equal([]string{"0-in", "1-in", "base", "1-out", "0-out"})
+}
+
+// Every ClaimOutcome the kernel can report, produced by the situation that
+// produces it in production.
+func TestClaimMiddlewareReportsEachOutcome(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("finished", func(t *testing.T) {
+		outs := &claimOutcomes{}
+		step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			return st, agentkit.Done([]byte("ok")), nil
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, _, ag := setupScript(t, step, model, agentkit.WithClaimMiddleware(recordClaims(outs)))
+		_, _ = ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		serveUntilOutcome(t, k, outs, agentkit.ClaimFinished, 3*time.Second)
+	})
+
+	t.Run("suspended", func(t *testing.T) {
+		outs := &claimOutcomes{}
+		step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			// A question with no deadline: the Process stays waiting, so the claim
+			// ends by suspending rather than by running out of budget.
+			return st, agentkit.Suspend[[]byte](agentkit.Question("q:1", []byte("?"))), nil
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, _, ag := setupScript(t, step, model, agentkit.WithClaimMiddleware(recordClaims(outs)))
+		_, _ = ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		serveUntilOutcome(t, k, outs, agentkit.ClaimSuspended, 3*time.Second)
+	})
+
+	t.Run("released", func(t *testing.T) {
+		outs := &claimOutcomes{}
+		step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			st.N++
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, _, ag := setupScript(t, step, model, agentkit.WithClaimMiddleware(recordClaims(outs)))
+		_, _ = ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		serveUntilOutcome(t, k, outs, agentkit.ClaimReleased, 3*time.Second,
+			agentkit.WithMaxStepsPerClaim(1))
+	})
+
+	t.Run("requeued on a ToolFactory failure", func(t *testing.T) {
+		outs := &claimOutcomes{}
+		step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			return st, agentkit.Done([]byte("ok")), nil
+		}
+		tf := func(context.Context, *agentkit.Process) ([]gollem.Tool, error) {
+			return nil, gollemErr("no tools today")
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, _, ag := setupScript(t, step, model,
+			agentkit.WithToolFactory(tf), agentkit.WithClaimMiddleware(recordClaims(outs)))
+		_, _ = ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		serveUntilOutcome(t, k, outs, agentkit.ClaimRequeued, 3*time.Second)
+	})
+
+	t.Run("abandoned when the lease is taken mid-transition", func(t *testing.T) {
+		outs := &claimOutcomes{}
+		var box struct {
+			mu   sync.Mutex
+			repo agentkit.Repository
+			once bool
+		}
+		// Bumping the row's Rev and lease token from under the claim makes its
+		// commit conflict, and the re-read then shows the lease is gone.
+		steal := func(next agentkit.StepHandler) agentkit.StepHandler {
+			return func(c context.Context, req *agentkit.StepRequest) (*agentkit.StepResult, error) {
+				box.mu.Lock()
+				first := !box.once
+				box.once = true
+				repo := box.repo
+				box.mu.Unlock()
+				if first && repo != nil {
+					if p, err := repo.GetProcess(c, req.Effect.ProcessID); err == nil {
+						p.LeaseToken = "another-worker"
+						_ = repo.Apply(c, agentkit.ChangeSet{Processes: []*agentkit.Process{p}})
+					}
+				}
+				return next(c, req)
+			}
+		}
+		step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			st.N++
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, repo, ag := setupScript(t, step, model,
+			agentkit.WithClaimMiddleware(recordClaims(outs)), agentkit.WithStepMiddleware(steal))
+		box.mu.Lock()
+		box.repo = repo
+		box.mu.Unlock()
+
+		_, _ = ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		serveUntilOutcome(t, k, outs, agentkit.ClaimAbandoned, 3*time.Second)
+	})
+}
+
+// Refusing holds the work off without running it, and without charging the
+// strategy's error budget.
+func TestClaimMiddlewareRefuseSkipsTheClaim(t *testing.T) {
+	ctx := context.Background()
+	outs := &claimOutcomes{}
+	var steps, factories int32Box
+
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.inc()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	tf := func(context.Context, *agentkit.Process) ([]gollem.Tool, error) {
+		factories.inc()
+		return nil, nil
+	}
+	refuse := func(_ agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(context.Context, *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			return agentkit.ClaimRefused, nil
+		}
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model, agentkit.WithToolFactory(tf),
+		agentkit.WithClaimMiddleware(recordClaims(outs), refuse))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	// An outer middleware sees the refusal itself. ClaimRequeued is what the
+	// kernel reports to the scheduler, outside the chain. A long backoff holds
+	// the row still afterwards, which is also what stops a refusal from spinning.
+	serveUntilOutcome(t, k, outs, agentkit.ClaimRefused, 3*time.Second,
+		agentkit.WithRetryBackoff(func(int) time.Duration { return time.Hour }))
+
+	// The claim never ran, so neither the ToolFactory nor Step was reached.
+	gt.Value(t, factories.get()).Equal(0)
+	gt.Value(t, steps.get()).Equal(0)
+
+	p, err := repo.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	// No Step ran, so the error budget is untouched, and the wake time is what
+	// holds the Process back until the backoff elapses.
+	gt.Value(t, p.StepAttempts).Equal(0)
+	gt.NotNil(t, p.WakeAt)
+}
+
+func TestClaimMiddlewareErrorRequeuesWithoutRunning(t *testing.T) {
+	ctx := context.Background()
+	outs := &claimOutcomes{}
+	var steps int32Box
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.inc()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	boom := func(_ agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(context.Context, *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			return agentkit.ClaimRefused, gollemErr("middleware is unhappy")
+		}
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model,
+		agentkit.WithClaimMiddleware(recordClaims(outs), boom))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	// The outer middleware sees the zero outcome the failing one returned.
+	serveUntilOutcome(t, k, outs, agentkit.ClaimRefused, 3*time.Second,
+		agentkit.WithRetryBackoff(func(int) time.Duration { return time.Hour }))
+	gt.Value(t, steps.get()).Equal(0)
+
+	p, err := repo.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	// A middleware fault is not the strategy's: the error budget is untouched.
+	gt.Value(t, p.StepAttempts).Equal(0)
+	gt.NotNil(t, p.WakeAt)
+}
+
+// A control layer that panics must fail the claim, not the worker: serveLoop
+// calls runClaim without any recovery of its own.
+func TestClaimMiddlewarePanicKeepsTheWorkerAlive(t *testing.T) {
+	ctx := context.Background()
+	outs := &claimOutcomes{}
+	var panicked int32Box
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	// Panic on the first claim only, so the Process can finish on a later one and
+	// prove the worker survived.
+	blowUp := func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(c context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			if panicked.get() == 0 {
+				panicked.inc()
+				panic("claim middleware exploded")
+			}
+			return next(c, req)
+		}
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model,
+		agentkit.WithClaimMiddleware(recordClaims(outs), blowUp))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, panicked.get()).Equal(1)
+	// The panicking claim was requeued; a later one finished the Process.
+	gt.Bool(t, outs.has(agentkit.ClaimFinished)).True()
+}
+
+func TestClaimMiddlewareRejectsSecondNext(t *testing.T) {
+	ctx := context.Background()
+	var steps int32Box
+	errs := make(chan error, 4)
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.inc()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	twice := func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(c context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			o, err := next(c, req)
+			if _, second := next(c, req); second != nil {
+				select {
+				case errs <- second:
+				default:
+				}
+			}
+			return o, err
+		}
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model, agentkit.WithClaimMiddleware(twice))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	select {
+	case err := <-errs:
+		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
+	default:
+		t.Fatal("the second next call was accepted")
+	}
+	// The claim ran once: the row was not driven twice.
+	gt.Value(t, steps.get()).Equal(1)
+	gt.Value(t, p.StateSeq).Equal(1)
+}
+
+// Eager dispatch re-submits on ClaimReleased, so a middleware that reports it
+// for a claim which did not release would spin the Process. The kernel reports
+// what the claim did, not what the middleware returned.
+func TestClaimMiddlewareCannotForgeTheOutcome(t *testing.T) {
+	ctx := context.Background()
+	var claims int32Box
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	liar := func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(c context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			claims.inc()
+			o, err := next(c, req)
+			gt.Value(t, o).Equal(agentkit.ClaimFinished) // what really happened
+			return agentkit.ClaimReleased, err           // what the kernel must ignore
+		}
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model, agentkit.WithClaimMiddleware(liar))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	// A terminal Process is not claimable, so a re-submit would find nothing --
+	// what this pins is that the forged outcome did not become the kernel's.
+	gt.Value(t, claims.get()).Equal(1)
+}
+
+func TestClaimMiddlewareProcessIsACopy(t *testing.T) {
+	ctx := context.Background()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	scribble := func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(c context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			req.Process.Rev = 9999
+			req.Process.Status = agentkit.ProcessCancelled
+			req.Process.Agent = "not-this-one"
+			return next(c, req)
+		}
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model, agentkit.WithClaimMiddleware(scribble))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, p.Agent).Equal(agentkit.AgentName("main"))
+}
+
+func TestClaimMiddlewareNilIsRejected(t *testing.T) {
+	reg := agentkit.NewRegistry()
+	_, err := agentkit.Register(reg, "main", 1, &scriptStrategy{
+		step: func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			return st, agentkit.Done([]byte("ok")), nil
+		},
+	})
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	_, err = agentkit.New(memory.New(), model, reg, agentkit.WithClaimMiddleware(nil))
+	gt.Error(t, err).Is(agentkit.ErrInvalidConfig)
+}
+
+func TestClaimMiddlewareNilHandlerRequeues(t *testing.T) {
+	ctx := context.Background()
+	outs := &claimOutcomes{}
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	broken := func(agentkit.ClaimHandler) agentkit.ClaimHandler { return nil }
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model,
+		agentkit.WithClaimMiddleware(recordClaims(outs), broken))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	// The chain is nil, so no middleware runs at all -- wait on the row instead.
+	deadline := time.Now().Add(3 * time.Second)
+	ctxServe, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		_ = k.Serve(ctxServe, agentkit.WithPollInterval(2*time.Millisecond),
+			agentkit.WithRetryBackoff(func(int) time.Duration { return time.Hour }))
+		close(done)
+	}()
+	defer func() { cancel(); <-done }()
+	for time.Now().Before(deadline) {
+		p, err := repo.GetProcess(ctx, pid)
+		if err == nil && p.WakeAt != nil {
+			gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("the Process was never put back")
+}
+
+// A panic while the chain is being BUILT is outside the handler call, so it
+// needs the same recovery. serveLoop has none, and an escaping panic there takes
+// the process down with the poll goroutine.
+func TestClaimMiddlewareFactoryPanicKeepsTheWorkerAlive(t *testing.T) {
+	ctx := context.Background()
+	var panicked int32Box
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	blowUp := func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+		if panicked.get() == 0 {
+			panicked.inc()
+			panic("claim middleware factory exploded")
+		}
+		return next
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model, agentkit.WithClaimMiddleware(blowUp))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, panicked.get()).Equal(1)
+}
+
+// A ToolFactory panic reaches the claim scope with no Claim middleware in play
+// at all, so it must still leave the row runnable. Leaving it `running` would
+// make the next claim charge an unclean reclaim for a crash that never happened.
+func TestToolFactoryPanicPutsTheProcessBack(t *testing.T) {
+	ctx := context.Background()
+	var panics int32Box
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	tf := func(context.Context, *agentkit.Process) ([]gollem.Tool, error) {
+		if panics.get() == 0 {
+			panics.inc()
+			panic("factory exploded")
+		}
+		return nil, nil
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model, agentkit.WithToolFactory(tf))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, panics.get()).Equal(1)
+	// The panicking claim was put back, not left running: a later claim finished
+	// it without the takeover being counted as a crash.
+	gt.Value(t, p.UncleanReclaims).Equal(0)
+}
+
+// A caller's RetryBackoff runs on the requeue path, which is reached from
+// runClaim itself. A panic there must not escape either.
+func TestRetryBackoffPanicKeepsTheWorkerAlive(t *testing.T) {
+	ctx := context.Background()
+	var panics int32Box
+	var steps int32Box
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if steps.get() == 0 {
+			steps.inc()
+			return st, agentkit.Decision[[]byte]{}, gollemErr("boom")
+		}
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model)
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal,
+		agentkit.WithRetryBackoff(func(int) time.Duration {
+			if panics.get() == 0 {
+				panics.inc()
+				panic("backoff exploded")
+			}
+			return time.Millisecond
+		}))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, panics.get()).Equal(1)
+}
+
+// Handing next to a goroutine and returning early is out of contract: the claim
+// still holds the lease. The kernel must not settle a row that is still being
+// driven, and must not race on the state it reads to decide that.
+func TestClaimMiddlewareReturningBeforeNextAbandonsTheFrame(t *testing.T) {
+	ctx := context.Background()
+	outs := &claimOutcomes{}
+	release := make(chan struct{})
+	var once sync.Once
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		// Hold the first claim open until the middleware has already returned.
+		once.Do(func() { <-release })
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	detach := func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(c context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			started := make(chan struct{})
+			go func() {
+				close(started)
+				_, _ = next(c, req)
+			}()
+			<-started
+			close(release)
+			return agentkit.ClaimRefused, nil // returns while next is still running.
+		}
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model,
+		agentkit.WithClaimMiddleware(recordClaims(outs), detach))
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	// The detached claim still finishes the Process on its own.
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+}
+
+// ClaimOutcome states what became of the row, so a store that refuses the
+// requeue must not be reported as a successful one.
+func TestClaimOutcomeReportsAbandonedWhenTheRequeueFails(t *testing.T) {
+	ctx := context.Background()
+	outs := &claimOutcomes{}
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	refuse := func(_ agentkit.ClaimHandler) agentkit.ClaimHandler {
+		return func(context.Context, *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+			return agentkit.ClaimRefused, nil
+		}
+	}
+	model, _ := mockLLM(textResponse("x"))
+	repo := memory.New()
+	failing := &applyFailRepo{Repository: repo}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(failing, model, reg,
+		agentkit.WithClaimMiddleware(recordClaims(outs), refuse))
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	claimed, ok := k.ClaimSpecificForTest(ctx, pid)
+	gt.Bool(t, ok).True()
+
+	// From here on the store refuses writes, so the refused claim cannot put the
+	// Process back and the kernel has to say so rather than claim it requeued.
+	failing.fail.Store(true)
+	gt.Value(t, k.RunClaimForTest(ctx, claimed)).Equal(agentkit.ClaimAbandoned)
+	gt.Bool(t, outs.has(agentkit.ClaimRefused)).True()
+}
+
+// applyFailRepo refuses every Apply once armed, so a test can watch a settle
+// step fail without inventing a whole Repository.
+type applyFailRepo struct {
+	agentkit.Repository
+	fail atomic.Bool
+}
+
+func (r *applyFailRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	if r.fail.Load() {
+		return gollemErr("store is down")
+	}
+	return r.Repository.Apply(ctx, cs)
 }

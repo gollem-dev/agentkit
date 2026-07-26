@@ -129,6 +129,10 @@ func serveUntil(t *testing.T, k *agentkit.Kernel, repo agentkit.Repository, pid 
 	opts := append([]agentkit.ServeOption{
 		agentkit.WithPollInterval(2 * time.Millisecond),
 		agentkit.WithLease(2 * time.Second),
+		// The default curve spends 2+4+8 seconds to exhaust a three-attempt budget.
+		// Tests here are about what the retry does, not how long it waits; a test
+		// that cares about the wait passes its own curve in extra.
+		agentkit.WithRetryBackoff(func(int) time.Duration { return time.Millisecond }),
 	}, extra...)
 	go func() {
 		_ = k.Serve(ctx, opts...)
@@ -2224,4 +2228,105 @@ func TestLimiterObservesFoldedChildMetrics(t *testing.T) {
 	defer mu.Unlock()
 	// The parent never generates; every call it sees belongs to its children.
 	gt.Value(t, maxSeenOnParent).Equal(int64(2))
+}
+
+// A parent that also declared a timer suspends with that deadline as its
+// WakeAt. When the children finish first, the wakeup has to clear it, or the
+// parent would sit pending until the timer it never needed.
+func TestChildrenWakeupClearsTheTimerWakeTime(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(textResponse("x"))
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			return st, agentkit.Done([]byte(st.Seed)), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			id, e := child.SpawnChild(c, sys, scriptInput{Seed: "r1"})
+			if e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			st.N = 1
+			// The timer is far enough away that it can only fire if the test is
+			// wrong about which await woke the parent.
+			return st, agentkit.Suspend[[]byte](
+				agentkit.WaitChildren("kids", id),
+				agentkit.Timer("late", sys.Now().Add(time.Hour)),
+			), nil
+		}
+		aw, ok := sys.Await("kids")
+		if !ok || aw.Status != agentkit.AwaitResponded {
+			return st, agentkit.Decision[[]byte]{}, gollemErr("children not ready")
+		}
+		return st, agentkit.Done([]byte("parent done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("parent done")
+}
+
+// The default curve, and what WithRetryBackoff is allowed to replace it with.
+func TestRetryBackoffOption(t *testing.T) {
+	t.Run("default doubles and caps at a minute", func(t *testing.T) {
+		fn := agentkit.RetryBackoffForTest()
+		gt.Value(t, fn(0)).Equal(time.Second)
+		gt.Value(t, fn(1)).Equal(2 * time.Second)
+		gt.Value(t, fn(3)).Equal(8 * time.Second)
+		gt.Value(t, fn(6)).Equal(time.Minute)
+		// Past the cap, and past the shift width, it stays at the cap rather than
+		// overflowing.
+		gt.Value(t, fn(30)).Equal(time.Minute)
+		// A stored counter that went negative must not panic on the shift.
+		gt.Value(t, fn(-1)).Equal(time.Second)
+	})
+
+	t.Run("a caller's curve replaces it", func(t *testing.T) {
+		fn := agentkit.RetryBackoffForTest(
+			agentkit.WithRetryBackoff(func(n int) time.Duration {
+				return time.Duration(n) * time.Millisecond
+			}))
+		gt.Value(t, fn(5)).Equal(5 * time.Millisecond)
+	})
+
+	t.Run("nil restores the default", func(t *testing.T) {
+		fn := agentkit.RetryBackoffForTest(agentkit.WithRetryBackoff(nil))
+		gt.Value(t, fn(1)).Equal(2 * time.Second)
+	})
+}
+
+// A negative duration would put the wake time in the past and quietly turn the
+// backoff into no backoff at all, so the worker floors it at zero.
+func TestRetryBackoffNegativeIsFlooredAtZero(t *testing.T) {
+	ctx := context.Background()
+	var calls atomic.Int32
+	step := countingStep(&calls, func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Decision[[]byte]{}, gollemErr("boom")
+	})
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model)
+
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal,
+		agentkit.WithRetryBackoff(func(int) time.Duration { return -time.Hour }),
+		agentkit.WithMaxStepAttempts(1))
+
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	// The retry still happened -- flooring the wait is not the same as skipping
+	// the requeue.
+	gt.Value(t, calls.Load()).Equal(int32(2))
 }
