@@ -1551,3 +1551,237 @@ func TestEffectContextCarriesAttempt(t *testing.T) {
 	gt.Value(t, seen[1]).Equal(agentkit.AttemptInfo{Errors: 1})
 	gt.Value(t, seen[1].IsReplay()).Equal(true)
 }
+
+// --- EffectContext.Metadata -------------------------------------------------
+
+// mapCapture collects the Metadata maps middleware observed, keyed by which
+// effect saw them.
+type mapCapture struct {
+	mu   sync.Mutex
+	seen map[string]map[string]string
+}
+
+func newMapCapture() *mapCapture {
+	return &mapCapture{seen: map[string]map[string]string{}}
+}
+
+func (c *mapCapture) put(where string, m map[string]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seen[where] = m
+}
+
+func (c *mapCapture) get(where string) map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seen[where]
+}
+
+// setupMetadataParent registers a "child" agent that finishes immediately and a
+// "parent" whose first transition performs one of every effect (Generate,
+// CallTool, SpawnChild) and then waits for the child.
+func setupMetadataParent(t *testing.T, opts ...agentkit.KernelOption) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput], agentkit.Agent[scriptInput]) {
+	t.Helper()
+	model, _ := mockLLM(textResponse("x"))
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			return st, agentkit.Done([]byte(st.Seed)), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N > 0 {
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		if _, e := sys.Generate(c, []gollem.Input{gollem.Text("go")}); e != nil {
+			return st, agentkit.Decision[[]byte]{}, e
+		}
+		if _, e := sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "t", Arguments: map[string]any{}}); e != nil {
+			return st, agentkit.Decision[[]byte]{}, e
+		}
+		id, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"},
+			agentkit.WithMetadata(map[string]string{"tenant": "child-co"}))
+		if e != nil {
+			return st, agentkit.Decision[[]byte]{}, e
+		}
+		st.N = 1
+		return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kids", id)), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	tf := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{mockTool("t", map[string]any{"ok": true})}, nil
+	}
+	k, err := agentkit.New(repo, model, reg, append(opts, agentkit.WithToolFactory(tf))...)
+	gt.NoError(t, err)
+	return k, repo, parent, child
+}
+
+// Every effect middleware reaches Process.Metadata without holding a Repository.
+func TestEffectMetadataReachesEveryEffectKind(t *testing.T) {
+	ctx := context.Background()
+	obs := newMapCapture()
+
+	genMW := func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+		return func(c context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+			obs.put("generate", req.Effect.Metadata)
+			return next(c, req)
+		}
+	}
+	toolMW := func(next agentkit.ToolCallHandler) agentkit.ToolCallHandler {
+		return func(c context.Context, req *agentkit.ToolCallRequest) (map[string]any, error) {
+			obs.put("calltool", req.Effect.Metadata)
+			return next(c, req)
+		}
+	}
+	spawnMW := func(next agentkit.SpawnHandler) agentkit.SpawnHandler {
+		return func(c context.Context, req *agentkit.SpawnRequest) (agentkit.ProcessID, error) {
+			obs.put("spawn", req.Effect.Metadata)
+			return next(c, req)
+		}
+	}
+	stepMW := func(next agentkit.StepHandler) agentkit.StepHandler {
+		return func(c context.Context, req *agentkit.StepRequest) (*agentkit.StepResult, error) {
+			obs.put("step", req.Effect.Metadata)
+			return next(c, req)
+		}
+	}
+
+	k, repo, parent, _ := setupMetadataParent(t,
+		agentkit.WithGenerateMiddleware(genMW),
+		agentkit.WithToolCallMiddleware(toolMW),
+		agentkit.WithSpawnMiddleware(spawnMW),
+		agentkit.WithStepMiddleware(stepMW))
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"},
+		agentkit.WithMetadata(map[string]string{"tenant": "acme"}))
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	want := map[string]string{"tenant": "acme"}
+	for _, where := range []string{"generate", "calltool", "spawn", "step"} {
+		gt.Value(t, obs.get(where)).Equal(want)
+	}
+}
+
+// A Process with no Metadata yields nil, not an empty map.
+func TestEffectMetadataNilWhenUnset(t *testing.T) {
+	ctx := context.Background()
+	var seen map[string]string
+	var called bool
+	var mu sync.Mutex
+	mw := func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+		return func(c context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+			mu.Lock()
+			seen, called = req.Effect.Metadata, true
+			mu.Unlock()
+			return next(c, req)
+		}
+	}
+	model, _ := mockLLM(textResponse("x"))
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, e := sys.Generate(c, []gollem.Input{gollem.Text("go")}); e != nil {
+			return st, agentkit.Decision[[]byte]{}, e
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	k, repo, ag := setupScript(t, step, model, agentkit.WithGenerateMiddleware(mw))
+	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Bool(t, called).True()
+	gt.Bool(t, seen == nil).True()
+}
+
+// A middleware is invited to rewrite its request, so the map it gets must be a
+// copy: the write must not reach the next effect, the Step's Process snapshot,
+// or the committed row.
+func TestEffectMetadataIsPerCallCopy(t *testing.T) {
+	ctx := context.Background()
+	obs := newMapCapture()
+
+	genMW := func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+		return func(c context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+			req.Effect.Metadata["tenant"] = "evil"
+			req.Effect.Metadata["injected"] = "yes"
+			return next(c, req)
+		}
+	}
+	// CallTool runs after Generate in the same transition (setupMetadataParent).
+	toolMW := func(next agentkit.ToolCallHandler) agentkit.ToolCallHandler {
+		return func(c context.Context, req *agentkit.ToolCallRequest) (map[string]any, error) {
+			obs.put("calltool", req.Effect.Metadata)
+			return next(c, req)
+		}
+	}
+	stepMW := func(next agentkit.StepHandler) agentkit.StepHandler {
+		return func(c context.Context, req *agentkit.StepRequest) (*agentkit.StepResult, error) {
+			res, err := next(c, req) // read AFTER the effects ran.
+			obs.put("process", req.Process.Metadata)
+			return res, err
+		}
+	}
+
+	k, repo, parent, _ := setupMetadataParent(t,
+		agentkit.WithGenerateMiddleware(genMW),
+		agentkit.WithToolCallMiddleware(toolMW),
+		agentkit.WithStepMiddleware(stepMW))
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"},
+		agentkit.WithMetadata(map[string]string{"tenant": "acme"}))
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	want := map[string]string{"tenant": "acme"}
+	gt.Value(t, obs.get("calltool")).Equal(want)
+	gt.Value(t, obs.get("process")).Equal(want)
+
+	stored, err := repo.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.Value(t, stored.Metadata).Equal(want)
+}
+
+// On a SpawnChild, Effect/Parent metadata is the PARENT's; the child's own is
+// SpawnRequest.Metadata. Conflating them would scope a child by its parent.
+func TestSpawnParentMetadataIsDistinctFromChilds(t *testing.T) {
+	ctx := context.Background()
+	obs := newMapCapture()
+
+	spawnMW := func(next agentkit.SpawnHandler) agentkit.SpawnHandler {
+		return func(c context.Context, req *agentkit.SpawnRequest) (agentkit.ProcessID, error) {
+			obs.put("spawn.effect", req.Effect.Metadata)
+			obs.put("spawn.child", req.Metadata)
+			return next(c, req)
+		}
+	}
+	initMW := func(next agentkit.InitHandler) agentkit.InitHandler {
+		return func(c context.Context, req *agentkit.InitRequest) (*agentkit.InitResult, error) {
+			if req.Parent != nil {
+				obs.put("init.parent", req.Parent.Metadata)
+			}
+			return next(c, req)
+		}
+	}
+
+	k, repo, parent, _ := setupMetadataParent(t,
+		agentkit.WithSpawnMiddleware(spawnMW),
+		agentkit.WithInitMiddleware(initMW))
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"},
+		agentkit.WithMetadata(map[string]string{"tenant": "acme"}))
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	gt.Value(t, obs.get("spawn.effect")).Equal(map[string]string{"tenant": "acme"})
+	gt.Value(t, obs.get("init.parent")).Equal(map[string]string{"tenant": "acme"})
+	gt.Value(t, obs.get("spawn.child")).Equal(map[string]string{"tenant": "child-co"})
+}

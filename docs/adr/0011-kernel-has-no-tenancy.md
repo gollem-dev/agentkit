@@ -8,9 +8,11 @@ agentkit has no tenant, scope, or environment abstraction. There is no
 Applications that need a tenant context propagate it themselves, by any of:
 
 - `WithMetadata(map[string]string)` at spawn, readable as `Process.Metadata` by
-  a `ToolFactory` (this is the intended path for infrastructure-facing scope).
-  `SpawnChild` copies the parent's map when the caller names none, so a child
-  runs under its parent's scope by default; naming one replaces it outright;
+  a `ToolFactory`, as `EffectContext.Metadata` by middleware, and through
+  `Syscalls.Metadata()` by a strategy (this is the intended path for
+  infrastructure-facing scope). `SpawnChild` copies the parent's map when the
+  caller names none, so a child runs under its parent's scope by default; naming
+  one replaces it outright;
 - the `context.Context` passed to `Serve`, for process-independent dependencies;
 - the strategy's own typed `Input`, folded into state by `Init`;
 - the application's own storage, keyed by `ProcessID`.
@@ -26,9 +28,15 @@ decide what it means.
 ## Decision
 
 Drop the layer. Dependencies are injected at `New` (positional and optional, per
-ADR-0005), and anything that must vary per process is derived inside the
-caller's own `ToolFactory` or `gollem.LLMClient`, both of which can dispatch
-dynamically.
+ADR-0005), and an infrastructure dependency that must vary per process — which
+database client, which model — is derived inside the caller's own `ToolFactory`
+or `gollem.LLMClient`, both of which can dispatch dynamically.
+
+Middleware and strategies can read `Metadata` too (`EffectContext.Metadata`,
+`Syscalls.Metadata()`), which is what lets a cross-cutting concern scope itself
+without holding a `Repository`. That does not make it the channel for a
+strategy's own control flow: data the strategy branches on belongs in its typed
+`Input`, which the compiler checks.
 
 **A child inherits the map unless the caller replaces it.** Copying is not
 interpreting: the kernel moves the whole map without reading a key, which is the
@@ -52,7 +60,7 @@ rule about what keys mean.
 | | `Input` (via `Init`) | `Metadata` (via `WithMetadata`) |
 |---|---|---|
 | Lifetime | folded into `State`, transient | persisted on the process row |
-| Audience | the strategy | infrastructure (`ToolFactory`, a `Limiter`) |
+| Audience | the strategy | infrastructure (`ToolFactory`, a `Limiter`, middleware); also readable by a strategy via `Syscalls.Metadata()` |
 | Typing | typed `I` | `map[string]string` |
 
 This generalizes to a standing rule: **agentkit does not ship vocabulary it does
@@ -85,10 +93,19 @@ kind *is* the selector, and `ToolFactory(ctx, proc)` decides from `proc.Agent`.
 
 - **`Process.Metadata` is not a credential and must never be treated as one.**
   It is caller-supplied data stored verbatim. A `ToolFactory` reading
-  `metadata["tenant"]` is trusting whoever called `Spawn`. The caller must derive
-  that value server-side from an already-validated principal *before* spawning —
-  validate first, then establish scope, never the reverse. This warning belongs
-  in every document that mentions `Metadata`.
+  `metadata["tenant"]`, or a middleware branching on `EffectContext.Metadata`,
+  is trusting whoever called `Spawn`. The caller must derive that value
+  server-side from an already-validated principal *before* spawning — validate
+  first, then establish scope, never the reverse. This warning belongs in every
+  document that mentions `Metadata`.
+- **The two indirect paths clone; the ones holding a `*Process` do not.**
+  `EffectContext.Metadata` and `Syscalls.Metadata()` hand out a copy, because a
+  middleware is invited to rewrite the request it was given and must not reach
+  the Process through it. A `ToolFactory`, a `Limiter` and `Kernel.GetProcess`
+  all receive a live `*Process` instead — the `Repository` contract does not
+  promise a copy either. Those are read-only by convention, not by
+  construction: a `Limiter` writing to `proc.Metadata` is writing to the very
+  row the transition is about to commit.
 - Multi-tenant deployments do slightly more wiring, in exchange for agentkit not
   guessing their model.
 - `RootID` is available for tree-wide correlation without any tenancy concept
@@ -103,4 +120,5 @@ kind *is* the selector, and `ToolFactory(ctx, proc)` decides from `proc.Agent`.
 | Date | Change |
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D4, D31, D42). |
+| 2026-07-26 | `Metadata` reaches middleware (`EffectContext.Metadata`) and strategies (`Syscalls.Metadata()`). Middleware is infrastructure but holds no `Repository`, so a cross-cutting concern had to read the Process back per effect or be wired in two stages; a strategy had no path to `Metadata` at all. Both read a clone. No new vocabulary: the map stays kernel-opaque and still is not a credential. |
 | 2026-07-26 | `SpawnChild` now copies the parent's `Metadata` when the caller names none (replacing, not merging, when one is named). Children previously started empty, so `planexec` — which spawns with no options — silently dropped the scope its own `ToolFactory` needed. |

@@ -16,6 +16,27 @@ type EffectContext struct {
 	// Attempt reports prior attempts at this transition that did not commit, so
 	// a middleware can tell a replayed effect from a first one.
 	Attempt AttemptInfo
+
+	// Metadata is a COPY of Process.Metadata — the same kernel-opaque map
+	// WithMetadata set at spawn and a ToolFactory reads. It is here so a
+	// cross-cutting concern (per-tenant rate limiting, an audit field) can be
+	// written as middleware, which holds no Repository and could otherwise only
+	// get at it by reading the Process back per effect. Nil when the Process has
+	// none.
+	//
+	// It is the one field that is copied rather than shared: writing to it
+	// affects neither the Process nor any other effect. On InitRequest.Parent it
+	// is the PARENT's metadata — the child's is SpawnRequest.Metadata. Those two
+	// hold equal content whenever the spawner named no metadata of its own, since
+	// the child inherits (ADR-0011); they remain separate copies, so a
+	// SpawnMiddleware editing SpawnRequest.Metadata to strip a key changes what
+	// the child gets without touching what this field reports about the parent.
+	//
+	// Metadata is caller-supplied DATA, not a credential. A middleware branching
+	// on Metadata["tenant"] is trusting whoever called Spawn; that value must
+	// have been derived server-side from an already-validated principal before
+	// the spawn (ADR-0011).
+	Metadata map[string]string
 }
 
 // This file defines the five next-chains the kernel calls out through: the
@@ -226,6 +247,17 @@ type GenerateRequest struct {
 	Tools        []gollem.Tool
 	Schema       *gollem.Parameter
 	LLMOptions   []gollem.GenerateOption
+
+	// LLMSessionOptions is passed verbatim to LLMClient.NewSession, after the
+	// options derived from the typed fields above. It is the escape hatch for
+	// session-scoped settings agentkit does not model itself — prompt cache,
+	// content-block middleware — so a new gollem SessionOption needs no change
+	// here to be reachable.
+	//
+	// A GenerateMiddleware appending to it applies one session setting across
+	// every agent from a single Kernel registration. See WithLLMSessionOptions
+	// for what "after" means when an option collides with a typed field.
+	LLMSessionOptions []gollem.SessionOption
 }
 
 // GenerateHandler performs one LLM call.

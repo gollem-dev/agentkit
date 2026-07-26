@@ -27,10 +27,12 @@ tree correlates under one id.
 
 `Process.Metadata` is an optional, kernel-opaque `map[string]string` set at
 spawn, meant for infrastructure — a `ToolFactory` deciding which database client
-to hand out, for instance. A child inherits its parent's unless the spawner names
-a different one, so a subtree runs under one scope by default. **It is data, not
-a credential:** derive it server-side from a validated principal before spawning,
-never trust it as proof of anything
+to hand out, for instance. Middleware reads the same map as
+`EffectContext.Metadata` and a strategy through `sys.Metadata()`; each gets its
+own copy, so writing to one changes nothing. A child inherits its parent's unless
+the spawner names a different one, so a subtree runs under one scope by default.
+**It is data, not a credential:** derive it server-side from a validated
+principal before spawning, never trust it as proof of anything
 ([ADR-0011](adr/0011-kernel-has-no-tenancy.md)).
 
 ## Strategy
