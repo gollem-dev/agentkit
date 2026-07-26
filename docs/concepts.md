@@ -204,9 +204,11 @@ See [persistence.md](persistence.md).
 - **`Event`** — an append-only record written durably inside the transition
   commit, carrying an `EventID`. Read per process with `ListEvents`, from the
   start or after an id you already have; delivering them anywhere is your job.
-- **Middleware** — `next`-chain hooks at `Init`, `Step`, `Generate`, `CallTool`
-  and `SpawnChild`, registered on the `Kernel`. Unlike the others, a middleware
-  can rewrite the request or refuse the call outright; nothing is persisted by
-  the framework, and it fires on replays too.
+- **Middleware** — `next`-chain hooks at `Claim`, `Init`, `Step`, `Generate`,
+  `CallTool` and `SpawnChild`, registered on the `Kernel`. Unlike the others, a
+  middleware can rewrite the request or refuse the call outright; nothing is
+  persisted by the framework, and it fires on replays too. `Claim` is the
+  outermost — it brackets a worker's whole run on one `Process`, so it is where a
+  trace span or a resource that must be released belongs.
 
 See [observability.md](observability.md).

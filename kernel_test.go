@@ -217,3 +217,78 @@ func TestCancelFiresFinishHandler(t *testing.T) {
 	calls, _ = rec.snapshot()
 	gt.Value(t, calls).Equal(1)
 }
+
+// A Process that suspended on a deadlined question carries that deadline as its
+// WakeAt. Now that WakeAt gates when a pending row may be claimed, Respond has
+// to clear it -- otherwise the answer would sit unread until the deadline it was
+// given to beat.
+func TestRespondClearsTheSuspendedWakeTime(t *testing.T) {
+	ctx := context.Background()
+	step := func(_ context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if aw, ok := sys.Await("q:1"); ok && aw.Status == agentkit.AwaitResponded {
+			return st, agentkit.Done([]byte("answered")), nil
+		}
+		far := sys.Now().Add(time.Hour)
+		return st, agentkit.Suspend[[]byte](
+			agentkit.Question("q:1", []byte("?"), agentkit.WithDeadline(far))), nil
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	waiting := serveUntil(t, k, repo, pid, 3*time.Second,
+		func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+	gt.NotNil(t, waiting.WakeAt) // the question's deadline
+
+	gt.NoError(t, k.Respond(ctx, pid, "q:1", []byte("yes")))
+
+	woken, err := repo.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.Value(t, woken.Status).Equal(agentkit.ProcessPending)
+	gt.Nil(t, woken.WakeAt)
+
+	// And it really is claimable now rather than an hour from now.
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+}
+
+// The other side of that trade: a Process already pending in retry backoff keeps
+// its wake time when a response arrives, so the answer waits out the remaining
+// backoff. Bounded by the backoff cap, and preferred over letting a Respond
+// erase the throttle on a Process that is failing.
+func TestRespondKeepsARetryBackoffWakeTime(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: doneStep()})
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+
+	// The state a failed transition leaves behind, with a question still open.
+	p, err := repo.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	backoff := time.Now().Add(time.Hour)
+	p.WakeAt = &backoff
+	p.StepAttempts = 1
+	aw := &agentkit.Await{
+		ProcessID: pid, Key: "q:1", Kind: agentkit.AwaitQuestion,
+		Status: agentkit.AwaitOpen, Question: []byte("?"), CreatedAt: time.Now(),
+	}
+	gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{
+		Processes: []*agentkit.Process{p}, Awaits: []*agentkit.Await{aw},
+	}))
+
+	gt.NoError(t, k.Respond(ctx, pid, "q:1", []byte("yes")))
+
+	after, err := repo.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.Value(t, after.Status).Equal(agentkit.ProcessPending)
+	gt.NotNil(t, after.WakeAt)
+	gt.Value(t, after.WakeAt.Unix()).Equal(backoff.Unix())
+}

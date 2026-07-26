@@ -1,6 +1,6 @@
 # Examples
 
-Six programs you can run. Each one is a complete `main` package, and each one
+Seven programs you can run. Each one is a complete `main` package, and each one
 is about a single thing agentkit does.
 
 > These live in their own Go module. Running them pulls in a Vertex AI client
@@ -15,7 +15,8 @@ is about a single thing agentkit does.
 | [`human-in-the-loop`](human-in-the-loop) | a strategy that suspends on a question and resumes from the answer |
 | [`durable-worker`](durable-worker) | submitting and executing in separate processes, and surviving a crash |
 | [`fanout`](fanout) | a planner that runs its tasks as parallel child processes |
-| [`middleware`](middleware) | wrapping all five kernel hooks with one registration each |
+| [`middleware`](middleware) | wrapping the five strategy and effect hooks with one registration each |
+| [`tracing`](tracing) | timing a claim, its transitions and its tool calls, and saving the result |
 
 ## Running them
 
@@ -182,9 +183,11 @@ See [bundled-strategies.md](../docs/bundled-strategies.md) and
 
 ## middleware
 
-A `next`-chain on each of the five points where the kernel calls out: `Init` and
+A `next`-chain on five of the six points where the kernel calls out: `Init` and
 `Step` at the strategy boundary, and `Generate`, `CallTool` and `SpawnChild` for
-the effects. The program's output is the trail they wrote.
+the effects. The sixth, `Claim`, wraps a whole claim rather than one call into
+caller code, and `tracing` is the example for it. The program's output is the
+trail they wrote.
 
 ```
 audit trail
@@ -224,6 +227,58 @@ value can call `Run` on it directly — which is why `tools` puts the enforcemen
 inside `Run`.
 
 See [ADR-0012](../docs/adr/0012-kernel-hooks-are-composable-middleware.md).
+
+## tracing
+
+A `Process` outlives any one worker, so there is no live span to hold open
+across a suspend. What there is, is the **claim**: one worker, one lease, one
+continuous stretch of work. `ClaimMiddleware` brackets exactly that, and the
+`ctx` it installs reaches the `ToolFactory` and every transition in the run.
+
+```
+agent_execute                        26.3ms
+  transition 1                          0.0ms
+  transition 2                         26.0ms
+    tool_exec lookup                     26.0ms
+  transition 3                          0.0ms
+  claim.outcome                         0.0ms
+```
+
+That tree is read back from the JSON the run saved, not from memory, so it also
+shows the save worked. The shape is: **a new trace per claim, saved when the
+claim ends, under `<process id>-<lease token>`.**
+
+Both halves of that are forced. A `gollem/trace` `Recorder` holds one trace, and
+starting a second on the same one attaches a child span instead — so a Recorder
+shared across claims would braid every Process running in parallel into one
+tree, and agentkit claims in parallel by default. The Recorder is therefore
+per-claim, while the `Repository` it saves to is a destination with no trace
+state and is built once. The id has to be unique per claim for the same reason
+the trace is: a per-Process id would have each claim overwrite the last file.
+Pairing the Process id with the lease token, which is minted fresh on every
+claim, keeps it unique and still says which Process it belongs to. The Process
+id is on the trace metadata as well, which is what a Repository writing to a
+database would key on.
+
+Three more things it is showing:
+
+- **Only agentkit's own spans are wired here.** The claim, the transitions and
+  the tool calls come from three middleware. `llm_call` does not: gollem's LLM
+  client reads the trace handler out of the `ctx` and emits its own. That is why
+  the handler goes in once, at the claim — and why running offline shows no
+  `llm_call`, since the offline stub is a mock session rather than a client.
+- **Tool spans have to be ours.** agentkit calls `tool.Run` directly instead of
+  going through gollem's agent loop, so nothing else would record them.
+- **Cleanup belongs in a `defer`.** The kernel recovers a panic *outside* the
+  middleware, so a panicking claim never returns to it — and that is exactly the
+  run whose trace you want. Ending the spans and saving from a `defer` is what
+  makes the failing case the one you can read afterwards.
+
+Times are measured, never inferred: two claims of one Process are two traces,
+each covering only what a worker really did. Correlate them by the `process_id`
+label rather than by drawing one span over the gap.
+
+See [observability.md](../docs/observability.md).
 
 ## Where to go next
 

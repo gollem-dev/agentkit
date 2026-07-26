@@ -45,6 +45,15 @@ Firestore, DynamoDB, an in-memory map.
    alone, and a claim never writes `step_attempts`. Only the atomic claim can
    observe which of the two it was, which is why this is the store's job and not
    the worker's (see ADR-0015).
+   A row is eligible when it is `pending` with `wake_at` unset or past, `waiting`
+   with `wake_at` past, or `running` with an expired lease. The two `wake_at`
+   conditions differ deliberately: a `pending` row without one is runnable now,
+   whereas a `waiting` row without one is waiting for a response and must never
+   wake by itself. Gating `pending` is what makes the worker's retry backoff
+   real. An implementation that claims a backed-off row anyway keeps every
+   durability guarantee, but loses the backoff and the throttle a refusing
+   `ClaimMiddleware` depends on — a Process refused on every claim would then be
+   re-offered as fast as the store is polled. It also fails `repotest`.
 5. Uniqueness is maintained on `idempotency_key`, on an open process's
    `Subject`, and on `(process_id, await_key)`. A violation writes nothing and
    returns `ErrConflict`.
@@ -91,8 +100,8 @@ conditional write, or a mutex around an immutable snapshot.
 - Implementers get a small, testable contract. `repository/repotest` is the
   executable form of the list above — `repotest.Run(t, factory)` covers Rev
   increment, cross-row atomicity, guards, both uniqueness domains, await upsert,
-  event ordering, claim eligibility (pending / waiting past `WakeAt` / expired
-  lease), fresh-token-per-claim, unclean-reclaim counting, attempt-counter
+  event ordering, claim eligibility (pending with no or a past `WakeAt` /
+  waiting past `WakeAt` / expired lease), fresh-token-per-claim, unclean-reclaim counting, attempt-counter
   round-trip, no-double-claim under 100-way concurrency, item 7's mutual
   linearizability of `ClaimNextProcess` against a racing `Apply`, and
   deep-copy-on-read. **Run it against any new implementation.**
@@ -116,4 +125,5 @@ conditional write, or a mutex around an immutable snapshot.
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D3, D34). |
 | 2026-07-21 | Contract item 4 gained the `unclean_reclaims` counting rule (ADR-0015). It belongs here rather than only in ADR-0015 because this is the contract a third-party `Repository` author implements against; without it they could conform to the letter and still leave crash replay unbounded. |
 | 2026-07-22 | Added contract item 7: `ClaimNextProcess` and `Apply` are mutually linearizable on the same `Process` row. It belongs here rather than only in ADR-0016 because it is a property of this SPI's `Rev` CAS itself, not of the eager-dispatch feature that first needed it stated explicitly — a third-party `Repository` could otherwise conform to items 1–6 and still let a claim and a racing `Apply` both succeed on one row. |
+| 2026-07-26 | Contract item 4 now gates a `pending` row on `wake_at` as well. The worker has always written a backoff there when requeueing a failed transition, but every implementation treated `pending` as unconditionally claimable — as the contract then said — so the backoff had no effect and a failing Process retried at poll speed. Recorded here because it is the claim predicate a third-party author implements. Source- and API-compatible, but a **behavioural** change to the contract: an implementation that does not follow it keeps its durability guarantees and behaves exactly as it did before, yet loses the retry backoff and the throttle a refusing `ClaimMiddleware` relies on, and no longer passes `repotest`. |
 | 2026-07-26 | `ListEvents` gained an `EventQuery` (exclusive `After` cursor, `Limit` cap), and contract item 6 now requires an implementation to round-trip `Event.ID` verbatim rather than assigning one (ADR-0019). Breaking for existing implementations: a new persisted column and a changed signature. Recorded here because this is the contract a third-party author implements against — an implementation that minted its own ids would satisfy every other item and still resume a caller at the wrong place. |

@@ -56,12 +56,13 @@ type EffectContext struct {
 	Limit LimitDecision
 }
 
-// This file defines the five next-chains the kernel calls out through: the
-// strategy boundary (Init, Step) and the effects a strategy performs (Generate,
-// CallTool, SpawnChild). A middleware receives the next handler and returns a
-// replacement, so it can observe, rewrite the request, or refuse by not calling
-// next. Registration is on the Kernel, so one registration covers every agent —
-// see the WithXMiddleware options.
+// This file defines the six next-chains the kernel calls out through: the
+// scheduling boundary (Claim), the strategy boundary (Init, Step) and the
+// effects a strategy performs (Generate, CallTool, SpawnChild). A middleware
+// receives the next handler and returns a replacement, so it can observe,
+// rewrite the request, or refuse by not calling next. Registration is on the
+// Kernel, so one registration covers every agent — see the WithXMiddleware
+// options.
 //
 // An effect handler may be called more than once (a retry charges twice, which
 // is the truth). StepHandler may not: see StepMiddleware.
@@ -89,6 +90,91 @@ type EffectContext struct {
 // any of them.
 //
 // See ADR-0012 for why this replaced the observation-only Observer hooks.
+
+// --- Claim ------------------------------------------------------------------
+
+// ClaimOutcome reports how one claim ended. It is not persisted anywhere; it
+// exists so a ClaimMiddleware learns what became of the Process it wrapped.
+type ClaimOutcome string
+
+const (
+	// ClaimRefused is the zero value: a middleware returned without calling next,
+	// so the claim never ran. The kernel never reports it — a refused claim is put
+	// back with a retry backoff and reported as ClaimRequeued, or as
+	// ClaimAbandoned if the store would not take the write. It is what an OUTER
+	// middleware sees returned from next.
+	ClaimRefused ClaimOutcome = ""
+	// ClaimFinished: the Process reached a terminal status during this claim.
+	ClaimFinished ClaimOutcome = "finished"
+	// ClaimSuspended: the Process committed as waiting.
+	ClaimSuspended ClaimOutcome = "suspended"
+	// ClaimRequeued: put back to pending with a backoff after a fault. The write
+	// is confirmed — a requeue the store refused is ClaimAbandoned instead.
+	ClaimRequeued ClaimOutcome = "requeued"
+	// ClaimReleased: the step budget was spent, so the Process went back to
+	// pending and is runnable now. This is the one outcome eager dispatch
+	// re-submits on, and like ClaimRequeued it is confirmed rather than attempted.
+	ClaimReleased ClaimOutcome = "released"
+	// ClaimAbandoned: this worker walked away without moving the row, because the
+	// lease was gone or a Repository call failed. A later claim recovers it —
+	// through the lease expiring, which the next claim counts as an unclean
+	// reclaim (ADR-0015), so a run of these is worth alerting on.
+	ClaimAbandoned ClaimOutcome = "abandoned"
+)
+
+// ClaimRequest is one claim: a worker holding one lease on one Process, about to
+// run a bounded run of transitions on it.
+//
+// A claim is the outermost scope the kernel owns, and the only one that brackets
+// the whole of a worker's work on a Process — ToolFactory construction, every
+// transition in the run, and the write that settles the row. It is therefore
+// where a per-claim resource is opened and closed, and where a ctx that must
+// reach all of that is installed.
+type ClaimRequest struct {
+	// Process is a copy taken at claim time, so writing to it changes nothing that
+	// gets committed — the commit is built from the original. LeaseOwner names the
+	// worker and LeaseToken is this claim's fence identity, unique per claim.
+	Process *Process
+}
+
+// ClaimHandler drives one claim to its end.
+type ClaimHandler func(ctx context.Context, req *ClaimRequest) (ClaimOutcome, error)
+
+// ClaimMiddleware wraps a ClaimHandler.
+//
+// The ctx it passes to next reaches the ToolFactory and every transition in the
+// claim, which is what makes it the place to install a per-claim trace handler
+// or logger. Three properties to design around:
+//
+// It must call next AT MOST ONCE, for the same reason a StepMiddleware must: the
+// first call settles the row, so a second would find it no longer running and
+// achieve nothing. The second call returns ErrInvalidRequest.
+//
+// It must call next SYNCHRONOUSLY and must not return before next has. This is
+// not a convention: the claim holds a lease for as long as next runs, and how
+// the row is settled is decided after the chain returns. A middleware that hands
+// next to a goroutine and returns early — a timeout wrapper is the tempting
+// shape — leaves the kernel asked to settle a row that is still being driven.
+// The kernel does not do it: it logs, abandons the frame and reports
+// ClaimAbandoned, letting the claim finish on its own. Bound a claim's work with
+// WithMaxStepsPerClaim and the ctx, not by outrunning next.
+//
+// Returning without calling next REFUSES the claim. The Process is put back to
+// pending with a retry backoff and is claimed again once that elapses — it is a
+// way to hold work off, not to drop it, and a middleware that refuses forever
+// re-refuses on every backoff. The step attempt counter is not charged, since no
+// Step ran.
+//
+// The ClaimOutcome a middleware returns is what an outer middleware sees, but
+// NOT what the scheduler acts on: the kernel reports what the claim actually did
+// to the row. A middleware cannot make eager dispatch re-submit a Process by
+// claiming the run was released.
+//
+// A panic — here, or in anything the claim calls that is not already covered by
+// the transition's own recovery — is turned into a claim failure and the Process
+// is put back. It does not reach serveLoop, which has no recovery and would take
+// the process down with the poll goroutine.
+type ClaimMiddleware func(next ClaimHandler) ClaimHandler
 
 // --- Init -------------------------------------------------------------------
 
@@ -359,6 +445,12 @@ type SpawnMiddleware func(next SpawnHandler) SpawnHandler
 
 // --- registration -----------------------------------------------------------
 
+// WithClaimMiddleware adds Claim middleware. Repeatable; the first registered is
+// the outermost. A nil element makes New return ErrInvalidConfig.
+func WithClaimMiddleware(mw ...ClaimMiddleware) KernelOption {
+	return func(c *kernelConfig) { c.claimMW = append(c.claimMW, mw...) }
+}
+
 // WithInitMiddleware adds Init middleware. Repeatable; the first registered is
 // the outermost. A nil element makes New return ErrInvalidConfig.
 func WithInitMiddleware(mw ...InitMiddleware) KernelOption {
@@ -387,10 +479,21 @@ func WithSpawnMiddleware(mw ...SpawnMiddleware) KernelOption {
 
 // --- chaining ---------------------------------------------------------------
 
-// The five function types are distinct, so a single generic chain helper cannot
+// The six function types are distinct, so a single generic chain helper cannot
 // express them; each is the same loop. A middleware that returns a nil handler
 // yields nil, which the call site reports as ErrInvalidConfig rather than
 // letting it panic.
+
+func chainClaim(mws []ClaimMiddleware, base ClaimHandler) ClaimHandler {
+	h := base
+	for i := len(mws) - 1; i >= 0; i-- {
+		h = mws[i](h)
+		if h == nil {
+			return nil
+		}
+	}
+	return h
+}
 
 func chainInit(mws []InitMiddleware, base InitHandler) InitHandler {
 	h := base

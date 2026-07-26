@@ -77,9 +77,21 @@ func ServeConfigForTest(opts ...ServeOption) (pollConcurrency, maxConcurrent int
 	return c.pollConcurrency, c.maxConcurrent
 }
 
+// RetryBackoffForTest resolves ServeOptions to the backoff curve in force, so a
+// test can assert both the default and what WithRetryBackoff put there.
+func RetryBackoffForTest(opts ...ServeOption) RetryBackoff {
+	return newServeConfig(opts).retryBackoff
+}
+
 // MaxStepsPerClaimForTest resolves ServeOptions to the clamped maxStepsPerClaim.
 func MaxStepsPerClaimForTest(opts ...ServeOption) int {
 	return newServeConfig(opts).maxStepsPerClaim
+}
+
+// RunClaimForTest drives an already-claimed Process through runClaim, so a test
+// can assert the ClaimOutcome the kernel reports without racing a Serve loop.
+func (k *Kernel) RunClaimForTest(ctx context.Context, proc *Process, opts ...ServeOption) ClaimOutcome {
+	return k.runClaim(ctx, newServeConfig(opts), proc)
 }
 
 // ClaimSpecificForTest exposes claimSpecific (the eager claim path) so a test can
