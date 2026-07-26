@@ -78,6 +78,12 @@ type strategy struct {
 
 func (s *strategy) Version() int { return 1 }
 
+// Limit is where this agent's budget would go. This example has none, and
+// LimitPass is how a strategy says so.
+func (s *strategy) Limit(context.Context, *agentkit.Process, agentkit.Metrics) agentkit.LimitDecision {
+	return agentkit.LimitPass()
+}
+
 // Init runs inside Spawn, purely, so a bad input is an error the caller gets
 // synchronously rather than a Process that fails later.
 func (s *strategy) Init(in input) (state, error) {

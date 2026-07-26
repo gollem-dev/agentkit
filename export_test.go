@@ -16,6 +16,17 @@ func (b StrategyBinding) EncodeForTest(st any) ([]byte, error)         { return 
 func (b StrategyBinding) DecodeForTest(v int, raw []byte) (any, error) { return b.decode(v, raw) }
 func (b StrategyBinding) VersionForTest() int                          { return b.version }
 
+// LimitForTest exposes the Limit method value BindStrategy carried over.
+func (b StrategyBinding) LimitForTest(ctx context.Context, proc *Process, m Metrics) LimitDecision {
+	return b.limit(ctx, proc, m)
+}
+
+// CallLimitForTest exposes callLimit, the boundary wrapper that turns a panicking
+// Limit into a transition error.
+func CallLimitForTest(ctx context.Context, f Limiter, proc *Process, m Metrics) (LimitDecision, error) {
+	return callLimit(ctx, f, proc, m)
+}
+
 // HasFinishForTest reports whether a completion handler was registered.
 func (b StrategyBinding) HasFinishForTest() bool { return b.finish != nil }
 

@@ -21,7 +21,6 @@ type Kernel struct {
 	models       map[ModelRole]gollem.LLMClient
 	agents       *Registry
 	toolFactory  ToolFactory
-	limiter      Limiter
 	initMW       []InitMiddleware
 	stepMW       []StepMiddleware
 	generateMW   []GenerateMiddleware
@@ -40,7 +39,6 @@ type Kernel struct {
 type kernelConfig struct {
 	roleBindings []roleBinding
 	toolFactory  ToolFactory
-	limiter      Limiter
 	initMW       []InitMiddleware
 	stepMW       []StepMiddleware
 	generateMW   []GenerateMiddleware
@@ -69,11 +67,6 @@ func WithModelRole(role ModelRole, client gollem.LLMClient) KernelOption {
 // WithToolFactory sets the tool factory. Default: none (no tools).
 func WithToolFactory(f ToolFactory) KernelOption {
 	return func(c *kernelConfig) { c.toolFactory = f }
-}
-
-// WithLimiter sets the limiter. Default: none (unlimited).
-func WithLimiter(f Limiter) KernelOption {
-	return func(c *kernelConfig) { c.limiter = f }
 }
 
 // WithLogger sets the logger. Default: slog.Default().
@@ -145,7 +138,6 @@ func New(repo Repository, model gollem.LLMClient, agents *Registry, opts ...Kern
 		models:       models,
 		agents:       agents,
 		toolFactory:  cfg.toolFactory,
-		limiter:      cfg.limiter,
 		initMW:       cfg.initMW,
 		stepMW:       cfg.stepMW,
 		generateMW:   cfg.generateMW,

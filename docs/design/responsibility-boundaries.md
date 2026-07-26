@@ -18,7 +18,7 @@ exists to name them.
 | A human approves a sensitive action | **tool author** | a syscall-level gate is not enforceable |
 | Data formats round-trip correctly | **caller / strategy author** | the kernel never parses caller data |
 | Tenant isolation | **application** | the kernel has no tenancy concept |
-| Cost limits | **application** (`Limiter`) | pricing is not kernel knowledge |
+| Cost limits | **strategy author** (`Strategy.Limit`) | pricing is not kernel knowledge |
 | Audit durability before an action | **tool author** | middleware runs inline and is not a journal |
 | Event delivery to channels | **application** | delivery couples to the store |
 | Follow-up work after a run that must not be lost | **strategy author** (a parent process) | a completion handler runs after the commit, so a crash can drop it |
@@ -108,8 +108,8 @@ Middleware sees the same map as `EffectContext.Metadata`, and a strategy through
 `Syscalls.Metadata()`; the warning above applies unchanged at both. Widening the
 readership does not make the value any more trustworthy — it only saves reading
 the Process back. Those two paths hand out a clone, so neither can edit what the
-kernel commits or what the next effect sees. A `ToolFactory` and a `Limiter` are
-different: they hold a live `*Process`, and for the `Limiter` that is the very
+kernel commits or what the next effect sees. A `ToolFactory` and `Strategy.Limit`
+are different: they hold a live `*Process`, and for `Limit` that is the very
 row the transition is about to commit. Read it; do not write to it.
 
 The map also descends: `SpawnChild` copies the parent's unless the spawner names
@@ -142,7 +142,7 @@ Beyond the above:
 - **Verify your `Repository` with `repotest.Run`.** The kernel's correctness
   rests on that contract. An implementation that has not been run against the
   suite is unverified, however plausible it looks.
-- **Keep the `Limiter` cheap.** It runs before every effect and at every
+- **Keep `Limit` cheap.** It runs before every effect and at every
   transition boundary.
 - **Keep middleware non-blocking and duplicate-tolerant.** It runs inline on
   the transition path and fires on replays.

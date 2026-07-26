@@ -22,7 +22,7 @@ change.
 | [0007](0007-kernel-neutral-to-serialization.md) | The kernel is neutral to serialization |
 | [0008](0008-three-await-kinds-confirmation-is-a-question.md) | Three await kinds; confirmation is a question |
 | [0009](0009-child-processes-committed-atomically.md) | Child processes commit atomically with the transition |
-| [0010](0010-limiter-is-one-function.md) | Execution limits are one Limiter function |
+| [0010](0010-limiter-is-one-function.md) | Execution limits are the strategy's Limit method |
 | [0011](0011-kernel-has-no-tenancy.md) | The kernel has no tenancy concept |
 | [0012](0012-kernel-hooks-are-composable-middleware.md) | Kernel hooks are composable middleware |
 | [0013](0013-os-metaphor-naming.md) | OS-metaphor naming |

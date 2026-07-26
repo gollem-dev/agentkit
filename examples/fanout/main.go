@@ -88,26 +88,6 @@ func newFanout(ctx context.Context, w io.Writer, maxLLMCalls int) (*agentkit.Ker
 		return nil, none, goerr.Wrap(err, "new task llm")
 	}
 
-	reg := agentkit.NewRegistry()
-	worker, err := simple.Register(reg, taskAgent, 1,
-		simple.WithSystemPrompt("Answer the task in two sentences."))
-	if err != nil {
-		return nil, none, goerr.Wrap(err, "register task worker")
-	}
-
-	// planexec is generic over the task agent's input type: makeInput adapts a
-	// planned task into whatever that agent takes, so any Agent[T] can be one.
-	researcher, err := planexec.Register(reg, plannerAgent, 1, worker,
-		func(spec planexec.TaskSpec) (simple.Input, error) {
-			return simple.Input{Prompt: spec.Prompt}, nil
-		},
-		planexec.WithMaxParallelTasks(3),
-		planexec.WithMaxRounds(2),
-	)
-	if err != nil {
-		return nil, none, goerr.Wrap(err, "register researcher")
-	}
-
 	// budget stops a Process that keeps calling the model. The metrics it sees
 	// are that Process's own spend plus every child that has finished, counted
 	// once each, so on a fan-out parent this is a budget for the subtree rather
@@ -126,6 +106,10 @@ func newFanout(ctx context.Context, w io.Writer, maxLLMCalls int) (*agentkit.Ker
 	// LimitStop takes the reason as a string rather than an error: the kernel is
 	// what turns it into ErrLimitExceeded or a Failure message, so a limiter
 	// never has to decide which error type to raise.
+	//
+	// The budget is registered per agent, because Limit is a Strategy method: the
+	// same closure goes to both agents here, but nothing forces that -- the
+	// planner and the task workers could each carry their own.
 	budget := func(_ context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
 		if m.LLMCalls >= int64(maxLLMCalls) {
 			return agentkit.LimitStop(fmt.Sprintf(
@@ -135,10 +119,31 @@ func newFanout(ctx context.Context, w io.Writer, maxLLMCalls int) (*agentkit.Ker
 		return agentkit.LimitPass()
 	}
 
+	reg := agentkit.NewRegistry()
+	worker, err := simple.Register(reg, taskAgent, 1,
+		simple.WithSystemPrompt("Answer the task in two sentences."),
+		simple.WithLimiter(budget))
+	if err != nil {
+		return nil, none, goerr.Wrap(err, "register task worker")
+	}
+
+	// planexec is generic over the task agent's input type: makeInput adapts a
+	// planned task into whatever that agent takes, so any Agent[T] can be one.
+	researcher, err := planexec.Register(reg, plannerAgent, 1, worker,
+		func(spec planexec.TaskSpec) (simple.Input, error) {
+			return simple.Input{Prompt: spec.Prompt}, nil
+		},
+		planexec.WithMaxParallelTasks(3),
+		planexec.WithMaxRounds(2),
+		planexec.WithLimiter(budget),
+	)
+	if err != nil {
+		return nil, none, goerr.Wrap(err, "register researcher")
+	}
+
 	k, err := agentkit.New(memory.New(), taskModel, reg,
 		agentkit.WithModelRole(planexec.RolePlanner, plannerModel),
 		agentkit.WithModelRole(planexec.RoleSummarizer, summarizerModel),
-		agentkit.WithLimiter(budget),
 	)
 	if err != nil {
 		return nil, none, goerr.Wrap(err, "new kernel")

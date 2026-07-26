@@ -6,7 +6,7 @@ Four separate mechanisms, easy to confuse. They differ in one property —
 | Mechanism | Durable? | Can stop execution? | For |
 |---|---|---|---|
 | `Metrics` | yes (on the process row) | no | usage accounting |
-| `Limiter` | — (a decision, not a record) | **yes** | budgets and caps |
+| `Strategy.Limit` | — (a decision, not a record) | **yes** | budgets and caps |
 | `Event` | yes (committed with the transition) | no | progress your application consumes |
 | Middleware | no (unless you persist something yourself) | **yes** | tracing, audit, cost accounting, redaction, tool policy |
 
@@ -41,12 +41,14 @@ whole tree spent. Two things follow: `proc.Metrics` on a process with children i
 a subtree figure rather than that one process's own spend, and a child still
 running is not in it yet.
 
-## Limiter
+## Limit
 
-The kernel measures; you decide. One closure, returning one of three verdicts:
+The kernel measures; your strategy decides. `Limit` is a required method on
+`Strategy`, returning one of three verdicts:
 
 ```go
-agentkit.WithLimiter(func(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+func (s *myStrategy) Limit(ctx context.Context, proc *agentkit.Process,
+    m agentkit.Metrics) agentkit.LimitDecision {
     switch {
     case m.LLMCalls >= 50:
         return agentkit.LimitStop("llm call budget exhausted")
@@ -57,7 +59,20 @@ agentkit.WithLimiter(func(ctx context.Context, proc *agentkit.Process, m agentki
     default:
         return agentkit.LimitPass()
     }
-})
+}
+```
+
+The bundled strategies take the same thing as an option, so you supply the policy
+without writing a strategy of your own:
+
+```go
+assistant, err := simple.Register(reg, "assistant", 1,
+    simple.WithLimiter(func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+        if m.LLMCalls >= 50 {
+            return agentkit.LimitStop("llm call budget exhausted")
+        }
+        return agentkit.LimitPass()
+    }))
 ```
 
 `LimitStop` refuses. Where the refusal surfaces depends on where the check ran:
@@ -75,22 +90,28 @@ into either form, so every refusal a strategy sees is an `ErrLimitExceeded` and
 execution continue — see [Telling the agent the budget is running
 out](#telling-the-agent-the-budget-is-running-out).
 
-No `Limiter` means unlimited.
+`LimitPass()` from every call means unlimited. There is no way to leave the
+question unanswered — that is why a forgotten budget can no longer read as no
+budget.
 
-Because the counters roll up, the same closure is a subtree budget on a fan-out
+Because the counters roll up, the same policy is a subtree budget on a fan-out
 parent — you do not need separate accounting keyed by `RootID`. The case to
 design around is that a parent can pass the check, spawn children that spend the
 rest of the budget, and trip on its next transition, ending above its own cap.
 The cap bounds what the parent goes on to do, not what its subtree already did.
 `examples/fanout` is written around exactly this.
 
-A `Limiter` is a **budget veto, not admission control**: it answers "may this
+`Limit` is a **budget veto, not admission control**: it answers "may this
 continue", and has no way to wait. Do not block in it for a rate-limit token —
 it runs on the transition hot path while the claim holds its lease, so waiting
 there turns a throttle into a lease expiry and an unclean reclaim. Work that has
 to wait belongs behind a timer await.
 
-A `Limiter` is not the only thing that ends a run without the strategy deciding
+A panic in `Limit` does not take the worker down. At the transition boundary it
+becomes a transition error and goes down the ordinary retry path, ending as
+`retry_exhausted` if it keeps happening.
+
+`Limit` is not the only thing that ends a run without the strategy deciding
 to. A process whose claims keep dying mid-transition finalizes as `failed` with
 `FailureUncleanReclaim` once it exceeds `WithMaxUncleanReclaims`. Read that code
 as a signal about your workers rather than about the strategy: `retry_exhausted`
@@ -98,31 +119,33 @@ means a strategy kept returning errors, whereas `unclean_reclaim` means the
 worker running it kept disappearing
 ([ADR-0015](adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
 
-Because it is a closure and not a table, policies that a static limit table
-cannot express are ordinary code — per-agent caps from `proc.Agent`, correlation
-across a tree from `proc.RootID`, rate limits from your own limiter (a tree
-budget needs none of that, since the counters already roll up):
+Because it is code and not a table, policies that a static limit table cannot
+express are ordinary code — a per-tenant budget from `proc.Metadata`, rate limits
+from your own limiter (a tree budget needs none of that, since the counters
+already roll up). A per-agent cap needs nothing at all: each agent registers with
+its own `Limit`.
 
 ```go
-agentkit.WithLimiter(func(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
-    if m.LLMCalls > budgetFor(proc.Agent) {
-        return agentkit.LimitStop("agent budget exhausted: " + string(proc.Agent))
+func (s *myStrategy) Limit(ctx context.Context, proc *agentkit.Process,
+    m agentkit.Metrics) agentkit.LimitDecision {
+    if m.LLMCalls > s.budgetFor(proc.Metadata["tenant"]) {
+        return agentkit.LimitStop("tenant budget exhausted")
     }
     // Ask, do not take: this runs more than once per effect, so drawing a token
     // here would charge several times for one call — and once for a call that
     // has already happened. Leave the drawing to whatever owns the bucket.
-    if !myRateLimiter.HasHeadroom(string(proc.RootID)) {
+    if !s.rateLimiter.HasHeadroom(string(proc.RootID)) {
         return agentkit.LimitStop("rate limited")
     }
     return agentkit.LimitPass()
-})
+}
 ```
 
 Two rules follow from how often it runs — roughly `1 + 2×effects` times per
 attempt:
 
 - **Read-only.** A call is an enquiry, not an acquisition. The same effect is
-  asked about more than once, and once after the work is done, so a `Limiter`
+  asked about more than once, and once after the work is done, so a `Limit`
   that consumes a token or charges a quota over-charges and then refuses work
   nobody performed.
 - **Cheap and non-blocking.** It is on the hot path and the claim holds its lease
@@ -135,7 +158,7 @@ are nearly out" while execution continues, and the agent decides what to do with
 that — wrap up, drop the expensive tools, put it in the next prompt.
 
 agentkit never acts on the message itself. Nothing reads it unless you ask for
-it, so a notice nobody looks at costs nothing beyond the `Limiter` call.
+it, so a notice nobody looks at costs nothing beyond the `Limit` call.
 
 **From a strategy**, through `Syscalls.LimitStatus()`:
 
@@ -151,7 +174,7 @@ func (s *strategy) Step(ctx context.Context, sys agentkit.Syscalls, st state) (s
 }
 ```
 
-The verdict tracks `sys.Metrics()`: the `Limiter` runs again after each effect is
+The verdict tracks `sys.Metrics()`: `Limit` runs again after each effect is
 counted, so reading it straight after a `Generate` reflects the tokens that
 `Generate` just spent. Do not fold it into checkpointed state — like `Now()`, it
 depends on how far the attempt got and does not reproduce on a replay.
@@ -170,7 +193,7 @@ agentkit.WithGenerateMiddleware(func(next agentkit.GenerateHandler) agentkit.Gen
 })
 ```
 
-A middleware wraps its own syscall's `Limiter` check, so `Effect.Limit` is the
+A middleware wraps its own syscall's `Limit` check, so `Effect.Limit` is the
 verdict from *before* this call, and it does not change while the handler runs —
 calling `next` and reading it again returns the same value. That is the right
 reading for prompt injection anyway: "the budget looked like this going into this
@@ -310,8 +333,8 @@ Properties to design around, all detailed in `middleware.go` and
 - **Nothing is persisted by the framework.** Whatever you want kept, you keep.
 - **A middleware is a real chokepoint, not a security gate.** `Generate`,
   `CallTool` and `SpawnChild` middleware is the outermost layer of its syscall —
-  it wraps the `Limiter` check and, for tool calls, name resolution and argument
-  validation — so it can refuse a call fail-closed and see a call the `Limiter`
+  it wraps the `Limit` check and, for tool calls, name resolution and argument
+  validation — so it can refuse a call fail-closed and see a call `Limit`
   later refuses. But `Syscalls.CallTool` is not the only path to a tool: a
   strategy holding a `gollem.Tool` value can call `Run` on it directly.
   Enforcement still belongs inside `Run` ([tools.md](tools.md)).
@@ -368,7 +391,7 @@ panic in it is recovered and logged rather than becoming a transition error.
   [Delivering a result](#delivering-a-result). Best-effort is the default answer;
   reach past it only when a miss actually costs something.
 - **Distributed tracing / metrics export / tool policy** → middleware.
-- **Enforcing a budget** → `Limiter`.
+- **Enforcing a budget** → `Strategy.Limit`.
 - **Reporting usage** → `Metrics`.
 
 ## Logging

@@ -127,6 +127,45 @@ func TestPlanExecE2E(t *testing.T) {
 	gt.Value(t, out.Summary[0]).Equal("combined summary")
 }
 
+// Limit is a required Strategy method, so planexec answers it even with no
+// budget configured. WithLimiter is how a caller supplies one, and it binds the
+// planner before it ever gets to plan.
+func TestPlanExecWithLimiter(t *testing.T) {
+	ctx := context.Background()
+	def := mockLLM(&gollem.Response{Texts: []string{"task complete"}, InputToken: 1, OutputToken: 1})
+	planner := mockLLM(jsonResponse(`{"tasks":[{"title":"T","prompt":"p"}]}`))
+	summarizer := mockLLM(&gollem.Response{Texts: []string{"s"}, InputToken: 1, OutputToken: 1})
+
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	task, err := simple.Register(reg, "task", 1)
+	gt.NoError(t, err)
+	makeInput := func(spec planexec.TaskSpec) (simple.Input, error) {
+		return simple.Input{Prompt: spec.Prompt}, nil
+	}
+	plan, err := planexec.Register(reg, "planner", 1, task, makeInput,
+		planexec.WithLimiter(func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+			return agentkit.LimitStop("no budget at all")
+		}))
+	gt.NoError(t, err)
+
+	k, err := agentkit.New(repo, def, reg,
+		agentkit.WithModelRole(planexec.RolePlanner, planner),
+		agentkit.WithModelRole(planexec.RoleSummarizer, summarizer),
+	)
+	gt.NoError(t, err)
+
+	pid, err := plan.Spawn(ctx, k, planexec.Input{Prompt: "write a report"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureLimitExceeded)
+	gt.Value(t, p.Failure.Message).Equal("no budget at all")
+	// The refusal happened at the boundary, before any planning ran.
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(0))
+}
+
 // TestRegisterValidation verifies the required-argument guard.
 func TestRegisterValidation(t *testing.T) {
 	reg := agentkit.NewRegistry()

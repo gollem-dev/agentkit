@@ -237,6 +237,12 @@ type coordinator struct {
 
 func (s *coordinator) Version() int { return 1 }
 
+// Limit is where this agent's budget would go. This example has none, and
+// LimitPass is how a strategy says so.
+func (s *coordinator) Limit(context.Context, *agentkit.Process, agentkit.Metrics) agentkit.LimitDecision {
+	return agentkit.LimitPass()
+}
+
 func (s *coordinator) Init(in input) (state, error) {
 	if in.Topic == "" {
 		return state{}, goerr.New("topic is required")

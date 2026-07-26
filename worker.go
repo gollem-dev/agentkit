@@ -266,18 +266,26 @@ func (k *Kernel) runClaim(ctx context.Context, cfg serveConfig, proc *Process) c
 		// The verdict is kept, not just tested: a notice seeds Syscalls.LimitStatus()
 		// for this transition, which is how a strategy learns the budget is running
 		// out before anything refuses it.
-		var limit LimitDecision
-		if k.limiter != nil {
-			d := k.limiter(ctx, proc, proc.Metrics)
-			if d.Kind() == LimitKindStop {
-				_ = k.finalize(ctx, proc, failWithMessage(FailureLimitExceeded, d.Message()),
-					claimToken, Metrics{})
-				return claimStopped
+		//
+		// Limit is the strategy's own method and this call is outside the recover in
+		// runTransition, so a panic is folded into the same retry path a failed
+		// transition takes. No effect has run yet, hence Metrics{}.
+		limit, lerr := callLimit(ctx, b.limit, proc, proc.Metrics)
+		if lerr != nil {
+			if proc.StepAttempts+1 > cfg.maxStepAttempts {
+				_ = k.finalize(ctx, proc, failWith(FailureRetryExhausted, lerr), claimToken, Metrics{})
+			} else {
+				k.requeueTransition(ctx, cfg, proc, claimToken, lerr, Metrics{})
 			}
-			limit = d
+			return claimStopped
+		}
+		if limit.Kind() == LimitKindStop {
+			_ = k.finalize(ctx, proc, failWithMessage(FailureLimitExceeded, limit.Message()),
+				claimToken, Metrics{})
+			return claimStopped
 		}
 
-		sys := newSyscalls(k, proc, toolList, hs, limit)
+		sys := newSyscalls(k, proc, toolList, hs, b.limit, limit)
 		rawState, dec, terr := k.runTransition(ctx, sys, b, proc)
 		if terr != nil {
 			// This transition did not commit; its buffered children are dropped.
@@ -527,7 +535,7 @@ func failWith(code FailureCode, err error) terminalMutator {
 }
 
 // failWithMessage is the form for a reason that was never an error to begin
-// with — a Limiter's, which is a string by design (the error type would be
+// with — a Limit verdict's, which is a string by design (the error type would be
 // discarded here anyway).
 func failWithMessage(code FailureCode, msg string) terminalMutator {
 	return func(p *Process) { p.Status = ProcessFailed; p.Failure = &Failure{Code: code, Message: msg} }

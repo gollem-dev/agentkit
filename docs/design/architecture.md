@@ -11,13 +11,12 @@ graph TB
     UC["Use case layer<br/>Spawn / Respond / Cancel"]
     RP["Repository impl<br/>(postgres, ...)"]
     TF["ToolFactory impl"]
-    LM["Limiter"]
     MW["Middleware<br/>(Init/Step/Generate/CallTool/Spawn)"]
   end
   subgraph ak["agentkit"]
     K["Kernel<br/>lifecycle API + Serve worker loop<br/>+ in-process eager dispatcher"]
     SC["Syscalls<br/>the only path to the world"]
-    SG["Strategy<br/>(strategy/simple, strategy/planexec, yours)"]
+    SG["Strategy<br/>(strategy/simple, strategy/planexec, yours)<br/>Step + Limit"]
   end
   subgraph gollem["gollem"]
     LC["LLMClient / Session"]
@@ -27,9 +26,8 @@ graph TB
   UC -->|"Agent[I].Spawn"| K
   RP -->|"New(repo, ...)"| K
   TF -->|WithToolFactory| K
-  LM -->|WithLimiter| K
   MW -->|"WithInitMiddleware / WithStepMiddleware /<br/>WithGenerateMiddleware / WithToolCallMiddleware /<br/>WithSpawnMiddleware"| K
-  K -->|"Step(ctx, sys, state)"| SG
+  K -->|"Step(ctx, sys, state)<br/>Limit(ctx, proc, metrics)"| SG
   SG --> SC
   SC -->|NewSession / Generate| LC
   SC -->|Run| GT
@@ -48,14 +46,15 @@ transactions (ADR-0004), and cost (ADR-0010).
 | `Repository` | interface | the application | yes |
 | `Strategy[S, I, O]` | interface | the agent author | yes (or use a bundled one) |
 | `ToolFactory` | function type | the application | no |
-| `Limiter` | function type | the application | no |
 | Middleware (`Init`/`Step`/`Generate`/`CallTool`/`Spawn`) | `next`-chain, repeatable | the application | no |
 
 `Repository` and `Strategy` are interfaces because both have several related
-operations that must move together. `ToolFactory` and `Limiter` are function
-types because each is a single decision best written as a closure — a stateful
-implementation passes a method value. Middleware is a fifth kind: unlike the
-other four it is chain-composable — each `WithXMiddleware` call is repeatable,
+operations that must move together — for `Strategy` that includes `Limit`, the
+budget decision, which belongs with the agent it bounds rather than in a Kernel
+slot someone can forget to fill (ADR-0010). `ToolFactory` is a function
+type because it is a single decision best written as a closure — a stateful
+implementation passes a method value. Middleware is a third kind: unlike the
+other two it is chain-composable — each `WithXMiddleware` call is repeatable,
 and registrations nest around one another instead of replacing a single slot
 ([ADR-0012](../adr/0012-kernel-hooks-are-composable-middleware.md)).
 
@@ -95,12 +94,12 @@ sequenceDiagram
   W->>R: ClaimNextProcess (mints a fresh LeaseToken)
   Note over W,R: triggered by a poll loop (as drawn) or by eager dispatch claiming this row via an Apply Rev-CAS instead (ADR-0016) — the rest is identical either way
   W->>R: settle any due awaits (timers, expired questions)
-  W->>W: Limiter check
+  W->>W: Limit check
   W->>S: DecodeState(version, bytes)
   W->>M: StepMiddleware(Step call)
   M->>S: Step(ctx, sys, state)
   S->>M: Generate / CallTool (via Syscalls)
-  Note over M: outermost layer — Limiter check,<br/>tool resolution, arg validation happen inside here
+  Note over M: outermost layer — Limit check,<br/>tool resolution, arg validation happen inside here
   M->>X: Generate / CallTool
   X-->>M: result
   M-->>S: result (Metrics recorded)
@@ -130,7 +129,7 @@ If the `Apply` does not happen, none of it happened. If it does, all of it did.
 
 A `Strategy` receives no `Repository`, no LLM client, and no tool list except
 through `Syscalls`. That single gateway is what makes metering universal: every
-`Generate`, `CallTool` and `SpawnChild` runs a `Limiter` check before and
+`Generate`, `CallTool` and `SpawnChild` runs a `Limit` check before and
 accumulates `Metrics` after, with no path around it (ADR-0010).
 
 `Syscalls` is assembled fresh per claim and holds the transition's buffers —

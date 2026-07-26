@@ -38,10 +38,10 @@ type EffectContext struct {
 	// the spawn (ADR-0011).
 	Metadata map[string]string
 
-	// Limit is the Limiter's most recent verdict, or the zero LimitDecision when
-	// there is no Limiter. Read it through Kind() and Message().
+	// Limit is the Strategy's most recent Limit verdict, starting with the one
+	// taken at the transition boundary. Read it through Kind() and Message().
 	//
-	// A middleware wraps its own syscall's Limiter check, so this carries the
+	// A middleware wraps its own syscall's Limit check, so this carries the
 	// verdict from BEFORE this call: the transition boundary's for a
 	// transition's first effect, the previous effect's after that. That is the
 	// useful reading — "the budget looked like this going into this call".
@@ -83,7 +83,7 @@ type EffectContext struct {
 // concern and belongs in the strategy. Observation is the well-served case:
 // InitInput[any] / StepState[any] always succeed.
 //
-// Effect middleware is the outermost layer of its syscall, wrapping the Limiter
+// Effect middleware is the outermost layer of its syscall, wrapping the Limit
 // check, tool resolution and argument validation — so a refused call reaches it
 // too, and a middleware that returns without calling next stops the call before
 // any of them.

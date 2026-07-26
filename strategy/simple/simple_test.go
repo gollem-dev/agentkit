@@ -124,6 +124,52 @@ func TestSimpleE2E(t *testing.T) {
 	gt.Number(t, p.Metrics.ToolCalls).GreaterOrEqual(int64(1))
 }
 
+// Limit is a required Strategy method, so simple has to answer it even when the
+// caller never asked for a budget. Without WithLimiter the answer is LimitPass,
+// and a run must not be affected by the check happening at all.
+func TestSimpleWithoutLimiterRunsUnbounded(t *testing.T) {
+	ctx := context.Background()
+	model, llmCount := mockLLM(&gollem.Response{Texts: []string{"done"}, InputToken: 1, OutputToken: 1})
+
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	assistant, err := simple.Register(reg, "assistant", 1)
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := assistant.Spawn(ctx, k, simple.Input{Prompt: "hello"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Number(t, *llmCount).Equal(1)
+}
+
+// WithLimiter is how a caller supplies the budget simple's Limit answers with.
+func TestSimpleWithLimiterStopsTheRun(t *testing.T) {
+	ctx := context.Background()
+	model, _ := mockLLM(&gollem.Response{Texts: []string{"done"}, InputToken: 1, OutputToken: 1})
+
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	assistant, err := simple.Register(reg, "assistant", 1,
+		simple.WithLimiter(func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+			return agentkit.LimitStop("no budget at all")
+		}))
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := assistant.Spawn(ctx, k, simple.Input{Prompt: "hello"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureLimitExceeded)
+	gt.Value(t, p.Failure.Message).Equal("no budget at all")
+}
+
 // TestSimpleEmptyPromptInitError verifies Init's empty-prompt rejection surfaces
 // synchronously from Spawn and creates no Process.
 func TestSimpleEmptyPromptInitError(t *testing.T) {

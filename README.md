@@ -25,7 +25,7 @@ lease, and a wait queue — nothing more.
 - **Child processes** — a strategy spawns children and waits for their results;
   the children and the parent's new state commit in one atomic write.
 - **Usage metering and limits** — token and tool usage accumulates on the
-  `Process`, and a `Limiter` decides when a run has had enough — or tells the
+  `Process`, and each strategy's `Limit` decides when a run has had enough — or tells the
   agent the budget is nearly gone and lets it finish on its own terms.
 - **Idempotent spawning** — an idempotency key or a `subject` prevents a retried
   request from starting a second run.
@@ -243,7 +243,7 @@ on the `Kernel`: `Init` and `Step` (the strategy boundary) and `Generate`,
 which makes this the place for audit, tracing, redaction, retry and tool policy.
 
 An effect middleware is the outermost layer of its syscall — it wraps the
-`Limiter` check, tool resolution and argument validation — so a refused call is
+`Limit` check, tool resolution and argument validation — so a refused call is
 visible to it too, and returning without calling `next` stops the call before
 any of them:
 

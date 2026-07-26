@@ -1,6 +1,11 @@
 package agentkit
 
-import "context"
+import (
+	"context"
+	"fmt"
+
+	"github.com/m-mizutani/goerr/v2"
+)
 
 // LimitKind is which of the three verdicts a LimitDecision carries.
 //
@@ -19,10 +24,10 @@ const (
 	LimitKindStop LimitKind = "stop"
 )
 
-// LimitDecision is a Limiter's verdict: one kind, plus the message that goes
+// LimitDecision is a Limit verdict: one kind, plus the message that goes
 // with it. Build it with LimitPass, LimitNotice or LimitStop.
 //
-// It is both what a Limiter returns and what a strategy observes through
+// It is both what Strategy.Limit returns and what a strategy observes through
 // Syscalls.LimitStatus(), so a field added here reaches readers without
 // changing any signature. The message is one field rather than a separate
 // reason and notice because a decision is exactly one kind: "stopped, and also
@@ -41,7 +46,7 @@ func LimitPass() LimitDecision { return LimitDecision{kind: LimitKindPass} }
 // LimitNotice continues but attaches a message for the strategy, which may read
 // it through Syscalls.LimitStatus() and act on it — put it in a prompt, drop
 // expensive tools, wrap up early. agentkit itself does none of that: a decision
-// nobody reads costs nothing beyond the Limiter call.
+// nobody reads costs nothing beyond the Limit call.
 //
 // An empty message is a LimitPass, so a LimitKindNotice always carries text and
 // a reader never has to test for both.
@@ -65,8 +70,8 @@ func LimitStop(reason string) LimitDecision {
 }
 
 // Kind reports which verdict this is. The zero LimitDecision reads as
-// LimitKindPass, so a Kernel with no Limiter needs no special case at the call
-// sites that read one.
+// LimitKindPass, so a reader holding one taken before any verdict was recorded
+// needs no special case.
 func (d LimitDecision) Kind() LimitKind {
 	if d.kind == "" {
 		return LimitKindPass
@@ -74,13 +79,14 @@ func (d LimitDecision) Kind() LimitKind {
 	return d.kind
 }
 
-// Message is the text the Limiter attached: the notice for LimitKindNotice, the
+// Message is the text Limit attached: the notice for LimitKindNotice, the
 // reason for LimitKindStop, and "" for LimitKindPass.
 func (d LimitDecision) Message() string { return d.message }
 
 // Limiter decides whether a Process may continue. Measurement (Metrics) is the
-// Kernel's job; the decision is the caller's closure. A nil Limiter means
-// unlimited.
+// Kernel's job; the decision is the strategy's, expressed as Strategy.Limit,
+// whose shape this type is (ADR-0010). It is also the argument type the bundled
+// strategies take to build that method from a caller's closure.
 //
 // It runs at three points: at each transition boundary, before every Generate,
 // CallTool and SpawnChild, and again after each of those has been metered. The
@@ -105,3 +111,25 @@ func (d LimitDecision) Message() string { return d.message }
 //     into a lease expiry and an unclean reclaim (ADR-0010, ADR-0015). Work that
 //     has to wait belongs behind a timer await.
 type Limiter func(ctx context.Context, proc *Process, metrics Metrics) LimitDecision
+
+// callLimit runs a strategy's Limit at the transition boundary, where
+// runTransition's recover is not yet in scope. Limit is strategy-author code, so
+// a panic there would otherwise take the worker goroutine down; it is converted
+// into a transition error carrying the same "strategy panic" message
+// runTransition produces, discriminated by the hook key.
+//
+// The other two call sites (checkLimit and meter) run inside runTransition and
+// are already covered. Wrapping them here too would not add protection; it would
+// change what the strategy sees. A recovered panic there would come back as the
+// syscall's own error, which a strategy may catch and carry on past — turning a
+// strategy panic into something other than a transition error, which is the one
+// meaning it has everywhere else.
+func callLimit(ctx context.Context, f Limiter, proc *Process, m Metrics) (d LimitDecision, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = goerr.New("strategy panic",
+				goerr.V("panic", fmt.Sprint(r)), goerr.V("hook", "Limit"))
+		}
+	}()
+	return f(ctx, proc, m), nil
+}

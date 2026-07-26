@@ -32,7 +32,7 @@ var (
 	ErrEventNotFound = goerr.New("event not found")
 	// ErrToolNotFound is returned by CallTool for an unknown tool name.
 	ErrToolNotFound = goerr.New("tool not found")
-	// ErrLimitExceeded is returned to a strategy when a Limiter stops execution
+	// ErrLimitExceeded is returned to a strategy when Limit stops execution
 	// before an effect runs.
 	ErrLimitExceeded = goerr.New("limit exceeded")
 	// ErrConflict is returned by Repository.Apply when a precondition (Rev CAS,

@@ -113,9 +113,10 @@ support.
   would appear at five points in the public API — the spine of the design, not a
   corner of it — which is too much to carve out of an invariant.
 - **Middleware around `Kernel.Respond` / `Kernel.Cancel` / `ToolFactory` /
-  `Limiter`.** The first two are called by the application itself, which already
-  has a service layer to put authorization and audit in. The last two are
-  already injected as function values and compose without kernel support.
+  `Strategy.Limit`.** The first two are called by the application itself, which
+  already has a service layer to put authorization and audit in. A `ToolFactory`
+  is an injected function value and `Limit` is the strategy's own method; both
+  compose in the code that supplies them, without kernel support.
   Middleware belongs only where the kernel owns the call site.
 - **Wrap a whole `runClaim` iteration (Step *plus* commit).** That would be a
   true transition span, but the loop carries retry, lease loss and conflict

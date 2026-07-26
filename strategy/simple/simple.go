@@ -31,6 +31,7 @@ type config struct {
 	role          agentkit.ModelRole
 	systemPrompt  string
 	maxIterations int
+	limiter       agentkit.Limiter
 	registerOpts  []agentkit.RegisterOption[Output]
 }
 
@@ -43,6 +44,15 @@ func WithSystemPrompt(p string) Option { return func(c *config) { c.systemPrompt
 // WithMaxIterations caps the number of LLM rounds. Default: 32. Exceeding it
 // finalizes as Fail(strategy_error).
 func WithMaxIterations(n int) Option { return func(c *config) { c.maxIterations = n } }
+
+// WithLimiter sets this agent's execution budget, which Strategy.Limit answers
+// with. Default: none, i.e. LimitPass at every check.
+//
+// This is a different question from WithMaxIterations: that one bounds this
+// strategy's own loop and is counted in checkpointed state, while a limiter sees
+// the kernel's counters — including every terminated child, so on a Process that
+// spawns, it is a budget for the subtree.
+func WithLimiter(f agentkit.Limiter) Option { return func(c *config) { c.limiter = f } }
 
 // WithOnFinish wires a completion handler for this agent. Delivery is
 // best-effort; see agentkit.WithOnFinish.
@@ -64,6 +74,7 @@ func Register(r *agentkit.Registry, name agentkit.AgentName, version int, opts .
 		role:          cfg.role,
 		systemPrompt:  cfg.systemPrompt,
 		maxIterations: cfg.maxIterations,
+		limiter:       cfg.limiter,
 	}, cfg.registerOpts...)
 }
 
@@ -89,9 +100,17 @@ type strategy struct {
 	role          agentkit.ModelRole
 	systemPrompt  string
 	maxIterations int
+	limiter       agentkit.Limiter
 }
 
 func (s *strategy) Version() int { return s.version }
+
+func (s *strategy) Limit(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+	if s.limiter == nil {
+		return agentkit.LimitPass()
+	}
+	return s.limiter(ctx, proc, m)
+}
 
 func (s *strategy) Init(in Input) (state, error) {
 	if in.Prompt == "" {
