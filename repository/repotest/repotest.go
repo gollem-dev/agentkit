@@ -32,6 +32,18 @@ func uniqueStr(prefix string) string {
 	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), n)
 }
 
+// mkEvent stands in for the kernel, which is what mints an Event's ID — the
+// suite drives Apply directly, so it has to supply one the same way.
+func mkEvent(pid agentkit.ProcessID, typ agentkit.EventType, payload string) *agentkit.Event {
+	return &agentkit.Event{
+		ID:        agentkit.EventID(uniqueStr("event")),
+		ProcessID: pid,
+		Type:      typ,
+		Payload:   []byte(payload),
+		At:        time.Now(),
+	}
+}
+
 func mkProc(pid agentkit.ProcessID) *agentkit.Process {
 	now := time.Now()
 	return &agentkit.Process{
@@ -254,18 +266,129 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		pid := newPID()
 		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mkProc(pid)}}))
 
-		e1 := &agentkit.Event{ProcessID: pid, Type: agentkit.EventProcessCreated, Payload: []byte("1"), At: time.Now()}
-		e2 := &agentkit.Event{ProcessID: pid, Type: agentkit.EventAwaitCreated, Payload: []byte("2"), At: time.Now()}
+		e1 := mkEvent(pid, agentkit.EventProcessCreated, "1")
+		e2 := mkEvent(pid, agentkit.EventAwaitCreated, "2")
 		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Events: []*agentkit.Event{e1, e2}}))
-		e3 := &agentkit.Event{ProcessID: pid, Type: agentkit.EventProcessFinished, Payload: []byte("3"), At: time.Now()}
+		e3 := mkEvent(pid, agentkit.EventProcessFinished, "3")
 		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Events: []*agentkit.Event{e3}}))
 
-		events, err := repo.ListEvents(ctx, pid)
+		events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
 		gt.NoError(t, err)
 		gt.Array(t, events).Length(3)
 		gt.Value(t, string(events[0].Payload)).Equal("1")
 		gt.Value(t, string(events[1].Payload)).Equal("2")
 		gt.Value(t, string(events[2].Payload)).Equal("3")
+	})
+
+	// The ID is the handle a caller resumes from, so an implementation that
+	// mints or rewrites it would resume the caller at the wrong place.
+	t.Run("ListEventsRoundTripsID", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mkProc(pid)}}))
+
+		e1, e2 := mkEvent(pid, agentkit.EventProcessCreated, "1"), mkEvent(pid, agentkit.EventAwaitCreated, "2")
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Events: []*agentkit.Event{e1, e2}}))
+
+		events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
+		gt.NoError(t, err)
+		gt.Array(t, events).Length(2)
+		gt.Value(t, events[0].ID).Equal(e1.ID)
+		gt.Value(t, events[1].ID).Equal(e2.ID)
+		gt.Value(t, events[0].ID).NotEqual(events[1].ID)
+	})
+
+	t.Run("ListEventsCursor", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mkProc(pid)}}))
+
+		e1 := mkEvent(pid, agentkit.EventProcessCreated, "1")
+		e2 := mkEvent(pid, agentkit.EventAwaitCreated, "2")
+		e3 := mkEvent(pid, agentkit.EventProcessFinished, "3")
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Events: []*agentkit.Event{e1, e2, e3}}))
+
+		t.Run("after is exclusive", func(t *testing.T) {
+			events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{After: e1.ID})
+			gt.NoError(t, err)
+			gt.Array(t, events).Length(2)
+			gt.Value(t, string(events[0].Payload)).Equal("2")
+			gt.Value(t, string(events[1].Payload)).Equal("3")
+		})
+		t.Run("after the last event is empty, not an error", func(t *testing.T) {
+			events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{After: e3.ID})
+			gt.NoError(t, err)
+			gt.Array(t, events).Length(0)
+		})
+		t.Run("limit caps the count", func(t *testing.T) {
+			events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{Limit: 2})
+			gt.NoError(t, err)
+			gt.Array(t, events).Length(2)
+			gt.Value(t, string(events[1].Payload)).Equal("2")
+		})
+		t.Run("limit larger than the remainder returns the remainder", func(t *testing.T) {
+			events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{After: e2.ID, Limit: 99})
+			gt.NoError(t, err)
+			gt.Array(t, events).Length(1)
+		})
+		t.Run("limit <= 0 is uncapped", func(t *testing.T) {
+			events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{Limit: -1})
+			gt.NoError(t, err)
+			gt.Array(t, events).Length(3)
+		})
+		t.Run("an unknown cursor is ErrEventNotFound with no events", func(t *testing.T) {
+			events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{After: "no-such-event"})
+			gt.Error(t, err).Is(agentkit.ErrEventNotFound)
+			gt.Array(t, events).Length(0)
+		})
+	})
+
+	// A children await carries each child's usage, which is how a parent's
+	// Limiter sees what its subtree spent after a restart.
+	t.Run("ChildResultMetricsRoundTripAndDeepCopy", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mkProc(pid)}}))
+
+		key := agentkit.AwaitKey(uniqueStr("kids"))
+		kid := newPID()
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{
+			Awaits: []*agentkit.Await{{
+				ProcessID: pid, Key: key, Kind: agentkit.AwaitChildren,
+				Status: agentkit.AwaitResponded, Children: []agentkit.ProcessID{kid},
+				Results: []agentkit.ChildResult{{
+					ProcessID: kid,
+					Status:    agentkit.ProcessSucceeded,
+					Metrics:   agentkit.Metrics{agentkit.MetricLLMCalls: 3, agentkit.MetricInputTokens: 42},
+				}},
+				CreatedAt: time.Now(),
+			}},
+		}))
+
+		got, err := repo.ListAwaits(ctx, pid)
+		gt.NoError(t, err)
+		gt.Array(t, got).Length(1)
+		gt.Value(t, got[0].Results[0].Metrics[agentkit.MetricLLMCalls]).Equal(int64(3))
+		gt.Value(t, got[0].Results[0].Metrics[agentkit.MetricInputTokens]).Equal(int64(42))
+
+		// Reads deep-copy: mutating what we got back must not reach stored state.
+		got[0].Results[0].Metrics[agentkit.MetricLLMCalls] = 999
+		again, err := repo.ListAwaits(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, again[0].Results[0].Metrics[agentkit.MetricLLMCalls]).Equal(int64(3))
+	})
+
+	t.Run("ListEventsOnProcessWithNoEvents", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mkProc(pid)}}))
+
+		events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
+		gt.NoError(t, err)
+		gt.Array(t, events).Length(0)
+
+		_, err = repo.ListEvents(ctx, pid, agentkit.EventQuery{After: "any"})
+		gt.Error(t, err).Is(agentkit.ErrEventNotFound)
 	})
 
 	t.Run("ClaimPending", func(t *testing.T) {
@@ -600,7 +723,7 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		key := agentkit.AwaitKey(uniqueStr("await"))
 		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{
 			Awaits: []*agentkit.Await{{ProcessID: pid, Key: key, Kind: agentkit.AwaitQuestion, Status: agentkit.AwaitOpen, Response: []byte("orig"), CreatedAt: time.Now()}},
-			Events: []*agentkit.Event{{ProcessID: pid, Type: agentkit.EventProcessCreated, Payload: []byte("orig"), At: time.Now()}},
+			Events: []*agentkit.Event{mkEvent(pid, agentkit.EventProcessCreated, "orig")},
 		}))
 
 		awaits, err := repo.ListAwaits(ctx, pid)
@@ -609,7 +732,7 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		awaits[0].Status = agentkit.AwaitExpired
 		awaits[0].Response[0] = 'X'
 
-		events, err := repo.ListEvents(ctx, pid)
+		events, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
 		gt.NoError(t, err)
 		gt.Array(t, events).Length(1)
 		events[0].Payload[0] = 'X'
@@ -618,7 +741,7 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		gt.NoError(t, err)
 		gt.Value(t, a2[0].Status).Equal(agentkit.AwaitOpen)
 		gt.Value(t, string(a2[0].Response)).Equal("orig")
-		e2, err := repo.ListEvents(ctx, pid)
+		e2, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
 		gt.NoError(t, err)
 		gt.Value(t, string(e2[0].Payload)).Equal("orig")
 	})

@@ -176,7 +176,7 @@ func TestUC1_GenerateThenDone(t *testing.T) {
 	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(5))
 	gt.Value(t, p.Metrics[agentkit.MetricSteps]).Equal(int64(1))
 	gt.Value(t, *count).Equal(1)
-	events, _ := repo.ListEvents(ctx, pid)
+	events, _ := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
 	gt.Bool(t, hasEvent(events, agentkit.EventProcessCreated)).True()
 	gt.Bool(t, hasEvent(events, agentkit.EventProcessFinished)).True()
 }
@@ -291,7 +291,7 @@ func TestQuestionRoundtrip(t *testing.T) {
 
 	// Run until the Process is waiting on the question.
 	serveUntil(t, k, repo, pid, 3*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
-	events, _ := repo.ListEvents(ctx, pid)
+	events, _ := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
 	gt.Bool(t, hasEvent(events, agentkit.EventAwaitCreated)).True()
 
 	gt.NoError(t, k.Respond(ctx, pid, "q:1", []byte("yes"), agentkit.WithRespondedBy("slack:U1")))
@@ -1422,4 +1422,417 @@ func TestBothAttemptCountersCoexist(t *testing.T) {
 	// A successful commit clears both.
 	gt.Value(t, p.StepAttempts).Equal(0)
 	gt.Value(t, p.UncleanReclaims).Equal(0)
+}
+
+// setupMetricsTree registers a child that burns one LLM call and a parent that
+// spawns nChildren, waits for them, and finishes. repo is wrapped so a test can
+// intercept commits.
+func setupMetricsTree(t *testing.T, repo agentkit.Repository, nChildren int) (*agentkit.Kernel, agentkit.Agent[scriptInput]) {
+	t.Helper()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if _, e := sys.Generate(c, []gollem.Input{gollem.Text("hi")}); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			return st, agentkit.Done([]byte("kid")), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			ids := make([]agentkit.ProcessID, 0, nChildren)
+			for i := 0; i < nChildren; i++ {
+				id, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"})
+				if e != nil {
+					return st, agentkit.Decision[[]byte]{}, e
+				}
+				ids = append(ids, id)
+			}
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kids", ids...)), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	model, _ := mockLLM(textResponse("x"), textResponse("x"), textResponse("x"), textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+	return k, parent
+}
+
+// A Limiter on the parent has to see what the subtree spent, so a child's usage
+// is folded into the parent when the children await resolves.
+func TestChildMetricsFoldIntoParent(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	k, parent := setupMetricsTree(t, repo, 3)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessSucceeded
+	})
+
+	// Three children, one Generate each (mockLLM reports 5 in / 7 out per call).
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(3))
+	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(15))
+	gt.Value(t, p.Metrics[agentkit.MetricOutputTokens]).Equal(int64(21))
+	// The parent's own counters are still its own: it spawned 3 and never
+	// generated, so the LLM calls above came entirely from the fold.
+	gt.Value(t, p.Metrics[agentkit.MetricSpawns]).Equal(int64(3))
+}
+
+// Siblings finalize concurrently, but only the last one closes the await, so the
+// fold must not run once per sibling.
+func TestChildMetricsFoldOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	k, parent := setupMetricsTree(t, repo, 3)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessSucceeded
+	}, agentkit.WithPollConcurrency(4))
+
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(3))
+	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(15))
+}
+
+// A transition that does not commit leaves nothing behind, so the fold on the
+// retry is still the only one.
+func TestChildMetricsFoldSurvivesFailedCommit(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	repo := &hookRepo{Repository: base}
+	k, parent := setupMetricsTree(t, repo, 2)
+
+	// Reject the first Apply that carries the parent's resolved children await.
+	var rejected bool
+	repo.setFailApply(func(cs agentkit.ChangeSet) error {
+		for _, aw := range cs.Awaits {
+			if aw.Kind == agentkit.AwaitChildren && aw.Status == agentkit.AwaitResponded && !rejected {
+				rejected = true
+				return agentkit.ErrConflict
+			}
+		}
+		return nil
+	})
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessSucceeded
+	})
+
+	gt.Value(t, rejected).Equal(true)
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(2))
+	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(10))
+}
+
+// A children await with nothing in it resolves immediately and adds nothing.
+func TestChildMetricsFoldWithNoChildren(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kids")), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, err := agentkit.Register(reg, "solo", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessSucceeded
+	})
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(0))
+}
+
+// When every waited child is already terminal at declaration time the await is
+// resolved on the spot, without a later wakeParentIfComplete — a second place
+// the fold has to happen, and exactly once there too. The timer is what makes
+// the child terminal before the await is declared.
+func TestChildMetricsFoldOnDeclarationTimeElision(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if _, e := sys.Generate(c, []gollem.Input{gollem.Text("hi")}); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			return st, agentkit.Done([]byte("kid")), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	var kidID agentkit.ProcessID
+	var kidMu sync.Mutex
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		switch st.N {
+		case 0:
+			id, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"})
+			if e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			kidMu.Lock()
+			kidID = id
+			kidMu.Unlock()
+			st.N = 1
+			// Park until the child has certainly finished, so the next transition
+			// declares the children await over an already-terminal child.
+			return st, agentkit.Suspend[[]byte](agentkit.Timer("settle", sys.Now().Add(150*time.Millisecond))), nil
+		case 1:
+			kidMu.Lock()
+			id := kidID
+			kidMu.Unlock()
+			st.N = 2
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kids", id)), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	model, _ := mockLLM(textResponse("x"), textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessSucceeded
+	})
+
+	kidMu.Lock()
+	id := kidID
+	kidMu.Unlock()
+	kid, err := k.GetProcess(ctx, id)
+	gt.NoError(t, err)
+	gt.Value(t, kid.Status).Equal(agentkit.ProcessSucceeded)
+
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(5))
+	gt.Value(t, p.Metrics[agentkit.MetricOutputTokens]).Equal(int64(7))
+}
+
+// Folding is keyed to the child's own terminal transition, so naming the same
+// child from two different await keys counts it once. Keying the fold to the
+// await instead made this the case that double-counted.
+func TestChildMetricsFoldOncePerChildAcrossAwaitKeys(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if _, e := sys.Generate(c, []gollem.Input{gollem.Text("hi")}); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			return st, agentkit.Done([]byte("kid")), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	var kidMu sync.Mutex
+	var kidID agentkit.ProcessID
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		switch st.N {
+		case 0:
+			id, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"})
+			if e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			kidMu.Lock()
+			kidID = id
+			kidMu.Unlock()
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("first", id)), nil
+		case 1:
+			kidMu.Lock()
+			id := kidID
+			kidMu.Unlock()
+			st.N = 2
+			// A second await over the very same child. It resolves by elision, since
+			// the child is long terminal.
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("second", id)), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	model, _ := mockLLM(textResponse("x"), textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessSucceeded
+	})
+
+	// One child, one Generate. Two awaits naming it must not make it two.
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+	gt.Value(t, p.Metrics[agentkit.MetricInputTokens]).Equal(int64(5))
+	gt.Value(t, p.Metrics[agentkit.MetricOutputTokens]).Equal(int64(7))
+}
+
+// Same reasoning for a duplicate inside one spec.
+func TestChildMetricsFoldOnceWithDuplicateIDInOneAwait(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if _, e := sys.Generate(c, []gollem.Input{gollem.Text("hi")}); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			return st, agentkit.Done([]byte("kid")), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			id, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"})
+			if e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kids", id, id)), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	model, _ := mockLLM(textResponse("x"), textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessSucceeded
+	})
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+}
+
+// ADR-0009 permits spawning a child and never waiting on it. Its usage still has
+// to reach the parent, or a tree total is not a tree total.
+func TestChildMetricsFoldForAnUnwaitedChild(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if _, e := sys.Generate(c, []gollem.Input{gollem.Text("hi")}); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			return st, agentkit.Done([]byte("kid")), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		switch st.N {
+		case 0:
+			if _, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"}); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			st.N = 1
+			// Park long enough for the child to finish and report, without ever
+			// declaring a children await over it.
+			return st, agentkit.Suspend[[]byte](agentkit.Timer("settle", sys.Now().Add(200*time.Millisecond))), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	model, _ := mockLLM(textResponse("x"), textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessSucceeded
+	})
+	gt.Value(t, p.Metrics[agentkit.MetricLLMCalls]).Equal(int64(1))
+}
+
+// The Limiter is the reason the fold exists, so assert it actually observes the
+// folded total rather than only the row's own spend.
+func TestLimiterObservesFoldedChildMetrics(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if _, e := sys.Generate(c, []gollem.Input{gollem.Text("hi")}); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			return st, agentkit.Done([]byte("kid")), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			id1, e := child.SpawnChild(c, sys, scriptInput{Seed: "a"})
+			if e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			id2, e2 := child.SpawnChild(c, sys, scriptInput{Seed: "b"})
+			if e2 != nil {
+				return st, agentkit.Decision[[]byte]{}, e2
+			}
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kids", id1, id2)), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	var mu sync.Mutex
+	maxSeenOnParent := int64(-1)
+	limiter := func(_ context.Context, proc *agentkit.Process, m agentkit.Metrics) error {
+		if proc.Agent == "parent" {
+			mu.Lock()
+			if v := m[agentkit.MetricLLMCalls]; v > maxSeenOnParent {
+				maxSeenOnParent = v
+			}
+			mu.Unlock()
+		}
+		return nil
+	}
+
+	model, _ := mockLLM(textResponse("x"), textResponse("x"), textResponse("x"))
+	k, err := agentkit.New(repo, model, reg, agentkit.WithLimiter(limiter))
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessSucceeded
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	// The parent never generates; every call it sees belongs to its children.
+	gt.Value(t, maxSeenOnParent).Equal(int64(2))
 }

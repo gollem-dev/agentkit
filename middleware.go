@@ -26,7 +26,11 @@ type EffectContext struct {
 	//
 	// It is the one field that is copied rather than shared: writing to it
 	// affects neither the Process nor any other effect. On InitRequest.Parent it
-	// is the PARENT's metadata — the child's is SpawnRequest.Metadata.
+	// is the PARENT's metadata — the child's is SpawnRequest.Metadata. Those two
+	// hold equal content whenever the spawner named no metadata of its own, since
+	// the child inherits (ADR-0011); they remain separate copies, so a
+	// SpawnMiddleware editing SpawnRequest.Metadata to strip a key changes what
+	// the child gets without touching what this field reports about the parent.
 	//
 	// Metadata is caller-supplied DATA, not a credential. A middleware branching
 	// on Metadata["tenant"] is trusting whoever called Spawn; that value must

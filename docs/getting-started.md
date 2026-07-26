@@ -119,10 +119,12 @@ Two things to know before you build on it.
 
 **Delivery is best-effort.** The handler never fires twice, but if the worker
 dies between committing the terminal state and calling it, nothing retries and
-it never fires at all. If the follow-up work must not be lost, model it as a
-parent process waiting on `WaitChildren` instead — every step there is part of a
-committed transition. See
-[ADR-0014](adr/0014-completion-handlers-are-best-effort.md).
+it never fires at all. That is the right trade for most notifications; when it is
+not, [Delivering a result](observability.md#delivering-a-result) lays out the two
+durable tiers — a parent process on `WaitChildren` for follow-up that is itself
+agent work, and an outbox inside your own `Repository.Apply` for an external
+destination. See [ADR-0014](adr/0014-completion-handlers-are-best-effort.md) and
+[ADR-0018](adr/0018-durable-delivery-is-built-in-repository-apply.md).
 
 **It runs synchronously, on whichever instance committed the transition.** A
 slow handler delays that worker's next claim, so keep it short or hand off. For

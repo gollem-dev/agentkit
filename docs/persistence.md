@@ -67,7 +67,11 @@ the contract against a shared store.
 5. **Uniqueness holds** on `idempotency_key`, on an open process's `Subject`, and
    on `(process_id, await_key)`. A violation writes nothing and returns
    `ErrConflict`.
-6. **`ListEvents` preserves append order** per process.
+6. **`ListEvents` preserves append order** per process, **returns each event's
+   `ID` unchanged** (the kernel mints it; you store it), and honours the
+   `EventQuery`: `After` is an exclusive cursor and `Limit` caps the count. An
+   `After` the process has no event for is `ErrEventNotFound` and returns nothing
+   ([ADR-0019](adr/0019-events-are-addressable-and-reads-resume.md)).
 7. **Reads deep-copy.** A caller mutating a returned `*Process`, `*Await` or
    `*Event` must not be able to reach stored state.
 

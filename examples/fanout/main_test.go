@@ -112,26 +112,93 @@ func TestBudgetRefusesToSpawnChildren(t *testing.T) {
 }
 
 // TestBudgetIsNeverExceeded is the assertion that matters: the cap is a cap,
-// not "a cap plus one". The limiter runs before each call, so a Process must
-// never end up having made more calls than its budget allows.
+// not "a cap plus one". The limiter runs before each call, so a leaf Process
+// must never end up having made more calls than its budget allows.
+//
+// A fan-out parent is the case to read carefully. Its metrics absorb every
+// child once the children await resolves, so its recorded count can land above
+// the cap -- the subtree really did spend that much. What the cap still
+// guarantees there is that the parent stops: it cannot go on to make calls of
+// its own once the folded total is over the line.
 func TestBudgetIsNeverExceeded(t *testing.T) {
 	for _, budget := range []int{0, 1, 2, 3} {
 		k, proc := execute(t, budget)
 
-		gt.Number(t, proc.Metrics[agentkit.MetricLLMCalls]).LessOrEqual(int64(budget))
-
-		// Children carry their own budget, and it binds them too.
-		var out planexec.Output
-		if proc.Status != agentkit.ProcessSucceeded {
-			continue
-		}
-		gt.NoError(t, json.Unmarshal(proc.Output, &out))
-		for _, task := range out.Tasks {
-			child, err := k.GetProcess(context.Background(), task.ProcessID)
-			gt.NoError(t, err)
+		// Every leaf is bound directly, whether or not the parent survived: a
+		// child has no children of its own, so its count is its own spend and the
+		// limiter ran before each of those calls.
+		for _, child := range childrenOf(t, k, proc) {
 			gt.Number(t, child.Metrics[agentkit.MetricLLMCalls]).LessOrEqual(int64(budget))
 		}
+
+		if proc.Status != agentkit.ProcessSucceeded {
+			// Over budget is how an overspending subtree must end, and it is the
+			// limiter that has to end it -- not a strategy error or a crash.
+			gt.NotNil(t, proc.Failure)
+			// Either the limiter finalized it directly, or planexec surfaced the
+			// spawn it refused. Anything else means it died for another reason.
+			byLimiter := proc.Failure.Code == agentkit.FailureLimitExceeded ||
+				proc.Failure.Code == agentkit.FailureStrategyError
+			gt.Value(t, byLimiter).Equal(true)
+			continue
+		}
+		// A parent that still succeeded stayed within the cap for the whole tree.
+		gt.Number(t, proc.Metrics[agentkit.MetricLLMCalls]).LessOrEqual(int64(budget))
 	}
+}
+
+// TestParentMetricsCountEachChildExactlyOnce is the other half: the fold is what
+// makes a tree budget expressible with one per-Process Limiter, and it has to be
+// an equality -- a fold that ran twice would still satisfy ">=".
+func TestParentMetricsCountEachChildExactlyOnce(t *testing.T) {
+	k, proc := execute(t, defaultMaxLLMCalls)
+	gt.Value(t, proc.Status).Equal(agentkit.ProcessSucceeded)
+
+	children := childrenOf(t, k, proc)
+	gt.Array(t, children).Longer(0)
+
+	var childCalls, childIn, childOut int64
+	for _, child := range children {
+		childCalls += child.Metrics[agentkit.MetricLLMCalls]
+		childIn += child.Metrics[agentkit.MetricInputTokens]
+		childOut += child.Metrics[agentkit.MetricOutputTokens]
+	}
+	gt.Number(t, childCalls).Greater(int64(0))
+
+	// The planner's own calls are what remains once the children are subtracted,
+	// and it made at least one (it produced a plan).
+	ownCalls := proc.Metrics[agentkit.MetricLLMCalls] - childCalls
+	gt.Number(t, ownCalls).Greater(int64(0))
+	// Tokens have to subtract cleanly by the same accounting, which they cannot
+	// do if any child were folded in twice.
+	gt.Number(t, proc.Metrics[agentkit.MetricInputTokens]-childIn).Greater(int64(0))
+	gt.Number(t, proc.Metrics[agentkit.MetricOutputTokens]-childOut).Greater(int64(0))
+}
+
+// childrenOf reads the task children off the parent's children await, which
+// works whether or not the parent reached a successful Output.
+func childrenOf(t *testing.T, k *agentkit.Kernel, parent *agentkit.Process) []*agentkit.Process {
+	t.Helper()
+	awaits, err := k.ListAwaits(context.Background(), parent.ID)
+	gt.NoError(t, err)
+
+	var out []*agentkit.Process
+	seen := map[agentkit.ProcessID]bool{}
+	for _, aw := range awaits {
+		if aw.Kind != agentkit.AwaitChildren {
+			continue
+		}
+		for _, cid := range aw.Children {
+			if seen[cid] {
+				continue
+			}
+			seen[cid] = true
+			child, err := k.GetProcess(context.Background(), cid)
+			gt.NoError(t, err)
+			out = append(out, child)
+		}
+	}
+	return out
 }
 
 func TestRunSurfacesAFailedProcess(t *testing.T) {

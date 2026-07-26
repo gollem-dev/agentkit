@@ -155,7 +155,7 @@ func TestCancelPending(t *testing.T) {
 	gt.NoError(t, k.Cancel(ctx, pid, "user aborted"))
 	p, _ := repo.GetProcess(ctx, pid)
 	gt.Value(t, p.Status).Equal(agentkit.ProcessCancelled)
-	events, _ := repo.ListEvents(ctx, pid)
+	events, _ := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
 	gt.Bool(t, hasEvent(events, agentkit.EventProcessFinished)).True()
 	// cancelling a terminal process errors.
 	gt.Error(t, k.Cancel(ctx, pid, "again")).Is(agentkit.ErrProcessFinished)

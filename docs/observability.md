@@ -25,8 +25,12 @@ kernel cannot know; emitting a number it cannot compute correctly would be worse
 than emitting none. Derive cost from the token counters
 ([ADR-0010](adr/0010-limiter-is-one-function.md)).
 
-Metrics are **not** rolled up from children to parents. Each process meters
-independently, and `RootID` lets you aggregate a whole tree yourself.
+Children roll up into their parent. A child adds its totals to its parent's when
+it terminates — once, whether or not the parent ever waited on it — and since a
+child rolled up its own children the same way, a root ends up holding what the
+whole tree spent. Two things follow: `proc.Metrics` on a process with children is
+a subtree figure rather than that one process's own spend, and a child still
+running is not in it yet.
 
 ## Limiter
 
@@ -54,6 +58,19 @@ every transition boundary.** Nil means continue; non-nil means stop:
 
 No `Limiter` means unlimited.
 
+Because the counters roll up, the same closure is a subtree budget on a fan-out
+parent — you do not need separate accounting keyed by `RootID`. The case to
+design around is that a parent can pass the check, spawn children that spend the
+rest of the budget, and trip on its next transition, ending above its own cap.
+The cap bounds what the parent goes on to do, not what its subtree already did.
+`examples/fanout` is written around exactly this.
+
+A `Limiter` is a **budget veto, not admission control**: it answers "may this
+continue", and has no way to wait. Do not block in it for a rate-limit token —
+it runs on the transition hot path while the claim holds its lease, so waiting
+there turns a throttle into a lease expiry and an unclean reclaim. Work that has
+to wait belongs behind a timer await.
+
 A `Limiter` is not the only thing that ends a run without the strategy deciding
 to. A process whose claims keep dying mid-transition finalizes as `failed` with
 `FailureUncleanReclaim` once it exceeds `WithMaxUncleanReclaims`. Read that code
@@ -63,9 +80,9 @@ worker running it kept disappearing
 ([ADR-0015](adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
 
 Because it is a closure and not a table, policies that a static limit table
-cannot express are ordinary code — per-agent caps from `proc.Agent`, tree-wide
-budgets from `proc.RootID` plus your own store, rate limits from your own
-limiter:
+cannot express are ordinary code — per-agent caps from `proc.Agent`, correlation
+across a tree from `proc.RootID`, rate limits from your own limiter (a tree
+budget needs none of that, since the counters already roll up):
 
 ```go
 agentkit.WithLimiter(func(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) error {
@@ -92,18 +109,89 @@ The kernel emits three of its own: `process.created`, `process.finished`, and
 `await.created` (questions only — timers and children awaits are internal). Your
 own type names should avoid those three; it is a recommendation, not enforced.
 
-Read them back per process:
+Read them back per process, all at once or from where you left off:
 
 ```go
 events, err := kernel.ListEvents(ctx, pid)
+
+// Next time round, resume from the last id you saw.
+more, err := kernel.ListEvents(ctx, pid,
+    agentkit.WithAfterEvent(events[len(events)-1].ID),
+    agentkit.WithEventLimit(100))
 ```
 
-There is no global feed and no cursor API. Delivering events to Slack, a queue,
-or anywhere else is your application's job — tailing your own database is
-simpler than a delivery port every `Repository` implementation would have to
-support ([ADR-0012](adr/0012-kernel-hooks-are-composable-middleware.md)).
+Every event carries an `EventID` the kernel minted, which is what makes both
+resuming and deduplicating possible. A cursor the process has no event for is
+`ErrEventNotFound` rather than a silent restart — that error means your stored
+cursor went stale, and reading from the beginning again would look like a burst
+of new events ([ADR-0019](adr/0019-events-are-addressable-and-reads-resume.md)).
+
+There is still no global feed: ids order events within one process, not across
+them. Delivering events to Slack, a queue, or anywhere else is your
+application's job — tailing your own database is simpler than a delivery port
+every `Repository` implementation would have to support
+([ADR-0012](adr/0012-kernel-hooks-are-composable-middleware.md)).
 
 Payload bytes are stored verbatim; encoding is yours.
+
+## Delivering a result
+
+Three ways to act on a finished Process, in ascending order of what they cost
+and what they guarantee ([ADR-0018](adr/0018-durable-delivery-is-built-in-repository-apply.md)):
+
+| | Use when |
+|---|---|
+| `WithOnFinish` | losing the notification is acceptable — a dev channel ping, a metric, a log line |
+| a parent Process on `WaitChildren` | the follow-up is itself agent work |
+| an outbox row written inside your `Repository.Apply` | an external system must hear about it, and a duplicate is cheaper than a miss |
+
+The first is best-effort by construction: it runs right after the commit, so a
+crash in between loses it and nothing in your store records that anything was
+owed ([ADR-0014](adr/0014-completion-handlers-are-best-effort.md)). Reaching for
+a durable tier because a notification *might* matter is usually the wrong trade
+— most of them do not.
+
+The third works because you already own `Apply`. Add the row to the same write
+as the `ChangeSet`:
+
+```go
+func (r *Repo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	return r.inTx(ctx, func(tx *sql.Tx) error {
+		// ... the ChangeSet itself: Guards, Processes (Rev-CAS), Awaits, Events
+		for _, p := range cs.Processes {
+			if p.Status == agentkit.ProcessSucceeded || p.Status == agentkit.ProcessFailed {
+				// Key it by (ProcessID, Rev): at most one Apply succeeds per Rev,
+				// so a replayed transition cannot insert a second row.
+				if err := insertOutbox(ctx, tx, p); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+```
+
+Two properties of the `Repository` contract carry this, and `repotest` already
+checks both: the whole `ChangeSet` commits atomically, so the Process cannot go
+terminal without the row; and a `Rev` mismatch writes nothing, so `(ProcessID,
+Rev)` names one committed transition and stays stable across a replay.
+
+Write the payload while you are there. `cs.Processes` holds `Output` and
+`Failure`, whereas the kernel's `process.finished` event carries none — a relay
+that skipped this has to read the Process back.
+
+Then deliver from a separate process: claim a pending row, send, mark it
+delivered, and back off on failure. Alert on the age of the oldest pending row.
+
+What you do not get is exactly-once — no tier offers it. An outbox trades silent
+loss for duplicates you can see and suppress, so a destination without its own
+idempotency (`chat.postMessage`) still needs a dedup key or an update-by-`ts`
+scheme of yours.
+
+This needs your own `Repository`. `repository/filesystem` commits by renaming one
+snapshot file and `repository/memory` is not durable at all, so neither has
+anywhere to put the row.
 
 ## Middleware
 
@@ -196,6 +284,9 @@ panic in it is recovered and logged rather than becoming a transition error.
 - **A durable audit record that must exist before an action happens** → inside
   the tool's `Run`. Middleware runs inline and is not a journal.
 - **Progress your application reacts to** → `Emit`, then tail your own store.
+- **Telling something outside about a finished run** → pick a tier in
+  [Delivering a result](#delivering-a-result). Best-effort is the default answer;
+  reach past it only when a miss actually costs something.
 - **Distributed tracing / metrics export / tool policy** → middleware.
 - **Enforcing a budget** → `Limiter`.
 - **Reporting usage** → `Metrics`.

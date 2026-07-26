@@ -264,7 +264,7 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 	}
 	cs := ChangeSet{
 		Processes: []*Process{proc},
-		Events:    []*Event{{ProcessID: pid, Type: EventProcessCreated, At: now}},
+		Events:    []*Event{newEvent(pid, EventProcessCreated, "", nil, now)},
 	}
 	if err := k.repo.Apply(ctx, cs); err != nil {
 		// A uniqueness conflict on idempotency key means a concurrent Spawn won;
@@ -379,9 +379,33 @@ func (k *Kernel) ListAwaits(ctx context.Context, pid ProcessID) ([]*Await, error
 	return k.repo.ListAwaits(ctx, pid)
 }
 
-// ListEvents returns the Process's events in append order.
-func (k *Kernel) ListEvents(ctx context.Context, pid ProcessID) ([]*Event, error) {
-	return k.repo.ListEvents(ctx, pid)
+// ListEventsOption configures a ListEvents read. It resolves into the
+// EventQuery the Repository receives: options at the entry point (ADR-0005),
+// plain fields at the SPI.
+type ListEventsOption func(*EventQuery)
+
+// WithAfterEvent returns only the events appended after id, so a caller that
+// stored the last id it saw resumes there instead of re-reading the whole list.
+// An id this Process has no event for is ErrEventNotFound rather than a silent
+// restart from the beginning.
+func WithAfterEvent(id EventID) ListEventsOption {
+	return func(q *EventQuery) { q.After = id }
+}
+
+// WithEventLimit caps how many events are returned. n <= 0 means no cap.
+func WithEventLimit(n int) ListEventsOption {
+	return func(q *EventQuery) { q.Limit = n }
+}
+
+// ListEvents returns the Process's events in append order. With no options it
+// returns all of them; see WithAfterEvent and WithEventLimit to read
+// incrementally.
+func (k *Kernel) ListEvents(ctx context.Context, pid ProcessID, opts ...ListEventsOption) ([]*Event, error) {
+	var q EventQuery
+	for _, o := range opts {
+		o(&q)
+	}
+	return k.repo.ListEvents(ctx, pid, q)
 }
 
 // findAwait loads a single await by key. Absent -> ErrAwaitNotFound.

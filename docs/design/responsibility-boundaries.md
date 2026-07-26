@@ -112,6 +112,12 @@ kernel commits or what the next effect sees. A `ToolFactory` and a `Limiter` are
 different: they hold a live `*Process`, and for the `Limiter` that is the very
 row the transition is about to commit. Read it; do not write to it.
 
+The map also descends: `SpawnChild` copies the parent's unless the spawner names
+its own, so the whole subtree resolves tools under one scope. Since none of it is
+a credential, that is data propagation rather than privilege propagation — but a
+key you would not want a subagent's factory to read has to be stripped in a
+`SpawnMiddleware`, or kept out of the map.
+
 ## The strategy author's obligations
 
 Beyond the above:

@@ -177,6 +177,10 @@ type spawnConfig struct {
 	hasIdempotencyKey bool
 	subject           *SubjectRef
 	metadata          map[string]string
+	// hasMetadata separates "the caller named none" from "the caller named an
+	// empty one", which SpawnChild needs: the first inherits the parent's map,
+	// the second is how a caller says the child gets nothing.
+	hasMetadata bool
 }
 
 // WithIdempotencyKey makes Spawn return the existing Process's ID if one already
@@ -194,8 +198,13 @@ func WithSubject(ref SubjectRef) SpawnOption {
 
 // WithMetadata sets Process.Metadata (infrastructure-facing scope for ToolFactory;
 // not a credential — derive it server-side from a validated principal).
+//
+// On SpawnChild it REPLACES the parent's map rather than merging into it, and
+// omitting it inherits the parent's. Merging would leave a caller no way to drop
+// a key the parent carries; replacing makes both outcomes reachable, with an
+// empty map meaning "this child gets none".
 func WithMetadata(m map[string]string) SpawnOption {
-	return func(c *spawnConfig) { c.metadata = m }
+	return func(c *spawnConfig) { c.metadata = m; c.hasMetadata = true }
 }
 
 func newSpawnConfig(opts []SpawnOption) *spawnConfig {
@@ -410,10 +419,19 @@ func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts .
 	if cfg.hasIdempotencyKey {
 		return "", goerr.Wrap(ErrInvalidRequest, "WithIdempotencyKey is not allowed on SpawnChild (D48)")
 	}
+	// A child runs under its parent's infrastructure scope, so the map carries
+	// over when the caller named none — a ToolFactory keying off metadata["tenant"]
+	// behaves the same in the child as in the parent. The kernel copies it; it
+	// still never reads a key (ADR-0011). Inheritance happens before the chain, so
+	// a SpawnMiddleware sees the inherited map and can drop keys from it.
+	md := cfg.metadata
+	if !cfg.hasMetadata {
+		md = maps.Clone(s.proc.Metadata)
+	}
 	req := &SpawnRequest{
 		Effect:   s.ec(),
 		Agent:    agent,
-		Metadata: cfg.metadata,
+		Metadata: md,
 		Subject:  cfg.subject,
 		OnCommit: s.registerSpawnCommit,
 		input:    input,
@@ -493,12 +511,7 @@ func (s *syscalls) Emit(_ context.Context, typ EventType, payload []byte) error 
 	if payload == nil {
 		return goerr.Wrap(ErrInvalidRequest, "nil event payload")
 	}
-	s.pendingEvents = append(s.pendingEvents, &Event{
-		ProcessID: s.proc.ID,
-		Type:      typ,
-		Payload:   payload,
-		At:        s.k.clock(),
-	})
+	s.pendingEvents = append(s.pendingEvents, newEvent(s.proc.ID, typ, "", payload, s.k.clock()))
 	return nil
 }
 

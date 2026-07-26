@@ -124,12 +124,34 @@ rate limiting, a workspace id on an audit row — does not have to read the
 Process back. Those two get a copy. The `proc` above is not one: it is the live
 Process, so read it here and do not write to it.
 
+A child gets the same map too, so the factory above behaves the same for a
+subagent as for its parent — including the children `planexec` spawns, which pass
+no options of their own. Passing `WithMetadata` to `SpawnChild` replaces the
+inherited map rather than merging into it, and an empty map is how you say "this
+child gets none":
+
+```go
+// Inherits {"tenant": "acme"} from the parent.
+id, err := worker.SpawnChild(ctx, sys, in)
+
+// Gets exactly this, and nothing the parent carried.
+id, err := worker.SpawnChild(ctx, sys, in,
+    agentkit.WithMetadata(map[string]string{"tenant": "acme"}))
+```
+
+To strip a key on the way down rather than at every call site, do it in a
+`SpawnMiddleware`: inheritance runs before the chain, so `req.Metadata` is the
+inherited map and editing it reaches the child
+([ADR-0011](adr/0011-kernel-has-no-tenancy.md)).
+
 **`Metadata` is not a credential.** It is caller-supplied data stored verbatim,
 and the kernel neither interprets nor validates it. Reading it — here, in a
 middleware, or in a strategy — means trusting whoever called `Spawn`, which is
 only safe if the application derived that value server-side from an
 already-validated principal *before* spawning. Validate first, then establish
-scope; never load a scope from input and check it afterwards.
+scope; never load a scope from input and check it afterwards. Since a child
+inherits the map, anything you would not want a subagent's factory to read should
+not be in it.
 
 ## Errors and validation
 

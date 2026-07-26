@@ -109,9 +109,15 @@ func newFanout(ctx context.Context, w io.Writer, maxLLMCalls int) (*agentkit.Ker
 	}
 
 	// budget stops a Process that keeps calling the model. The metrics it sees
-	// are that Process's own -- committed plus what this run has accumulated --
-	// so this caps the planner and each child separately. A budget for the whole
-	// tree has to be your own accounting, keyed by proc.RootID.
+	// are that Process's own spend plus every child that has finished, counted
+	// once each, so on a fan-out parent this is a budget for the subtree rather
+	// than for the planner's own calls. A child's own limit binds it while it
+	// runs; the parent learns what a child cost when that child terminates.
+	//
+	// The consequence to design around: a parent can pass this check, spawn
+	// children that spend the rest of the budget, and then trip on its very next
+	// transition. That is the limiter working -- the tree really did spend it --
+	// but it means a parent's recorded MetricLLMCalls can end up above the cap.
 	//
 	// The comparison is >= because the limiter runs *before* the call it is
 	// deciding about: at maxLLMCalls calls already spent, the next one is the

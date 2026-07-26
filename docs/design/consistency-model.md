@@ -132,10 +132,12 @@ already terminal, writes the await as `responded` and keeps the process
 
 ### Two siblings finish at the same time
 
-Each child's finalize includes the parent's row in its change set — even when
-the wake is a no-op. Two concurrent finalizes therefore contend on the parent's
-`Rev`, one wins, the loser retries against fresh state and sees the sibling's
-result. Neither can conclude "someone else will wake the parent" and be wrong.
+Each child's finalize includes the parent's row in its change set — always, since
+that write also carries the child's metrics up (ADR-0010), and so even when the
+wake is a no-op or there is no await at all. Two concurrent finalizes therefore
+contend on the parent's `Rev`, one wins, the loser retries against fresh state
+and sees the sibling's result. Neither can conclude "someone else will wake the
+parent" and be wrong, and neither can lose its own metrics to the other's write.
 
 ### Two humans answer the same question
 
@@ -210,7 +212,8 @@ The non-negotiable parts:
   ([ADR-0015](../adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
 - Uniqueness holds on `idempotency_key`, on an open process's `Subject`, and on
   `(process_id, await_key)`.
-- `ListEvents` preserves append order.
+- `ListEvents` preserves append order, returns each event's kernel-assigned `ID`
+  unchanged, and honours the `EventQuery` cursor and cap.
 - Reads deep-copy, so a caller mutating a returned value cannot reach stored
   state.
 
