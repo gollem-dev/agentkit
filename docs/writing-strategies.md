@@ -190,6 +190,23 @@ Keeping `res.History` in your state is what makes the conversation survive a
 checkpoint. `WithSchema` requests structured JSON output; `WithLLMOptions` passes
 gollem's own generate options (temperature and friends) through.
 
+For settings that belong to the gollem *session* rather than to one generate —
+`gollem.WithSessionPromptCache`, the content-block middlewares — use
+`WithLLMSessionOptions`. They are appended after the options agentkit derives
+from `WithSystemPrompt`, `WithTools` and friends, so a scalar setting passed
+here overrides the typed one and a list setting adds to it. That ordering is
+what lets a `GenerateMiddleware` turn prompt caching on for every agent from a
+single `agentkit.New` registration:
+
+```go
+agentkit.WithGenerateMiddleware(func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+    return func(ctx context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+        req.LLMSessionOptions = append(req.LLMSessionOptions, gollem.WithSessionPromptCache(true))
+        return next(ctx, req)
+    }
+})
+```
+
 ## Persisting conversation history
 
 Threading `History` through your own state (above) works, but you write the
@@ -258,6 +275,15 @@ for _, call := range res.FunctionCalls {
 
 Arguments are validated against the tool's spec before it runs. An unknown tool
 name is `ErrToolNotFound`.
+
+## Reading the process-scoped map
+
+`sys.Metadata()` returns a copy of what `WithMetadata` set at spawn — the same
+map a `ToolFactory` reads. Reach for it when the value is infrastructure-facing
+(which workspace, which toolset) and the `ToolFactory` already keys off it;
+anything the strategy's own logic turns on belongs in its typed `Input` instead.
+**It is data, not a credential** — see
+[ADR-0011](adr/0011-kernel-has-no-tenancy.md) and [tools.md](tools.md).
 
 ## Waiting for a human
 

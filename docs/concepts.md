@@ -27,9 +27,11 @@ tree correlates under one id.
 
 `Process.Metadata` is an optional, kernel-opaque `map[string]string` set at
 spawn, meant for infrastructure — a `ToolFactory` deciding which database client
-to hand out, for instance. **It is data, not a credential:** derive it
-server-side from a validated principal before spawning, never trust it as proof
-of anything ([ADR-0011](adr/0011-kernel-has-no-tenancy.md)).
+to hand out, for instance. Middleware reads the same map as
+`EffectContext.Metadata` and a strategy through `sys.Metadata()`; each gets its
+own copy, so writing to one changes nothing. **It is data, not a credential:**
+derive it server-side from a validated principal before spawning, never trust it
+as proof of anything ([ADR-0011](adr/0011-kernel-has-no-tenancy.md)).
 
 ## Strategy
 

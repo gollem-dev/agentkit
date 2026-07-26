@@ -118,12 +118,18 @@ agentkit.WithToolFactory(func(ctx context.Context, proc *agentkit.Process) ([]go
 })
 ```
 
+The same map reaches middleware as `EffectContext.Metadata` and a strategy as
+`sys.Metadata()`, so a cross-cutting concern that needs the scope — per-tenant
+rate limiting, a workspace id on an audit row — does not have to read the
+Process back. Those two get a copy. The `proc` above is not one: it is the live
+Process, so read it here and do not write to it.
+
 **`Metadata` is not a credential.** It is caller-supplied data stored verbatim,
-and the kernel neither interprets nor validates it. Reading it here means
-trusting whoever called `Spawn` — which is only safe if the application derived
-that value server-side from an already-validated principal *before* spawning.
-Validate first, then establish scope; never load a scope from input and check it
-afterwards.
+and the kernel neither interprets nor validates it. Reading it — here, in a
+middleware, or in a strategy — means trusting whoever called `Spawn`, which is
+only safe if the application derived that value server-side from an
+already-validated principal *before* spawning. Validate first, then establish
+scope; never load a scope from input and check it afterwards.
 
 ## Errors and validation
 
