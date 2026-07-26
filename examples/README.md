@@ -245,7 +245,22 @@ agent_execute                        26.3ms
 ```
 
 That tree is read back from the JSON the run saved, not from memory, so it also
-shows the save worked. Three things it is showing:
+shows the save worked. The shape is: **a new trace per claim, saved when the
+claim ends, under `<process id>-<lease token>`.**
+
+Both halves of that are forced. A `gollem/trace` `Recorder` holds one trace, and
+starting a second on the same one attaches a child span instead — so a Recorder
+shared across claims would braid every Process running in parallel into one
+tree, and agentkit claims in parallel by default. The Recorder is therefore
+per-claim, while the `Repository` it saves to is a destination with no trace
+state and is built once. The id has to be unique per claim for the same reason
+the trace is: a per-Process id would have each claim overwrite the last file.
+Pairing the Process id with the lease token, which is minted fresh on every
+claim, keeps it unique and still says which Process it belongs to. The Process
+id is on the trace metadata as well, which is what a Repository writing to a
+database would key on.
+
+Three more things it is showing:
 
 - **Only agentkit's own spans are wired here.** The claim, the transitions and
   the tool calls come from three middleware. `llm_call` does not: gollem's LLM

@@ -340,8 +340,60 @@ Returning without calling `next` **refuses** the claim: the Process goes back to
 throttle (a circuit breaker, a staged rollout), not a way to drop work. It is
 not an authorization gate either — see below.
 
-`examples/tracing` wires all of this against gollem's own trace handler and
-saves the result.
+### One trace per claim, saved when the claim ends
+
+The pattern `examples/tracing` follows, against gollem's own trace handler:
+**open a trace inside the middleware, and save it on the way out under an id
+built from the Process id and the claim's lease token.**
+
+```go
+repo := gtrace.NewFileRepository(dir) // built once: a destination, not trace state
+
+agentkit.WithClaimMiddleware(func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
+    return func(ctx context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
+        proc := req.Process
+        rec := gtrace.New( // built per claim
+            gtrace.WithTraceID(string(proc.ID)+"-"+proc.LeaseToken),
+            gtrace.WithRepository(repo),
+            gtrace.WithMetadata(gtrace.TraceMetadata{
+                Labels: map[string]string{"process_id": string(proc.ID)},
+            }),
+        )
+        ctx = gtrace.WithHandler(ctx, rec) // gollem's LLM client picks this up itself
+        ctx = rec.StartAgentExecute(ctx)
+        defer func() { _ = rec.Finish(ctx) }() // see below on defer, and on failing quietly
+        return next(ctx, req)
+    }
+}),
+```
+
+Both halves are forced rather than stylistic:
+
+- **The recorder is per claim.** A `Recorder` holds one trace, and starting a
+  second on the same one attaches a child span instead of replacing it. Sharing
+  one would braid every concurrently claimed Process into a single tree, and
+  claims run in parallel (`WithMaxConcurrent`). The `Repository` it saves to has
+  no trace state, so that one is built once and shared.
+- **The id is per claim.** A store that keys by trace id — the bundled file one
+  writes `{dir}/{trace_id}.json` — would have each claim overwrite the last if
+  the id were the Process id alone. A lease token is minted fresh on every claim,
+  so pairing the two is unique and still names the Process. Put the Process id on
+  `Metadata.Labels` as well: `Repository.Save` receives the whole `*Trace`, so a
+  store writing to a database keys on that rather than parsing the id apart.
+
+Where the saving happens differs by backend, and it is the one thing to get
+right:
+
+| | What saves it | What to remember |
+|---|---|---|
+| `gollem/trace` recorder | `Finish` writes the whole tree through your `Repository` | Nothing is flushed at exit, so an unended span is still saved — as `duration: 0`, `status: ok`. A span you forget to close lies rather than going missing |
+| `gollem/trace/otel` | `span.End()` hands off to the `TracerProvider`'s span processor; `Finish` is a no-op | Call `tp.Shutdown` after `Serve` returns, or the last batch never leaves the process |
+
+Either way, end the span and save from a `defer`. A panicking claim never
+returns to the middleware — the kernel recovers it outside — and that is exactly
+the run whose trace is worth keeping. Saving must not fail the claim either:
+returning an error from here would put the Process back for a retry it does not
+need, so log it instead.
 
 ### What the request carries
 

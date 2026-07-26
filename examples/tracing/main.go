@@ -54,19 +54,37 @@ const agentName agentkit.AgentName = "librarian"
 
 // --- the three middleware that record the trace ------------------------------
 
-// claimTrace opens one trace per claim and saves it when the claim ends.
+// claimTrace opens one trace per claim and saves it when the claim ends, under
+// an id built from the Process id and this claim's lease token.
 //
-// One trace per CLAIM rather than per Process, for two reasons. A Process may be
-// claimed many times, and only a claim is a single continuous stretch of work,
-// so it is the honest unit to time. And the file repository writes one file per
-// trace id, so a per-Process id would have each claim overwrite the last.
+// One trace per CLAIM rather than per Process, for three reasons.
+//
+// It is the honest unit. A Process may be claimed many times; only a claim is a
+// single continuous stretch of work on one worker.
+//
+// It is also the only unit a Recorder can represent. A Recorder holds one trace,
+// and StartAgentExecute on a Recorder that already has one attaches a child span
+// instead of starting a second trace. Sharing one across claims would therefore
+// braid every concurrently claimed Process into a single tree — and agentkit
+// runs claims in parallel (WithMaxConcurrent defaults to 64). So the Recorder is
+// built here, inside the per-claim closure. The Repository holds no trace state
+// and is built once, outside it.
+//
+// And it keeps the saved artifacts distinct. The file repository writes one file
+// per trace id, so a per-Process id would have each claim overwrite the last.
+// Naming it "<process>-<lease token>" makes the id unique (a fresh lease token
+// is minted on every claim) while still saying which Process it belongs to
+// without opening the file. The process id is on Metadata.Labels too, which is
+// what a Repository writing to a database would key on rather than parsing the
+// id apart.
 func claimTrace(dir string, logger *log.Logger) agentkit.ClaimMiddleware {
+	// Shared by every claim: a Repository is a destination, not trace state.
 	repo := gtrace.NewFileRepository(dir)
 	return func(next agentkit.ClaimHandler) agentkit.ClaimHandler {
 		return func(ctx context.Context, req *agentkit.ClaimRequest) (agentkit.ClaimOutcome, error) {
 			proc := req.Process
+			// Per claim, never reused: see why on claimTrace.
 			rec := gtrace.New(
-				// LeaseToken is minted fresh on every claim, so this is unique.
 				gtrace.WithTraceID(string(proc.ID)+"-"+proc.LeaseToken),
 				gtrace.WithRepository(repo),
 				gtrace.WithMetadata(gtrace.TraceMetadata{
