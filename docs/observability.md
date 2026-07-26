@@ -129,8 +129,12 @@ agentkit.WithToolCallMiddleware(func(next agentkit.ToolCallHandler) agentkit.Too
 }),
 ```
 
-`EffectContext` carries `ProcessID`, `RootID`, `Agent` and `StateSeq` — enough
-to key an audit row and to correlate a whole process tree.
+`EffectContext` is enough to key an audit row and to correlate a whole process
+tree: which Process, which agent, which transition, how many attempts it has
+already taken, and `Metadata` — a copy of what `WithMetadata` set at spawn, so a
+middleware can tag or scope by it without holding a `Repository`. **`Metadata`
+is data, not a credential** ([ADR-0011](adr/0011-kernel-has-no-tenancy.md));
+reading it is trusting whoever called `Spawn`.
 
 Properties to design around, all detailed in `middleware.go` and
 [ADR-0012](adr/0012-kernel-hooks-are-composable-middleware.md):

@@ -526,3 +526,77 @@ func TestSession_InjectsClaimTools(t *testing.T) {
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 	gt.Value(t, atomic.LoadInt32(&sawTool)).Equal(int32(1))
 }
+
+// WithLLMSessionOptions is appended last, so gollem.WithSessionHistory passed
+// through it replaces the History the managed conversation is carrying. The
+// override is not a detour around the managed conversation: what the model
+// returns from the overridden session becomes the new baseline and is persisted
+// like any other turn. Both halves are asserted, because the dangerous
+// regression is the second one silently stopping.
+func TestSession_LLMSessionOptionsOverrideManagedHistory(t *testing.T) {
+	ctx := context.Background()
+	injected := &gollem.History{
+		LLType:   gollem.LLMTypeClaude,
+		Version:  gollem.HistoryVersion,
+		Messages: make([]gollem.Message, 7),
+	}
+	// Each session grows what it was seeded with by one, so a message count
+	// identifies which History reached NewSession.
+	var mu sync.Mutex
+	var seen []int
+	model := &mock.LLMClientMock{
+		NewSessionFunc: func(_ context.Context, opts ...gollem.SessionOption) (gollem.Session, error) {
+			cfg := gollem.NewSessionConfig(opts...)
+			var seeded []gollem.Message
+			if h := cfg.History(); h != nil {
+				seeded = h.Messages
+			}
+			mu.Lock()
+			seen = append(seen, len(seeded))
+			mu.Unlock()
+			return &mock.SessionMock{
+				GenerateFunc: func(_ context.Context, _ []gollem.Input, _ ...gollem.GenerateOption) (*gollem.Response, error) {
+					return &gollem.Response{Texts: []string{"ok"}, InputToken: 1, OutputToken: 1}, nil
+				},
+				HistoryFunc: func() (*gollem.History, error) {
+					grown := make([]gollem.Message, len(seeded)+1)
+					copy(grown, seeded)
+					return &gollem.History{LLType: gollem.LLMTypeClaude, Version: gollem.HistoryVersion, Messages: grown}, nil
+				},
+			}, nil
+		},
+	}
+	// Transition 1 overrides the History; transition 2 uses the managed one, so
+	// the second NewSession reveals what the override left behind as baseline.
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		var opts []agentkit.GenerateOption
+		if st.N == 0 {
+			opts = append(opts, agentkit.WithLLMSessionOptions(gollem.WithSessionHistory(injected)))
+		}
+		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}, opts...); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	hr := histmem.New()
+	k, repo, ag := registerWithHistory(t, step, model, hr)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Array(t, seen).Length(2)
+	gt.Value(t, seen[0]).Equal(7) // the override replaced the empty managed History,
+	gt.Value(t, seen[1]).Equal(8) // and its result carried on as the baseline.
+
+	stored, err := hr.Load(ctx, string(pid))
+	gt.NoError(t, err)
+	gt.Value(t, histLen(stored)).Equal(9) // persisted, not just carried in memory.
+}

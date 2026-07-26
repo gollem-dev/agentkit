@@ -104,6 +104,14 @@ derived that value server-side from an already-validated principal before
 spawning. Validate first, then establish scope — never load a scope from input
 and verify it afterwards.
 
+Middleware sees the same map as `EffectContext.Metadata`, and a strategy through
+`Syscalls.Metadata()`; the warning above applies unchanged at both. Widening the
+readership does not make the value any more trustworthy — it only saves reading
+the Process back. Those two paths hand out a clone, so neither can edit what the
+kernel commits or what the next effect sees. A `ToolFactory` and a `Limiter` are
+different: they hold a live `*Process`, and for the `Limiter` that is the very
+row the transition is about to commit. Read it; do not write to it.
+
 ## The strategy author's obligations
 
 Beyond the above:

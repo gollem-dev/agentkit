@@ -3,6 +3,7 @@ package agentkit
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"time"
 
 	"github.com/gollem-dev/gollem"
@@ -35,6 +36,12 @@ type Syscalls interface {
 	// a strategy can tell a replay from a first run before acting. A zero value
 	// means this is the first attempt.
 	Attempt() AttemptInfo
+	// Metadata returns a COPY of Process.Metadata (what WithMetadata set at
+	// spawn), so a strategy can read the process-scoped map without being handed
+	// the Process. Nil when there is none; writing to the returned map affects
+	// nothing. It is data, not a credential — the value was trusted when Spawn
+	// was called, not verified here (ADR-0011).
+	Metadata() map[string]string
 
 	// --- LLM (via gollem; Limiter before, Metrics after) ---
 	Tools() []gollem.Tool // the tools the ToolFactory built (to declare to the LLM).
@@ -121,6 +128,28 @@ func WithLLMOptions(o ...gollem.GenerateOption) GenerateOption {
 	return func(req *GenerateRequest) { req.LLMOptions = append(req.LLMOptions, o...) }
 }
 
+// WithLLMSessionOptions passes gollem session options straight through to
+// LLMClient.NewSession. It reaches the session-scoped settings agentkit does
+// not model as typed fields — gollem.WithSessionPromptCache and the
+// content-block/stream middlewares — without agentkit growing a field per
+// setting.
+//
+// These are appended AFTER the options derived from Role/History/SystemPrompt/
+// Tools/Schema, and gollem applies session options in order, so the effect
+// depends on which kind the option is: a scalar one (history, system prompt,
+// content type, response schema, prompt cache) OVERRIDES what the typed field
+// set, while a slice one (tools, content-block/stream middleware) ADDS to it.
+// The order is fixed this way so a GenerateMiddleware can impose a setting on
+// every agent; reversing it would let any strategy silently opt out.
+//
+// The override reaches SessionGenerate's managed conversation too: passing
+// gollem.WithSessionHistory here replaces the History the runtime is carrying.
+// That is the same "extra options win" rule SessionGenerate already documents,
+// not a separate hazard, but it is the one worth naming.
+func WithLLMSessionOptions(o ...gollem.SessionOption) GenerateOption {
+	return func(req *GenerateRequest) { req.LLMSessionOptions = append(req.LLMSessionOptions, o...) }
+}
+
 func (r *GenerateRequest) sessionOptions() []gollem.SessionOption {
 	var opts []gollem.SessionOption
 	if r.History != nil {
@@ -135,6 +164,8 @@ func (r *GenerateRequest) sessionOptions() []gollem.SessionOption {
 	if r.Schema != nil {
 		opts = append(opts, gollem.WithSessionContentType(gollem.ContentTypeJSON), gollem.WithSessionResponseSchema(r.Schema))
 	}
+	// Last, so a pass-through option wins over the typed fields (WithLLMSessionOptions).
+	opts = append(opts, r.LLMSessionOptions...)
 	return opts
 }
 
@@ -271,9 +302,18 @@ func (s *syscalls) Attempt() AttemptInfo {
 	return AttemptInfo{Errors: s.proc.StepAttempts, UncleanReclaims: s.proc.UncleanReclaims}
 }
 
+func (s *syscalls) Metadata() map[string]string { return maps.Clone(s.proc.Metadata) }
+
+// ec builds the EffectContext for one effect. Metadata is cloned per call
+// rather than once per claim: a middleware is invited to rewrite the request it
+// is given, and the map must not carry that rewrite over to the next effect,
+// to StepRequest.Process, or into the row the transition commits. The
+// Repository contract does not promise that GetProcess returns a copy, so
+// sharing the map here would put the persistence layer's own state within
+// reach of a middleware on some implementations.
 func (s *syscalls) ec() EffectContext {
 	return EffectContext{ProcessID: s.proc.ID, RootID: s.proc.RootID, Agent: s.proc.Agent,
-		StateSeq: s.seq, Attempt: s.Attempt()}
+		StateSeq: s.seq, Attempt: s.Attempt(), Metadata: s.Metadata()}
 }
 
 // checkLimit runs the Limiter with the live snapshot (committed + this run).
