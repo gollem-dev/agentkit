@@ -3,6 +3,7 @@ package filesystem_test
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -156,4 +157,29 @@ func TestDirSyncFailurePropagates(t *testing.T) {
 
 	_, err = store.Save(ctx, newPID(), newHistory(t, "x"))
 	gt.Error(t, err)
+}
+
+// The rename that commits a version happens inside the process directory, so
+// that is the directory whose fsync makes it survive a crash. Syncing the store
+// root instead would leave a Process naming a version whose file is gone.
+func TestDirSyncTargetsTheProcessDirectory(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := filesystem.New(dir)
+	gt.NoError(t, err)
+	defer func() { gt.NoError(t, store.Close()) }()
+
+	var synced []string
+	store.SetDirSyncForTest(func(d string) error {
+		synced = append(synced, d)
+		return nil
+	})
+
+	pid := newPID()
+	_, err = store.Save(ctx, pid, newHistory(t, "x"))
+	gt.NoError(t, err)
+
+	gt.Array(t, synced).Length(1)
+	gt.Value(t, synced[0]).Equal(filepath.Join(dir, string(pid)))
+	gt.Value(t, synced[0]).NotEqual(dir)
 }

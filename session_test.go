@@ -354,6 +354,71 @@ func TestSession_SaveErrorRequeues(t *testing.T) {
 	gt.Value(t, p.HistoryRef).Equal(agentkit.HistoryRef("")) // nothing was committed.
 }
 
+// The save runs before the terminal commit too, and its failure has to stop that
+// commit. turns=1 makes the very first decision a Done, so this exercises the
+// terminal path rather than the Continue one.
+func TestSession_SaveErrorOnTerminalDoesNotCommit(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	store := &probeStore{inner: histmem.New(), saveErr: gollemErr("save boom")}
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 1), growingLLM(), store)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepAttempts(1))
+
+	// Terminal by exhaustion, never by the Done the strategy returned.
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	gt.Value(t, p.HistoryRef).Equal(agentkit.HistoryRef(""))
+	gt.Array(t, store.discarded()).Length(0)
+}
+
+// A terminal Apply that fails with anything other than a conflict leaves the
+// outcome unknown. Nothing may be released: neither the version this attempt
+// saved nor the one the record still names.
+func TestSession_TerminalApplyErrorReleasesNothing(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.New()
+	repo := &fragileRepo{Repository: inner, err: gollemErr("disk gone at terminal commit")}
+	store := &probeStore{inner: histmem.New()}
+	reg := agentkit.NewRegistry()
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		repo.armed.Store(true) // break the terminal Apply, after this transition's save.
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](store))
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	// The abandoned claim leaves a running row; reclaiming it counts as unclean,
+	// and a budget of 0 turns that into a terminal failure instead of a retry, so
+	// the state right after the broken Apply is what the test observes.
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal,
+		agentkit.WithLease(80*time.Millisecond), agentkit.WithMaxUncleanReclaims(0))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureUncleanReclaim)
+
+	saved := store.saved()
+	gt.Array(t, saved).Length(2) // the Continue transition, then the terminal attempt.
+	// The record still names the first version, and neither it nor the terminal
+	// attempt's version was released.
+	gt.Value(t, p.HistoryRef).Equal(saved[0])
+	gt.Array(t, store.discarded()).Length(0)
+	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(1)
+}
+
 // An empty ref is the record's way of saying "nothing committed yet", so a store
 // that returns one would make the next Load be skipped and silently truncate the
 // conversation. The transition must fail instead.
@@ -1029,6 +1094,58 @@ func TestSession_CallToolAppendsErrorResult(t *testing.T) {
 	gt.Value(t, toolResp.ToolCallID).Equal("call-1")
 	gt.Value(t, toolResp.IsError).Equal(true)
 	gt.Value(t, toolResp.Response["error"] != nil).Equal(true)
+}
+
+// A tool result that cannot be encoded into a conversation message leaves the
+// pair open, so the transition has to fail rather than commit a History the next
+// request cannot answer. The tool has already run by then — that is unavoidable
+// — but nothing is appended.
+func TestSession_CallToolEncodeFailureAppendsNothing(t *testing.T) {
+	ctx := context.Background()
+	hs := histmem.New()
+	var ran atomic.Bool
+	var mu sync.Mutex
+	var callErr error
+	var lenAfterCall int
+	tool := &mock.ToolMock{
+		SpecFunc: func() gollem.ToolSpec { return gollem.ToolSpec{Name: "t"} },
+		RunFunc: func(_ context.Context, _ map[string]any) (map[string]any, error) {
+			ran.Store(true)
+			// encoding/json cannot marshal a func, so building the tool_response
+			// content fails after the tool itself succeeded.
+			return map[string]any{"callback": func() {}}, nil
+		},
+	}
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		_, cerr := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "call-1", Name: "t"})
+		h, herr := sys.Session().History(ctx)
+		if herr != nil {
+			return st, agentkit.Decision[[]byte]{}, herr
+		}
+		mu.Lock()
+		callErr, lenAfterCall = cerr, histLen(h)
+		mu.Unlock()
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	factory := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{tool}, nil
+	}
+	k, repo, ag := registerWithHistory(t, step, growingLLM(), hs, agentkit.WithToolFactory(factory))
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Value(t, ran.Load()).Equal(true) // the tool did run,
+	gt.Error(t, callErr)                // the failure reached the strategy,
+	gt.Value(t, lenAfterCall).Equal(1)  // and nothing was appended.
+	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(1)
 }
 
 // Appending a result to a conversation that does not exist yet would mean
