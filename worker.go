@@ -418,12 +418,11 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		// Unknown agent: a permanent config mismatch (e.g. a binary generation skew).
 		return k.finalizeClaimed(ctx, proc, failWith(FailureStrategyError, err), claimToken, Metrics{})
 	}
-	// One History holder per claim: the committed baseline is loaded once (on
-	// first SessionGenerate/SessionHistory use) and advanced only when a
-	// transition commits, so it is shared across this claim's transitions
-	// (ADR-0017). repo is nil when the agent did not opt in, in which case
-	// SessionGenerate/SessionHistory return ErrHistoryNotConfigured.
-	hs := &historyState{repo: b.historyRepo, pid: proc.ID}
+	// One History holder per claim: the committed version is loaded once (on first
+	// Session use) and advanced only when a transition commits, so it is shared
+	// across this claim's transitions (ADR-0017). store is nil when the agent did
+	// not opt in, in which case Session's methods return ErrHistoryNotConfigured.
+	hs := &historyState{store: b.historyStore, pid: proc.ID}
 	var toolList []gollem.Tool
 	if k.toolFactory != nil {
 		toolList, err = k.toolFactory(ctx, proc)
@@ -478,6 +477,9 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		}
 
 		sys := newSyscalls(k, proc, toolList, hs, b.limit, limit)
+		// The History version this transition starts from. Once its own version is
+		// committed, this one is no longer referenced and the store is told.
+		prevRef := proc.HistoryRef
 		rawState, dec, terr := k.runTransition(ctx, sys, b, proc)
 		if terr != nil {
 			// This transition did not commit; its buffered children are dropped.
@@ -486,52 +488,55 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		}
 
 		if dec.kind == DecisionDone || dec.kind == DecisionFail {
-			// Fence the History write against a lost lease: if a newer worker
-			// reclaimed this Process, our stale Save would clobber the History it
-			// already committed, so skip it and abandon (ADR-0017).
-			if sys.historyPending() && !k.ownsLease(ctx, proc.ID, claimToken) {
-				sys.notifySpawnDone(ErrConflict)
-				return ClaimAbandoned
-			}
 			// Persist History before the terminal commit too, so a later
 			// restart/handoff can read the final transcript (ADR-0017, D-D). A save
 			// failure is treated like a transition failure: do not commit, requeue.
+			// No lease fence is needed: a stored version is never rewritten, so a
+			// worker that lost its lease can only add one nobody references.
 			if serr := sys.saveHistory(ctx); serr != nil {
 				sys.notifySpawnDone(serr)
 				return k.failOrRequeue(ctx, cfg, proc, claimToken, serr, sys.runMetrics)
 			}
 			// commitTerminal fires the spawn OnCommit callbacks and eager dispatch
 			// itself (nil on commit, err on abandon). A failure here means the row is
-			// NOT terminal, so it must not be reported as finished.
-			if cterr := k.commitTerminal(ctx, proc, rawState, b.version, sys.seq, dec, sys, claimToken); cterr != nil {
+			// NOT terminal, so it must not be reported as finished — and it leaves
+			// the commit outcome unknown, which is why nothing is discarded on it.
+			committed, cterr := k.commitTerminal(ctx, proc, rawState, b.version, sys.seq, dec, sys, claimToken)
+			if cterr != nil {
 				return ClaimAbandoned
+			}
+			// Only this call's own Apply supersedes prevRef. When another path
+			// finished the Process first, the record still names prevRef and
+			// releasing it would destroy the transcript that path committed.
+			if committed {
+				discardSuperseded(ctx, b.historyStore, proc.ID, prevRef, sys.sessRef)
 			}
 			return ClaimFinished
 		}
 
-		cs, cerr := k.buildCommit(ctx, proc, rawState, b.version, sys.seq, dec, sys, cfg)
-		if cerr != nil {
-			// Suspend-without-await, invalid child ref, etc. -> retry path.
-			sys.notifySpawnDone(cerr)
-			return k.failOrRequeue(ctx, cfg, proc, claimToken, cerr, sys.runMetrics)
-		}
-		// Fence the History write against a lost lease (see ownsLease / ADR-0017):
-		// a stale worker must not overwrite a newer worker's committed History.
-		if sys.historyPending() && !k.ownsLease(ctx, proc.ID, claimToken) {
-			sys.notifySpawnDone(ErrConflict)
-			return ClaimAbandoned
-		}
-		// Persist History before the commit (ADR-0017: commit is the completion
-		// marker, so durable work precedes it). A save failure requeues rather than
-		// committing. This does NOT advance the committed baseline — commitHistory
-		// does that only after Apply succeeds, so a conflict retry re-seeds from
-		// committed state.
+		// Save before building the commit: buildCommit records the ref this returns
+		// (ADR-0017 — commit is the completion marker, so durable work precedes it).
+		// It does NOT advance the committed baseline; commitHistory does that only
+		// after Apply succeeds, so a conflict retry re-seeds from committed state.
 		if serr := sys.saveHistory(ctx); serr != nil {
 			sys.notifySpawnDone(serr)
 			return k.failOrRequeue(ctx, cfg, proc, claimToken, serr, sys.runMetrics)
 		}
+		cs, cerr := k.buildCommit(ctx, proc, rawState, b.version, sys.seq, dec, sys, cfg)
+		if cerr != nil {
+			// Suspend-without-await, invalid child ref, etc. -> retry path. Nothing
+			// committed, so this attempt's version is unreferenced for good.
+			discardUncommitted(ctx, b.historyStore, proc.ID, prevRef, sys.sessRef)
+			sys.notifySpawnDone(cerr)
+			return k.failOrRequeue(ctx, cfg, proc, claimToken, cerr, sys.runMetrics)
+		}
 		if err := k.repo.Apply(ctx, cs.changeSet); err != nil {
 			if errors.Is(err, ErrConflict) {
+				// A conflict is the one failure that proves nothing committed, so this
+				// attempt's version can be released. Any other error leaves the outcome
+				// unknown and the version has to stay: discarding it could destroy the
+				// one the record now names.
+				discardUncommitted(ctx, b.historyStore, proc.ID, prevRef, sys.sessRef)
 				sys.notifySpawnDone(err) // this attempt's buffered children did not commit.
 				cur, gerr := k.repo.GetProcess(ctx, proc.ID)
 				if gerr != nil || cur == nil || cur.LeaseToken != claimToken {
@@ -549,6 +554,7 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		k.dispatchChildren(sys)
 		sys.notifySpawnDone(nil)
 		sys.commitHistory() // advance the committed History baseline (ADR-0017).
+		discardSuperseded(ctx, b.historyStore, proc.ID, prevRef, sys.sessRef)
 		switch {
 		case cs.suspend:
 			return ClaimSuspended // waiting committed.
@@ -563,17 +569,6 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		return ClaimAbandoned
 	}
 	return ClaimReleased
-}
-
-// ownsLease reports whether this claim still holds proc's lease, by re-reading
-// the row. It fences the History Save (a blob write that lives outside the
-// Rev/LeaseToken fence): if a newer worker has reclaimed proc, a stale Save would
-// overwrite the History that worker already committed, so the caller skips it
-// (ADR-0017). This narrows the last-writer-wins window to the gap between this
-// read and the write; the transition's own commit stays fenced by Rev CAS.
-func (k *Kernel) ownsLease(ctx context.Context, pid ProcessID, claimToken string) bool {
-	cur, err := k.repo.GetProcess(ctx, pid)
-	return err == nil && cur != nil && cur.LeaseToken == claimToken
 }
 
 // claimSpecific claims one pending Process by id, for eager dispatch. It writes
@@ -740,6 +735,7 @@ func (k *Kernel) buildCommit(ctx context.Context, proc *Process, rawState []byte
 	p.State = rawState
 	p.StateVersion = version
 	p.StateSeq = seq
+	p.HistoryRef = sys.nextHistoryRef()
 	p.StepAttempts = 0
 	p.UncleanReclaims = 0
 	p.Metrics = p.Metrics.add(sys.runMetrics).add(Metrics{Steps: 1})
@@ -915,11 +911,13 @@ func minTime(ts []time.Time) *time.Time {
 
 // commitTerminal commits a Done/Fail transition and its finalize in a single
 // Apply (#3/D47). It carries the transition state and folds this run's metrics.
-func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []byte, version, seq int, dec decision, sys *syscalls, fenceToken string) error {
+// The bool reports whether THIS call's Apply is what committed; see commitFinal.
+func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []byte, version, seq int, dec decision, sys *syscalls, fenceToken string) (bool, error) {
 	return k.commitFinal(ctx, proc, fenceToken, func(p *Process) {
 		p.State = rawState
 		p.StateVersion = version
 		p.StateSeq = seq
+		p.HistoryRef = sys.nextHistoryRef()
 		p.StepAttempts = 0
 		p.UncleanReclaims = 0
 		p.Metrics = p.Metrics.add(sys.runMetrics).add(Metrics{Steps: 1})
@@ -937,10 +935,13 @@ func (k *Kernel) commitTerminal(ctx context.Context, proc *Process, rawState []b
 // retry_exhausted). State is left as-is; foldMetrics is added to Process.Metrics
 // (retry_exhausted folds the run's consumed metrics, #5).
 func (k *Kernel) finalize(ctx context.Context, proc *Process, mut terminalMutator, fenceToken string, foldMetrics Metrics) error {
-	return k.commitFinal(ctx, proc, fenceToken, func(p *Process) {
+	// Which Apply won does not matter here: nothing downstream of an external
+	// termination depends on this call being the committing one.
+	_, err := k.commitFinal(ctx, proc, fenceToken, func(p *Process) {
 		mut(p)
 		p.Metrics = p.Metrics.add(foldMetrics)
 	}, nil, nil)
+	return err
 }
 
 // commitFinal commits a terminal Process plus its finalize (open awaits
@@ -962,9 +963,17 @@ func (k *Kernel) finalize(ctx context.Context, proc *Process, mut terminalMutato
 // A required read failure while building the finalize ChangeSet (own awaits,
 // parent, siblings) aborts the whole commit and returns the error, leaving the
 // Process non-terminal for lease-expiry retry (#2) — never a partial finalize.
+//
+// The bool reports whether THIS call's Apply is what made the Process terminal.
+// It is false, with a nil error, in the one case where the Process ended up
+// terminal without this call writing it: a conflict whose re-read finds it
+// already terminal by another path. A caller that acts on its own committed
+// values — releasing the History version its commit superseded, say — must check
+// it, because in that case the record still holds whatever the winning path
+// wrote, not what this mutate produced.
 const externalFence = ""
 
-func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken string, mutate func(*Process), sys *syscalls, typedOut any) error {
+func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken string, mutate func(*Process), sys *syscalls, typedOut any) (bool, error) {
 	for {
 		now := k.clock()
 		p := proc.clone()
@@ -982,7 +991,7 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 		// Close this Process's open awaits.
 		awaits, err := k.repo.ListAwaits(ctx, p.ID)
 		if err != nil {
-			return k.abortFinal(sys, goerr.Wrap(err, "list own awaits for finalize"))
+			return false, k.abortFinal(sys, goerr.Wrap(err, "list own awaits for finalize"))
 		}
 		for _, aw := range awaits {
 			if aw.Status == AwaitOpen {
@@ -994,7 +1003,7 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 		// completes an open children await.
 		if p.ParentID != nil {
 			if err := k.reportToParent(ctx, *p.ParentID, p, &cs, now); err != nil {
-				return k.abortFinal(sys, err)
+				return false, k.abortFinal(sys, err)
 			}
 		}
 
@@ -1002,24 +1011,27 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 		if errors.Is(err, ErrConflict) {
 			fresh, gerr := k.repo.GetProcess(ctx, proc.ID)
 			if gerr != nil || fresh == nil || fresh.Status.Terminal() {
-				return k.abortFinal(sys, nil) // already terminal by another path.
+				// Already terminal by another path: the Process is finished, but this
+				// Apply is not what finished it, so the row holds the winner's values
+				// and not the ones mutate produced. Reported as (false, nil).
+				return false, k.abortFinal(sys, nil)
 			}
 			if fenceToken == externalFence {
-				return goerr.Wrap(ErrConflict, "external finalize lost a race; retry") // caller re-reads (#1).
+				return false, goerr.Wrap(ErrConflict, "external finalize lost a race; retry") // caller re-reads (#1).
 			}
 			if fresh.LeaseToken != fenceToken {
 				// The worker lost the lease: abandon without rebasing Rev (#2/D50).
 				// This is reported rather than swallowed, because the row is NOT
 				// terminal — the caller would otherwise announce ClaimFinished for a
 				// Process another worker now owns.
-				return k.abortFinal(sys, goerr.Wrap(ErrConflict,
+				return false, k.abortFinal(sys, goerr.Wrap(ErrConflict,
 					"lost the lease before the terminal commit", goerr.V("process", proc.ID)))
 			}
 			proc = fresh
 			continue
 		}
 		if err != nil {
-			return k.abortFinal(sys, err)
+			return false, k.abortFinal(sys, err)
 		}
 		// Eager-dispatch after the durable commit, before user callbacks (ADR-0016):
 		// any child buffered by this (terminal) transition, and the parent this
@@ -1033,7 +1045,7 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 			sys.notifySpawnDone(nil)
 		}
 		k.fireFinish(ctx, p, typedOut)
-		return nil
+		return true, nil
 	}
 }
 

@@ -49,9 +49,14 @@ var (
 	// the same Kernel. One Kernel drives at most one active Serve, because the
 	// eager dispatcher and its concurrency semaphore are installed per-Serve.
 	ErrServeActive = goerr.New("serve already active")
-	// ErrHistoryNotConfigured is returned by SessionGenerate / SessionHistory when
-	// the agent was not registered with WithHistoryRepository. The managed
-	// conversation needs a store; rather than silently run without persistence,
-	// the call fails so the misconfiguration surfaces (ADR-0017).
-	ErrHistoryNotConfigured = goerr.New("history repository not configured")
+	// ErrHistoryNotConfigured is returned by every Session method when the agent
+	// was not registered with WithHistoryStore. The managed conversation needs a
+	// store; rather than silently run without persistence, the call fails so the
+	// misconfiguration surfaces (ADR-0017).
+	ErrHistoryNotConfigured = goerr.New("history store not configured")
+	// ErrHistoryVersionMissing is what a HistoryStore returns when Load is given a
+	// ref it cannot resolve. A referenced version that is gone is data loss, not
+	// an empty conversation, so it fails the transition instead of silently
+	// restarting the conversation from nothing.
+	ErrHistoryVersionMissing = goerr.New("history version missing")
 )

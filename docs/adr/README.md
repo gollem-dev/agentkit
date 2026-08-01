@@ -29,7 +29,7 @@ change.
 | [0014](0014-completion-handlers-are-best-effort.md) | Completion handlers are best-effort and bound at registration |
 | [0015](0015-unclean-reclaims-are-counted-and-bounded.md) | Unclean reclaims are counted separately and bounded |
 | [0016](0016-eager-dispatch-is-a-scheduling-optimization.md) | Eager dispatch is a scheduling optimization |
-| [0017](0017-history-is-a-decoupled-best-effort-store.md) | History is a decoupled, best-effort, per-agent store |
+| [0017](0017-history-is-an-immutable-versioned-store.md) | History is an immutable, versioned, per-agent store |
 | [0018](0018-durable-delivery-is-built-in-repository-apply.md) | Durable delivery is built inside `Repository.Apply` |
 | [0019](0019-events-are-addressable-and-reads-resume.md) | Events are addressable, and reads resume from an id |
 

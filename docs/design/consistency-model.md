@@ -151,50 +151,59 @@ Both paths include the process row in their `Apply`, so they serialize on its
 `Rev`. Whichever commits first settles the await; the other sees it is no longer
 `open`.
 
-## History is a separate, best-effort store
+## History rides the commit by reference
 
-Conversation History (`*gollem.History`) is the one piece of durable state that
-does **not** ride the atomic `Apply`. When an agent opts in with
-`WithHistoryRepository`, the worker persists History to a separate blob store
-(keyed by `ProcessID`) *before* each transition commits — including terminal
-commits — because the commit is the completion marker
-([ADR-0017](../adr/0017-history-is-a-decoupled-best-effort-store.md)). History is
-append-only and can outgrow what a transactional row should hold, which is why it
-is decoupled from the Process row.
+Conversation History (`*gollem.History`) is the one piece of durable state whose
+bytes do **not** ride the atomic `Apply` — it is append-only and can outgrow what
+a transactional row should hold, so it lives in a separate blob store. What rides
+the `Apply` is the *pointer*: `Process.HistoryRef` names the committed version,
+and it is written in the same change set as State
+([ADR-0017](../adr/0017-history-is-an-immutable-versioned-store.md)).
 
-The two guarantees above therefore do **not** extend to History; its save is an
-at-least-once effect ([ADR-0003](../adr/0003-at-least-once-replay-no-effect-journal.md)):
+Versions are immutable. When an agent opts in with `WithHistoryStore`, the worker
+saves a **new** version before each transition commits — including terminal
+commits, because the commit is the completion marker — and the commit publishes
+it by recording its ref. Nothing is ever rewritten in place, so a save whose
+transition did not commit leaves a version the record never names.
 
-- **A crash between the History save and the commit** leaves a saved History for
-  a transition that did not commit. The next claim reads that superseded History
-  back and the re-run appends to it, so the conversation can carry a duplicated
-  turn. This window is accepted, not closed.
-- **Save-before-commit removes the opposite "amnesia" window** (History lagging
-  State): once a transition commits, its History is already durable, so a
-  post-commit crash loses nothing.
-- **Same-lease conflict retries do not duplicate.** The committed baseline is
-  held in memory per claim and advanced only on a successful `Apply`; a retry
-  re-seeds from that baseline, not from the repo, so only a real crash — never an
-  in-process retry — reaches the duplication window.
-- **A worker that lost its lease cannot clobber a newer worker's committed
-  History.** The blob store has no Rev/LeaseToken fence of its own, so right
-  before the save the worker re-reads the row and skips the write when the lease
-  token changed (`ownsLease` in `worker.go`). Without it, a stalled old worker's
-  late save would overwrite a newer worker's committed History — a regression,
-  not just a duplicate. The re-check narrows that window to the gap between the
-  read and the write; with a single-key store it is narrowed, not fully closed.
+That is what extends the two guarantees above to History:
+
+- **A crash between the save and the commit changes nothing.** The record still
+  names the previous version, so the next claim re-seeds from exactly the state
+  the last commit left. State, awaits and History advance together or roll back
+  together; there is no window where one is ahead of the other.
+- **Save-before-commit removes the "amnesia" window** (History lagging State):
+  once a transition commits, its version is already durable.
+- **Same-lease conflict retries do not duplicate.** The committed version is held
+  in memory per claim and advanced only on a successful `Apply`, so a retry
+  re-seeds from it rather than from the abandoned attempt.
+- **A worker that lost its lease cannot clobber anything.** It can only add a
+  version nobody references. The blob store needs no fence of its own, which is
+  why there is no lease re-check around the save.
+
+What is *not* guaranteed: reclamation. After a commit the worker tells the store
+the superseded version is no longer referenced, but that call is a notification —
+the store decides when, or whether, to reclaim. Versions left by a crash between
+a save and its commit are never announced at all, so a store needs its own policy
+for them. And the effect model is unchanged ([ADR-0003](../adr/0003-at-least-once-replay-no-effect-journal.md)):
+a replay still re-calls the LLM and re-runs tools.
 
 Because the save precedes the commit, a History-store outage prevents the
 transition from committing at all, and the Process eventually fails
 `retry_exhausted`: liveness is coupled to the History store when an agent opts
 in.
 
-Keeping the next LLM request well-formed across a duplication is the strategy's
-responsibility. A `SessionGenerate`-using strategy must keep a tool-call round within one
-Step, so a persisted History never ends on a dangling `tool_use`; a strategy that
-splits a round across steps keeps History in its own State instead (raw
-`Generate` + `WithHistory`). The kernel does not inspect History
-([ADR-0011](../adr/0011-kernel-has-no-tenancy.md)).
+**A Step boundary may fall in the middle of a tool round.** A committed History
+ending on a `tool_use` whose `tool_result` belongs to a later Step is safe now,
+because a re-run always starts from the version the record names — so a strategy
+can generate a tool call, suspend for a human, and answer the call in the next
+Step. `sys.Session().CallTool` appends its result to the conversation, letting a
+Step close the pair without another LLM turn; that is the one place the kernel
+constructs a message (a single `RoleTool` entry) rather than treating History as
+opaque. It still never interprets what is inside
+([ADR-0011](../adr/0011-kernel-has-no-tenancy.md)), and it cannot tell whether a
+call was one the model asked for — pairing a `tool_result` to a real `tool_use`
+stays the strategy's responsibility.
 
 ## What a Repository implementation must provide
 

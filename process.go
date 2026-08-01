@@ -88,7 +88,12 @@ type Process struct {
 	State        []byte   // EncodeState output, stored verbatim (the kernel never converts it).
 	StateVersion int      // strategy version that wrote State (the first arg to DecodeState).
 	StateSeq     int      // number of committed transitions. 0 = first Step not yet committed.
-	StepAttempts int      // failure count of the current transition (reset to 0 on a successful commit).
+	// HistoryRef names the committed version of this Process's conversation
+	// History in its HistoryStore, or "" when none has been committed. The worker
+	// saves a NEW version before the commit and records its ref here inside the
+	// same Apply, so History rolls back together with State (ADR-0017).
+	HistoryRef   HistoryRef
+	StepAttempts int // failure count of the current transition (reset to 0 on a successful commit).
 	// UncleanReclaims counts claims that took over this Process after its
 	// previous claim died mid-transition. Same reset scope as StepAttempts.
 	// Maintained by ClaimNextProcess (see the Repository contract), never by the

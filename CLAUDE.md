@@ -32,7 +32,8 @@ a new idea:
    `ModelRole`. → [ADR-0006](docs/adr/0006-typed-handles-from-register.md)
 2. **The kernel never marshals or unmarshals caller data.** User payloads are
    `[]byte` stored verbatim. Serialization lives in exactly two places: the
-   caller's code and the `Repository` implementation. →
+   caller's code and the `Repository` implementation — plus one named exception,
+   `Session().CallTool` encoding a tool result into a conversation message. →
    [ADR-0007](docs/adr/0007-kernel-neutral-to-serialization.md)
 3. **Required arguments are positional; optional ones are functional options.**
    No config struct mixes the two. →
@@ -64,13 +65,16 @@ agentkit/                  root package: kernel + every port definition
   kernel.go                lifecycle API (Spawn/Respond/Cancel/Get/List)
   worker.go                Serve, claims, transitions, commits
   syscalls.go              the effect gateway
-  strategy.go repository.go tool.go middleware.go             the ports
+  session.go               the managed conversation (Syscalls.Session)
+  strategy.go repository.go tool.go middleware.go history.go   the ports
   strategy/simple/         LLM loop
   strategy/planexec/       plan -> children -> replan -> finalize
   repository/memory/       reference impl (in-process)
   repository/filesystem/   reference impl (single process, one snapshot file)
   repository/repotest/     the Repository contract, executable
   repository/internal/store/  shared state machine behind the two references
+  historystore/{memory,filesystem}/  HistoryStore reference impls
+  historystore/historytest/  the HistoryStore contract, executable
 
 examples/                  a SEPARATE module (its own go.mod, replace ../)
   internal/demo/           live-or-stub model, and a Process poll helper

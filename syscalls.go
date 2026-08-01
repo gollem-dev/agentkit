@@ -46,19 +46,13 @@ type Syscalls interface {
 	// --- LLM (via gollem; Limit before, Metrics after) ---
 	Tools() []gollem.Tool // the tools the ToolFactory built (to declare to the LLM).
 	Generate(ctx context.Context, input []gollem.Input, opts ...GenerateOption) (*GenerateResult, error)
-	// SessionGenerate runs one LLM turn as part of the Process's managed
-	// conversation: the runtime carries History across calls (and, once
-	// committed, across steps and workers) and injects the claim's tools, so the
-	// strategy threads neither by hand. It requires the agent to have been
-	// registered with WithHistoryRepository; otherwise it returns
-	// ErrHistoryNotConfigured rather than silently running without persistence.
-	// To manage History yourself, use the primitive Generate with WithHistory.
-	// See ADR-0017.
-	SessionGenerate(ctx context.Context, input []gollem.Input, opts ...GenerateOption) (*GenerateResult, error)
-	// SessionHistory returns the managed conversation's current history (loading
-	// the stored one on first use). Requires WithHistoryRepository, else
-	// ErrHistoryNotConfigured.
-	SessionHistory(ctx context.Context) (*gollem.History, error)
+	// Session returns the Process's managed conversation, where the runtime
+	// carries History across calls (and, once committed, across steps and
+	// workers) and injects the claim's tools. It always returns a usable handle;
+	// the handle's methods report ErrHistoryNotConfigured when the agent was
+	// registered without WithHistoryStore. To manage History yourself, use the
+	// primitive Generate with WithHistory. See ADR-0017.
+	Session() Session
 
 	// --- tool execution (Limit before, Metrics after; no approval gate) ---
 	CallTool(ctx context.Context, call gollem.FunctionCall) (map[string]any, error)
@@ -266,13 +260,15 @@ type syscalls struct {
 	awaits     map[AwaitKey]*Await
 
 	// hist is the claim-scoped committed History holder (shared across a claim's
-	// transitions). sessWorking/sessStarted/sessDirty are this transition's
-	// managed-conversation state (SessionGenerate/SessionHistory). See session.go
-	// / ADR-0017.
+	// transitions). The sess* fields are this transition's managed-conversation
+	// state (see Session in session.go / ADR-0017).
 	hist        *historyState
 	sessWorking *gollem.History
 	sessStarted bool
 	sessDirty   bool
+	// sessRef is the ref saveHistory got back for this transition's version, ""
+	// before it runs. nextHistoryRef turns it into the value the commit records.
+	sessRef HistoryRef
 
 	// run accumulation (committed proc.Metrics is only the committed cumulative;
 	// this run's share is folded on any successful Apply, D44).

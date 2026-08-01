@@ -586,6 +586,42 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		gt.Value(t, back.UncleanReclaims).Equal(0)
 	})
 
+	// HistoryRef names the committed version of a Process's conversation History
+	// in its HistoryStore. It is the pointer that makes History roll back with
+	// State (ADR-0017), so a Repository that drops it would silently resurrect a
+	// superseded conversation.
+	t.Run("HistoryRefRoundTrip", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		p := mkProc(pid)
+		gt.Value(t, p.HistoryRef).Equal(agentkit.HistoryRef("")) // zero value: nothing committed yet.
+
+		p.HistoryRef = agentkit.HistoryRef("version-" + string(pid))
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{p}}))
+
+		got, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, got.HistoryRef).Equal(agentkit.HistoryRef("version-" + string(pid)))
+
+		// And a later transition can replace it with another version.
+		got.HistoryRef = agentkit.HistoryRef("next-" + string(pid))
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{got}}))
+
+		back, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, back.HistoryRef).Equal(agentkit.HistoryRef("next-" + string(pid)))
+
+		// Empty must come back empty, not as a stale value: a store that maps ""
+		// to NULL and NULL to "the previous ref" would resurrect a released
+		// version.
+		back.HistoryRef = ""
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{back}}))
+
+		cleared, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, cleared.HistoryRef).Equal(agentkit.HistoryRef(""))
+	})
+
 	t.Run("ClaimLiveLeaseNotClaimed", func(t *testing.T) {
 		repo := factory(t)
 		pid := newPID()
