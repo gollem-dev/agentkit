@@ -11,9 +11,10 @@ conditional write, a mutex — is entirely yours
 ([ADR-0004](adr/0004-repository-changeset-rev-cas.md)).
 
 Conversation History (`*gollem.History`) is **not** part of this contract — it
-lives in a separate, opt-in blob store keyed by process id. See
+lives in a separate, opt-in blob store holding immutable versions, of which the
+Process record names the committed one. See
 [writing-strategies.md#persisting-conversation-history](writing-strategies.md#persisting-conversation-history)
-and [ADR-0017](adr/0017-history-is-a-decoupled-best-effort-store.md).
+and [ADR-0017](adr/0017-history-is-an-immutable-versioned-store.md).
 
 ## Bundled implementations
 
@@ -75,6 +76,13 @@ the contract against a shared store.
    ([ADR-0019](adr/0019-events-are-addressable-and-reads-resume.md)).
 7. **Reads deep-copy.** A caller mutating a returned `*Process`, `*Await` or
    `*Event` must not be able to reach stored state.
+8. **Every `Process` field round-trips**, `HistoryRef` included. It names the
+   committed version of the conversation History in the agent's `HistoryStore`,
+   and it must be written in the same `Apply` as `State` — that is the whole
+   mechanism by which History rolls back with State
+   ([ADR-0017](adr/0017-history-is-an-immutable-versioned-store.md)). A store
+   that drops it silently resurrects a superseded conversation. It is an
+   ordinary string column, empty when nothing has been committed yet.
 
 Every one of these carries weight. The `Rev` CAS is what stops a worker whose
 lease expired from clobbering its successor; the guards are what make the
@@ -109,6 +117,8 @@ The factory must return a fresh, empty repository each call. The suite covers:
 - a fresh `LeaseToken` on every claim, including re-claims
 - `unclean_reclaims` counted on a `running` takeover and left alone otherwise,
   and both attempt counters round-tripping through `Apply`
+- `HistoryRef` round-tripping through `Apply`, including being replaced by a
+  later transition and cleared back to empty
 - no double-claim, with 100 processes and 100 concurrent claimers
 - deep-copy-on-read for processes, awaits and events
 

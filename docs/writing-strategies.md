@@ -210,23 +210,22 @@ agentkit.WithGenerateMiddleware(func(next agentkit.GenerateHandler) agentkit.Gen
 ## Persisting conversation history
 
 Threading `History` through your own state (above) works, but you write the
-carrying, the folding, and the checkpointing by hand. If your strategy just
-needs a running conversation — no need to split a tool round across steps —
-register with `agentkit.WithHistoryRepository` and call `sys.SessionGenerate`
-instead; agentkit carries `History` across calls for you, and persists it across
-steps and crashes too.
+carrying, the folding, and the checkpointing by hand. If your strategy just needs
+a running conversation, register with `agentkit.WithHistoryStore` and use
+`sys.Session()` instead; agentkit carries `History` across calls for you, and
+persists it across steps and crashes too.
 
 ```go
 import histmem "github.com/gollem-dev/agentkit/historystore/memory"
 
 agent, err := agentkit.Register(reg, "chat", 1, &chatStrategy{},
-    agentkit.WithHistoryRepository[Output](histmem.New()),
+    agentkit.WithHistoryStore[Output](histmem.New()),
 )
 ```
 
 ```go
 func (s *chatStrategy) Step(ctx context.Context, sys agentkit.Syscalls, st chatState) (chatState, agentkit.Decision[Output], error) {
-    res, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text(st.Prompt)})
+    res, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text(st.Prompt)})
     if err != nil {
         return st, agentkit.Decision[Output]{}, err
     }
@@ -238,30 +237,68 @@ func (s *chatStrategy) Step(ctx context.Context, sys agentkit.Syscalls, st chatS
 }
 ```
 
-`SessionGenerate` injects the carried `History` and `sys.Tools()` for you — no
-`WithHistory`/`WithTools` to pass by hand. `sys.SessionHistory(ctx)` returns the
-current history (loading the stored one on first use) if you need to inspect it.
-`historystore/memory.New()` (non-persistent) and `historystore/filesystem.New(dir)`
-(single-process, persistent) are the reference stores.
+`Session().Generate` injects the carried `History` and `sys.Tools()` for you — no
+`WithHistory`/`WithTools` to pass by hand. `Session().History(ctx)` returns the
+current history (loading the committed one on first use) if you need to inspect
+it. `historystore/memory.New()` (non-persistent) and
+`historystore/filesystem.New(dir)` (single-process, persistent) are the reference
+stores; a production one implements `agentkit.HistoryStore` and is checked
+against `historystore/historytest.Run`.
 
-Two obligations come with this, and you hit both immediately:
+Without `WithHistoryStore`, every `Session()` method returns
+`ErrHistoryNotConfigured` — the managed conversation is never silently run
+without persistence.
 
-- **Keep a tool round inside one `Step`.** History persisted through
-  `SessionGenerate` is saved outside the atomic transition commit
-  ([ADR-0017](adr/0017-history-is-a-decoupled-best-effort-store.md)). If a
-  `tool_use` is committed in one `Step` and its `tool_result` only in a later
-  one, a crash in between leaves the stored History with a dangling
-  `tool_use`. Run the call and feed its result back to the model within the
-  same `Step` whenever you use `SessionGenerate`.
-- **The option is opt-in, and persistence is best-effort.** Without
-  `WithHistoryRepository`, `SessionGenerate`/`SessionHistory` return
-  `ErrHistoryNotConfigured` — they do not silently run without persistence. If
-  your strategy needs to split a tool round across steps, as `strategy/simple`
-  does, keep `History` in your own checkpointed state via the raw `sys.Generate`
-  + `agentkit.WithHistory(...)` pattern shown above instead.
+### A tool round may span several `Step`s
 
-See [ADR-0017](adr/0017-history-is-a-decoupled-best-effort-store.md) for the
-save-before-commit ordering and the duplication window it trades against.
+You do not have to finish a tool round before returning. A `Step` can commit with
+the conversation ending on a `tool_use` nobody has answered yet, and a later
+`Step` — on another worker, after a crash, or after a human replied — answers it.
+That works because a committed History is named by `Process.HistoryRef`, which is
+written in the same `Apply` as your state, so the two always roll back together
+([ADR-0017](adr/0017-history-is-an-immutable-versioned-store.md)).
+
+`Session().CallTool` is what closes the round: it runs the call like
+`sys.CallTool` and appends the result to the conversation, so the next `Generate`
+needs no input at all.
+
+```go
+func (s *approve) Step(ctx context.Context, sys agentkit.Syscalls, st state) (state, agentkit.Decision[Output], error) {
+    // Resumed: a human answered, and the conversation still ends on the call.
+    if aw, ok := sys.Await("approve"); ok && aw.Response != nil {
+        if string(aw.Response) == "yes" {
+            if _, err := sys.Session().CallTool(ctx, *st.Pending); err != nil {
+                return st, agentkit.Decision[Output]{}, err
+            }
+        }
+        res, err := sys.Session().Generate(ctx, nil) // the result is already in the History.
+        if err != nil {
+            return st, agentkit.Decision[Output]{}, err
+        }
+        return st, agentkit.Done(Output{Texts: res.Texts}), nil
+    }
+
+    res, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text(st.Prompt)})
+    if err != nil {
+        return st, agentkit.Decision[Output]{}, err
+    }
+    if len(res.FunctionCalls) > 0 {
+        st.Pending = res.FunctionCalls[0]
+        return st, agentkit.Suspend[Output](agentkit.Question("approve", []byte(st.Pending.Name))), nil
+    }
+    return st, agentkit.Done(Output{Texts: res.Texts}), nil
+}
+```
+
+Use `Session().CallTool` only for a call the **model** asked for. For a call your
+strategy makes on its own — fetching something to build a prompt, say — use
+`sys.CallTool`: there is no `tool_use` for it, and appending a `tool_result`
+without one corrupts the conversation. The kernel cannot tell the two apart, so
+this one is on you.
+
+Keeping `History` in your own checkpointed state via raw `sys.Generate` +
+`agentkit.WithHistory(...)` is still fully supported, and is what
+`strategy/simple` does.
 
 ## Running tools
 

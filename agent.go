@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 
-	"github.com/gollem-dev/gollem"
 	"github.com/m-mizutani/goerr/v2"
 )
 
@@ -45,9 +44,9 @@ type RegisterOption[O any] func(*registerConfig[O])
 type registerConfig[O any] struct {
 	onFinish    FinishHandler[O]
 	onFinishSet bool // distinguishes "not given" from "given as nil".
-	// historyRepo, when non-nil, opts this agent into runtime-managed History
+	// historyStore, when non-nil, opts this agent into runtime-managed History
 	// persistence. It is O-independent, so no type-erased closure is needed.
-	historyRepo gollem.HistoryRepository
+	historyStore HistoryStore
 }
 
 // WithOnFinish wires a completion handler for this agent. The handler runs
@@ -58,18 +57,18 @@ func WithOnFinish[O any](h FinishHandler[O]) RegisterOption[O] {
 	return func(c *registerConfig[O]) { c.onFinish, c.onFinishSet = h, true }
 }
 
-// WithHistoryRepository opts this agent into runtime-managed conversation
-// History persistence, enabling sys.SessionGenerate / sys.SessionHistory. When
-// set, the worker lazily loads History (keyed by the ProcessID string) on first
-// use and saves it to hr before each transition commit — including terminal
-// commits, so a later restart/handoff can read the final transcript (ADR-0017).
-// Without it, SessionGenerate/SessionHistory return ErrHistoryNotConfigured (the
-// managed conversation is not silently run without persistence); a strategy that
-// manages History itself uses the primitive Generate instead. The store is a
-// SEPARATE port (blob storage) from the Kernel's Repository, injected here per
+// WithHistoryStore opts this agent into runtime-managed conversation History
+// persistence, enabling sys.Session(). When set, the worker lazily loads the
+// version named by Process.HistoryRef on first use, and before each transition
+// commit — including terminal commits, so a later restart/handoff can read the
+// final transcript — saves a new version and records its ref in the same Apply
+// (ADR-0017). Without it, the Session methods return ErrHistoryNotConfigured
+// (the managed conversation is not silently run without persistence); a strategy
+// that manages History itself uses the primitive Generate instead. The store is
+// a SEPARATE port (blob storage) from the Kernel's Repository, injected here per
 // agent rather than on the Kernel.
-func WithHistoryRepository[O any](hr gollem.HistoryRepository) RegisterOption[O] {
-	return func(c *registerConfig[O]) { c.historyRepo = hr }
+func WithHistoryStore[O any](hs HistoryStore) RegisterOption[O] {
+	return func(c *registerConfig[O]) { c.historyStore = hs }
 }
 
 // Register registers a typed strategy and returns a typed handle carrying the

@@ -2,6 +2,6 @@ package filesystem
 
 import "github.com/m-mizutani/goerr/v2"
 
-// ErrInvalidSessionID is returned when a sessionID is unsafe to use as a
-// filename (empty, or containing a path separator or "..").
-var ErrInvalidSessionID = goerr.New("invalid session id")
+// ErrInvalidPathComponent is returned when a ProcessID or HistoryRef is unsafe
+// to use as a path element (empty, or containing a path separator or "..").
+var ErrInvalidPathComponent = goerr.New("invalid path component")

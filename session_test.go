@@ -3,6 +3,7 @@ package agentkit_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,9 +18,9 @@ import (
 )
 
 // growingLLM returns a client whose History() is the seeded history plus one
-// message. Session.Generate seeds each call with the carried history, so across
+// message. Session().Generate seeds each call with the carried history, so across
 // transitions the message count grows by one per Generate — a distinguishable
-// signal for asserting that History was carried and (with a repo) persisted.
+// signal for asserting that History was carried and (with a store) persisted.
 func growingLLM() gollem.LLMClient {
 	return &mock.LLMClientMock{
 		NewSessionFunc: func(_ context.Context, opts ...gollem.SessionOption) (gollem.Session, error) {
@@ -49,16 +50,29 @@ func histLen(h *gollem.History) int {
 	return len(h.Messages)
 }
 
+// committedHistory loads the version the Process record names. It is how a test
+// reads "the History this Process actually committed", as opposed to whatever
+// versions happen to be lying in the store.
+func committedHistory(t *testing.T, store agentkit.HistoryStore, p *agentkit.Process) *gollem.History {
+	t.Helper()
+	if p.HistoryRef == "" {
+		return nil
+	}
+	h, err := store.Load(context.Background(), p.ID, p.HistoryRef)
+	gt.NoError(t, err)
+	return h
+}
+
 // sessionStep builds a step that records the carried-in History length (before
-// Generate), runs one Session.Generate, and Continues until `turns` generates
+// Generate), runs one Session().Generate, and Continues until `turns` generates
 // then Dones. seen captures the carried-in lengths across transitions/attempts.
 func sessionStep(seen *[]int, mu *sync.Mutex, turns int) stepFn {
 	return func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		h, _ := sys.SessionHistory(ctx)
+		h, _ := sys.Session().History(ctx)
 		mu.Lock()
 		*seen = append(*seen, histLen(h))
 		mu.Unlock()
-		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		st.N++
@@ -69,54 +83,101 @@ func sessionStep(seen *[]int, mu *sync.Mutex, turns int) stepFn {
 	}
 }
 
-func registerWithHistory(t *testing.T, step stepFn, model gollem.LLMClient, hr gollem.HistoryRepository, kopts ...agentkit.KernelOption) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput]) {
+func registerWithHistory(t *testing.T, step stepFn, model gollem.LLMClient, hs agentkit.HistoryStore, kopts ...agentkit.KernelOption) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput]) {
 	t.Helper()
 	repo := memory.New()
 	reg := agentkit.NewRegistry()
-	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryRepository[[]byte](hr))
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](hs))
 	gt.NoError(t, err)
 	k, err := agentkit.New(repo, model, reg, kopts...)
 	gt.NoError(t, err)
 	return k, repo, ag
 }
 
-// probeHistoryRepo wraps a HistoryRepository, recording every Save's message
-// length (in order) and the load count, and can inject Load/Save errors.
-type probeHistoryRepo struct {
-	inner   gollem.HistoryRepository
-	mu      sync.Mutex
-	saves   []int
-	loads   int
-	loadErr error
-	saveErr error
+// probeStore wraps a HistoryStore, recording every Save (message length and the
+// ref handed back) and every Discard, in order, plus the load count. It can
+// inject Load/Save failures or an empty ref.
+type probeStore struct {
+	inner     agentkit.HistoryStore
+	mu        sync.Mutex
+	saves     []int
+	savedRefs []agentkit.HistoryRef
+	discards  []agentkit.HistoryRef
+	loads     int
+	loadErr   error
+	saveErr   error
+	emptyRef  bool
 }
 
-func (r *probeHistoryRepo) Load(ctx context.Context, id string) (*gollem.History, error) {
-	r.mu.Lock()
-	r.loads++
-	le := r.loadErr
-	r.mu.Unlock()
+func (s *probeStore) Save(ctx context.Context, pid agentkit.ProcessID, h *gollem.History) (agentkit.HistoryRef, error) {
+	s.mu.Lock()
+	s.saves = append(s.saves, histLen(h))
+	se, empty := s.saveErr, s.emptyRef
+	s.mu.Unlock()
+	if se != nil {
+		return "", se
+	}
+	ref, err := s.inner.Save(ctx, pid, h)
+	if err == nil {
+		s.mu.Lock()
+		s.savedRefs = append(s.savedRefs, ref)
+		s.mu.Unlock()
+	}
+	if empty {
+		return "", nil
+	}
+	return ref, err
+}
+
+func (s *probeStore) Load(ctx context.Context, pid agentkit.ProcessID, ref agentkit.HistoryRef) (*gollem.History, error) {
+	s.mu.Lock()
+	s.loads++
+	le := s.loadErr
+	s.mu.Unlock()
 	if le != nil {
 		return nil, le
 	}
-	return r.inner.Load(ctx, id)
+	return s.inner.Load(ctx, pid, ref)
 }
 
-func (r *probeHistoryRepo) Save(ctx context.Context, id string, h *gollem.History) error {
-	r.mu.Lock()
-	r.saves = append(r.saves, histLen(h))
-	se := r.saveErr
-	r.mu.Unlock()
-	if se != nil {
-		return se
+func (s *probeStore) Discard(ctx context.Context, pid agentkit.ProcessID, ref agentkit.HistoryRef) {
+	s.mu.Lock()
+	s.discards = append(s.discards, ref)
+	s.mu.Unlock()
+	s.inner.Discard(ctx, pid, ref)
+}
+
+func (s *probeStore) setLoadErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadErr = err
+}
+
+func (s *probeStore) saveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.saves)
+}
+
+func (s *probeStore) discarded() []agentkit.HistoryRef {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]agentkit.HistoryRef(nil), s.discards...)
+}
+
+func (s *probeStore) saved() []agentkit.HistoryRef {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]agentkit.HistoryRef(nil), s.savedRefs...)
+}
+
+func contains(refs []agentkit.HistoryRef, want agentkit.HistoryRef) bool {
+	for _, r := range refs {
+		if r == want {
+			return true
+		}
 	}
-	return r.inner.Save(ctx, id, h)
-}
-
-func (r *probeHistoryRepo) saveCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.saves)
+	return false
 }
 
 // fragileRepo wraps a Repository and injects `err` into the first Apply that
@@ -142,8 +203,8 @@ func TestSession_PersistsAcrossTransitionsAndTerminal(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
 	var seen []int
-	hr := histmem.New()
-	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 3), growingLLM(), hr)
+	hs := histmem.New()
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 3), growingLLM(), hs)
 
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
@@ -155,9 +216,7 @@ func TestSession_PersistsAcrossTransitionsAndTerminal(t *testing.T) {
 	mu.Unlock()
 	gt.Value(t, got).Equal([]int{0, 1, 2})
 
-	stored, err := hr.Load(ctx, string(pid))
-	gt.NoError(t, err)
-	gt.Value(t, histLen(stored)).Equal(3) // terminal transition saved too (D-D).
+	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(3) // terminal transition saved too (D-D).
 }
 
 // TestSession_PersistsAcrossClaims forces one transition per claim so History
@@ -166,8 +225,8 @@ func TestSession_PersistsAcrossClaims(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
 	var seen []int
-	hr := histmem.New()
-	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 3), growingLLM(), hr)
+	hs := histmem.New()
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 3), growingLLM(), hs)
 
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
@@ -177,32 +236,34 @@ func TestSession_PersistsAcrossClaims(t *testing.T) {
 	mu.Lock()
 	got := append([]int(nil), seen...)
 	mu.Unlock()
-	gt.Value(t, got).Equal([]int{0, 1, 2}) // each new claim loaded the prior claim's saved history.
+	gt.Value(t, got).Equal([]int{0, 1, 2}) // each new claim loaded the version the record named.
 
-	stored, err := hr.Load(ctx, string(pid))
-	gt.NoError(t, err)
-	gt.Value(t, histLen(stored)).Equal(3)
+	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(3)
 }
 
-// TestSession_WithoutRepositoryErrors verifies that using the managed
-// conversation on an agent NOT registered with WithHistoryRepository fails
-// loudly (ErrHistoryNotConfigured) instead of silently running without
-// persistence — for both SessionGenerate and SessionHistory.
-func TestSession_WithoutRepositoryErrors(t *testing.T) {
+// TestSession_WithoutStoreErrors verifies that using the managed conversation on
+// an agent NOT registered with WithHistoryStore fails loudly
+// (ErrHistoryNotConfigured) instead of silently running without persistence.
+// Session() itself still hands back a usable handle — the error belongs at the
+// point of use, not to a nil check the caller can forget.
+func TestSession_WithoutStoreErrors(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
-	var genErr, histErr error
+	var genErr, histErr, toolErr error
+	var handleNil bool
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		_, he := sys.SessionHistory(ctx)
-		_, ge := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")})
+		sess := sys.Session()
+		_, he := sess.History(ctx)
+		_, te := sess.CallTool(ctx, gollem.FunctionCall{ID: "c1", Name: "t"})
+		_, ge := sess.Generate(ctx, []gollem.Input{gollem.Text("hi")})
 		mu.Lock()
-		histErr, genErr = he, ge
+		handleNil, histErr, toolErr, genErr = sess == nil, he, te, ge
 		mu.Unlock()
 		return st, agentkit.Decision[[]byte]{}, ge
 	}
 	repo := memory.New()
 	reg := agentkit.NewRegistry()
-	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}) // no WithHistoryRepository.
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}) // no WithHistoryStore.
 	gt.NoError(t, err)
 	k, err := agentkit.New(repo, growingLLM(), reg)
 	gt.NoError(t, err)
@@ -213,44 +274,67 @@ func TestSession_WithoutRepositoryErrors(t *testing.T) {
 	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
 
 	mu.Lock()
-	ge, he := genErr, histErr
-	mu.Unlock()
-	gt.Value(t, errors.Is(ge, agentkit.ErrHistoryNotConfigured)).Equal(true)
-	gt.Value(t, errors.Is(he, agentkit.ErrHistoryNotConfigured)).Equal(true)
+	defer mu.Unlock()
+	gt.Value(t, handleNil).Equal(false)
+	gt.Value(t, errors.Is(genErr, agentkit.ErrHistoryNotConfigured)).Equal(true)
+	gt.Value(t, errors.Is(histErr, agentkit.ErrHistoryNotConfigured)).Equal(true)
+	gt.Value(t, errors.Is(toolErr, agentkit.ErrHistoryNotConfigured)).Equal(true)
 }
 
 // ---- error paths ----
 
+// A fresh Process names no version, so its first transition loads nothing. The
+// load only happens once a ref is committed, which is what this arms for.
 func TestSession_LoadErrorFailsTransition(t *testing.T) {
 	ctx := context.Background()
-	var mu sync.Mutex
-	var seen []int
-	hr := &probeHistoryRepo{inner: histmem.New(), loadErr: gollemErr("load boom")}
-	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 3), growingLLM(), hr)
+	store := &probeStore{inner: histmem.New()}
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		store.setLoadErr(gollemErr("load boom")) // breaks the NEXT claim's load.
+		st.N++
+		if st.N >= 3 {
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		return st, agentkit.Continue[[]byte](), nil
+	}
+	k, repo, ag := registerWithHistory(t, step, growingLLM(), store)
 
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
-	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepAttempts(1))
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal,
+		agentkit.WithMaxStepsPerClaim(1), agentkit.WithMaxStepAttempts(1))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
 	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
 }
 
-// TestSession_HistoryMethodSurfacesLoadError checks that Session.History(ctx)
+// TestSession_HistoryMethodSurfacesLoadError checks that Session().History
 // propagates a load failure to the strategy rather than returning nil silently.
 func TestSession_HistoryMethodSurfacesLoadError(t *testing.T) {
 	ctx := context.Background()
-	hr := &probeHistoryRepo{inner: histmem.New(), loadErr: gollemErr("load boom")}
+	store := &probeStore{inner: histmem.New()}
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		if _, herr := sys.SessionHistory(ctx); herr != nil {
+		if st.N == 0 {
+			// Commit a version first: there is nothing to fail to load until then.
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			store.setLoadErr(gollemErr("load boom"))
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		if _, herr := sys.Session().History(ctx); herr != nil {
 			return st, agentkit.Decision[[]byte]{}, herr
 		}
 		return st, agentkit.Done([]byte("x")), nil
 	}
-	k, repo, ag := registerWithHistory(t, step, growingLLM(), hr)
+	k, repo, ag := registerWithHistory(t, step, growingLLM(), store)
 
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
-	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepAttempts(1))
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal,
+		agentkit.WithMaxStepsPerClaim(1), agentkit.WithMaxStepAttempts(1))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
 	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
 }
@@ -259,38 +343,62 @@ func TestSession_SaveErrorRequeues(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
 	var seen []int
-	hr := &probeHistoryRepo{inner: histmem.New(), saveErr: gollemErr("save boom")}
-	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 3), growingLLM(), hr)
+	store := &probeStore{inner: histmem.New(), saveErr: gollemErr("save boom")}
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 3), growingLLM(), store)
 
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
 	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepAttempts(1))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
 	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	gt.Value(t, p.HistoryRef).Equal(agentkit.HistoryRef("")) // nothing was committed.
+}
+
+// An empty ref is the record's way of saying "nothing committed yet", so a store
+// that returns one would make the next Load be skipped and silently truncate the
+// conversation. The transition must fail instead.
+func TestSession_SaveEmptyRefFailsTransition(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	store := &probeStore{inner: histmem.New(), emptyRef: true}
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 3), growingLLM(), store)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepAttempts(1))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	gt.Value(t, p.HistoryRef).Equal(agentkit.HistoryRef(""))
 }
 
 // ---- ordering ----
 
-// orderHistoryRepo records, at Save time, the process's currently-committed
-// StateSeq (read from the process repo). save-before-commit means the value
-// observed is the pre-commit StateSeq.
-type orderHistoryRepo struct {
+// orderStore records, at Save time, the process's currently-committed StateSeq
+// (read from the process repo). save-before-commit means the value observed is
+// the pre-commit StateSeq.
+type orderStore struct {
 	proc      agentkit.Repository
-	inner     gollem.HistoryRepository
+	inner     agentkit.HistoryStore
 	mu        sync.Mutex
 	seqOnSave []int
 }
 
-func (r *orderHistoryRepo) Load(ctx context.Context, id string) (*gollem.History, error) {
-	return r.inner.Load(ctx, id)
+func (s *orderStore) Load(ctx context.Context, pid agentkit.ProcessID, ref agentkit.HistoryRef) (*gollem.History, error) {
+	return s.inner.Load(ctx, pid, ref)
 }
-func (r *orderHistoryRepo) Save(ctx context.Context, id string, h *gollem.History) error {
-	if p, err := r.proc.GetProcess(ctx, agentkit.ProcessID(id)); err == nil {
-		r.mu.Lock()
-		r.seqOnSave = append(r.seqOnSave, p.StateSeq)
-		r.mu.Unlock()
+
+func (s *orderStore) Save(ctx context.Context, pid agentkit.ProcessID, h *gollem.History) (agentkit.HistoryRef, error) {
+	if p, err := s.proc.GetProcess(ctx, pid); err == nil {
+		s.mu.Lock()
+		s.seqOnSave = append(s.seqOnSave, p.StateSeq)
+		s.mu.Unlock()
 	}
-	return r.inner.Save(ctx, id, h)
+	return s.inner.Save(ctx, pid, h)
+}
+
+func (s *orderStore) Discard(ctx context.Context, pid agentkit.ProcessID, ref agentkit.HistoryRef) {
+	s.inner.Discard(ctx, pid, ref)
 }
 
 func TestSession_SaveHappensBeforeCommit(t *testing.T) {
@@ -298,9 +406,9 @@ func TestSession_SaveHappensBeforeCommit(t *testing.T) {
 	var mu sync.Mutex
 	var seen []int
 	repo := memory.New()
-	hr := &orderHistoryRepo{proc: repo, inner: histmem.New()}
+	hs := &orderStore{proc: repo, inner: histmem.New()}
 	reg := agentkit.NewRegistry()
-	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: sessionStep(&seen, &mu, 1)}, agentkit.WithHistoryRepository[[]byte](hr))
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: sessionStep(&seen, &mu, 1)}, agentkit.WithHistoryStore[[]byte](hs))
 	gt.NoError(t, err)
 	k, err := agentkit.New(repo, growingLLM(), reg)
 	gt.NoError(t, err)
@@ -311,9 +419,9 @@ func TestSession_SaveHappensBeforeCommit(t *testing.T) {
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 	gt.Value(t, p.StateSeq).Equal(1)
 
-	hr.mu.Lock()
-	seqs := append([]int(nil), hr.seqOnSave...)
-	hr.mu.Unlock()
+	hs.mu.Lock()
+	seqs := append([]int(nil), hs.seqOnSave...)
+	hs.mu.Unlock()
 	gt.Value(t, len(seqs)).Equal(1)
 	gt.Value(t, seqs[0]).Equal(0) // saved before the commit that bumped StateSeq to 1.
 }
@@ -322,24 +430,26 @@ func TestSession_SaveHappensBeforeCommit(t *testing.T) {
 
 // TestSession_SameLeaseConflictReseeds injects one ErrConflict on the second
 // transition's Apply. The same-lease retry must re-seed from the committed
-// baseline, NOT from the aborted attempt's history, so no turn is duplicated.
+// version, NOT from the aborted attempt's history, so no turn is duplicated —
+// and the version that attempt saved must be released, since a conflict proves
+// nothing committed.
 func TestSession_SameLeaseConflictReseeds(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
 	var seen []int
 	inner := memory.New()
 	repo := &fragileRepo{Repository: inner, err: agentkit.ErrConflict}
-	hr := histmem.New()
+	store := &probeStore{inner: histmem.New()}
 	reg := agentkit.NewRegistry()
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		h, _ := sys.SessionHistory(ctx)
+		h, _ := sys.Session().History(ctx)
 		mu.Lock()
 		seen = append(seen, histLen(h))
 		mu.Unlock()
 		if st.N == 1 {
 			repo.armed.Store(true) // arm the one-shot conflict on entering the 2nd transition.
 		}
-		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		st.N++
@@ -348,7 +458,7 @@ func TestSession_SameLeaseConflictReseeds(t *testing.T) {
 		}
 		return st, agentkit.Continue[[]byte](), nil
 	}
-	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryRepository[[]byte](hr))
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](store))
 	gt.NoError(t, err)
 	k, err := agentkit.New(repo, growingLLM(), reg)
 	gt.NoError(t, err)
@@ -361,38 +471,46 @@ func TestSession_SameLeaseConflictReseeds(t *testing.T) {
 	mu.Lock()
 	got := append([]int(nil), seen...)
 	mu.Unlock()
-	// T1=0, T2-attempt1=1, T2-attempt2=1 (re-seeded from committed baseline, not 2), T3=2.
+	// T1=0, T2-attempt1=1, T2-attempt2=1 (re-seeded from the committed version, not 2), T3=2.
 	gt.Value(t, got).Equal([]int{0, 1, 1, 2})
 
-	stored, err := hr.Load(ctx, string(pid))
-	gt.NoError(t, err)
-	gt.Value(t, histLen(stored)).Equal(3) // no duplication: 3 turns, not 4.
+	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(3) // no duplication: 3 turns, not 4.
+
+	// One save per attempt: T1, T2-attempt1 (conflicted), T2-attempt2, T3.
+	saved := store.saved()
+	gt.Array(t, saved).Length(4)
+	// The conflicted attempt's version is released — a conflict proves nothing
+	// committed — and it never became the committed one.
+	gt.Value(t, contains(store.discarded(), saved[1])).Equal(true)
+	gt.Value(t, saved[1]).NotEqual(p.HistoryRef)
+	// The committed version itself is not released.
+	gt.Value(t, contains(store.discarded(), p.HistoryRef)).Equal(false)
 }
 
-// ---- crash between save and commit (tolerated duplication) ----
+// ---- crash between save and commit ----
 
-// TestSession_CrashBetweenSaveAndCommitDuplicates injects a non-conflict Apply
+// TestSession_CrashBetweenSaveAndCommitRollsBack injects a non-conflict Apply
 // error on the second transition (a crash at commit, after the History save
-// already ran). The claim abandons; a re-claim re-runs from committed State but
-// loads the ahead-of-State saved history, so the conversation carries a
-// duplicated turn — the accepted best-effort behavior (ADR-0017).
-func TestSession_CrashBetweenSaveAndCommitDuplicates(t *testing.T) {
+// already ran). The claim abandons; a re-claim re-runs from committed State and
+// loads the version the record still names — the saved-but-uncommitted one is
+// never reachable, so the conversation carries no duplicated turn.
+func TestSession_CrashBetweenSaveAndCommitRollsBack(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
 	var seen []int
 	inner := memory.New()
 	repo := &fragileRepo{Repository: inner, err: gollemErr("disk gone at commit")}
-	hr := histmem.New()
+	store := &probeStore{inner: histmem.New()}
 	reg := agentkit.NewRegistry()
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		h, _ := sys.SessionHistory(ctx)
+		h, _ := sys.Session().History(ctx)
 		mu.Lock()
 		seen = append(seen, histLen(h))
 		mu.Unlock()
 		if st.N == 1 {
 			repo.armed.Store(true) // crash the 2nd transition's commit (after its History save).
 		}
-		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		st.N++
@@ -401,7 +519,7 @@ func TestSession_CrashBetweenSaveAndCommitDuplicates(t *testing.T) {
 		}
 		return st, agentkit.Continue[[]byte](), nil
 	}
-	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryRepository[[]byte](hr))
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](store))
 	gt.NoError(t, err)
 	k, err := agentkit.New(repo, growingLLM(), reg)
 	gt.NoError(t, err)
@@ -412,36 +530,319 @@ func TestSession_CrashBetweenSaveAndCommitDuplicates(t *testing.T) {
 		agentkit.WithLease(80*time.Millisecond), agentkit.WithMaxUncleanReclaims(10))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 
-	// The aborted attempt saved a len-2 history that its State never committed; the
-	// re-claim loads it and appends, so the final transcript is one turn longer
-	// than the clean run's 3 — duplication is tolerated, and the process still
-	// completes well-formed.
-	stored, err := hr.Load(ctx, string(pid))
-	gt.NoError(t, err)
-	gt.Value(t, histLen(stored)).Equal(4)
+	// A clean run is 3 turns; the aborted attempt's version was saved but never
+	// named by the record, so the transcript is still 3 and not 4.
+	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(3)
 }
 
-// ---- stale-worker fence (the #1 fix) ----
+// An Apply failure that is not a conflict leaves the commit outcome unknown, so
+// the version this attempt saved must be kept: discarding it could release the
+// one the record now names.
+func TestSession_UnknownApplyErrorKeepsVersion(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.New()
+	repo := &fragileRepo{Repository: inner, err: gollemErr("disk gone at commit")}
+	store := &probeStore{inner: histmem.New()}
+	reg := agentkit.NewRegistry()
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			repo.armed.Store(true)
+		}
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		st.N++
+		if st.N >= 2 {
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		return st, agentkit.Continue[[]byte](), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](store))
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
 
-// TestSession_StaleWorkerSaveSkipped simulates a newer worker reclaiming the
-// Process mid-transition (the lease token changes). The pre-save fence must skip
-// the stale worker's History write entirely, so its Save never reaches the
-// store; the Process then recovers on a clean re-claim. Without the fence the
-// stale Save would run (two Saves for a one-transition process); with it there
-// is exactly one.
-func TestSession_StaleWorkerSaveSkipped(t *testing.T) {
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal,
+		agentkit.WithLease(80*time.Millisecond), agentkit.WithMaxUncleanReclaims(10))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	// The first attempt is the one whose Apply failed opaquely. Its version is
+	// still in the store: no Discard names it, and it never became the committed
+	// one either.
+	saved := store.saved()
+	gt.Value(t, len(saved) > 1).Equal(true)
+	gt.Value(t, contains(store.discarded(), saved[0])).Equal(false)
+	gt.Value(t, saved[0]).NotEqual(p.HistoryRef)
+}
+
+// ---- a ref the record still names is never released ----
+
+// contentAddressedStore names a version by its content (here, its message
+// count), so saving the same conversation twice hands back the same ref. The
+// HistoryStore contract allows this explicitly, and it is what makes "release
+// the version this attempt saved" dangerous: that ref can be the committed one.
+type contentAddressedStore struct {
+	mu       sync.Mutex
+	m        map[agentkit.HistoryRef]*gollem.History
+	discards []agentkit.HistoryRef
+}
+
+func newContentAddressedStore() *contentAddressedStore {
+	return &contentAddressedStore{m: make(map[agentkit.HistoryRef]*gollem.History)}
+}
+
+func (s *contentAddressedStore) Save(_ context.Context, _ agentkit.ProcessID, h *gollem.History) (agentkit.HistoryRef, error) {
+	ref := agentkit.HistoryRef(fmt.Sprintf("len-%d", histLen(h)))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m[ref] = h.Clone()
+	return ref, nil
+}
+
+func (s *contentAddressedStore) Load(_ context.Context, _ agentkit.ProcessID, ref agentkit.HistoryRef) (*gollem.History, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, ok := s.m[ref]
+	if !ok {
+		return nil, agentkit.ErrHistoryVersionMissing
+	}
+	return h.Clone(), nil
+}
+
+func (s *contentAddressedStore) Discard(_ context.Context, _ agentkit.ProcessID, ref agentkit.HistoryRef) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.discards = append(s.discards, ref)
+	delete(s.m, ref)
+}
+
+func (s *contentAddressedStore) discarded() []agentkit.HistoryRef {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]agentkit.HistoryRef(nil), s.discards...)
+}
+
+// stableLLM answers with a history that never grows, so two Generates over the
+// same conversation produce identical content — and a content-addressed store
+// returns the same ref for both.
+func stableLLM() gollem.LLMClient {
+	return &mock.LLMClientMock{
+		NewSessionFunc: func(_ context.Context, _ ...gollem.SessionOption) (gollem.Session, error) {
+			return &mock.SessionMock{
+				GenerateFunc: func(_ context.Context, _ []gollem.Input, _ ...gollem.GenerateOption) (*gollem.Response, error) {
+					return &gollem.Response{Texts: []string{"ok"}, InputToken: 1, OutputToken: 1}, nil
+				},
+				HistoryFunc: func() (*gollem.History, error) {
+					return &gollem.History{
+						LLType:   gollem.LLMTypeClaude,
+						Version:  gollem.HistoryVersion,
+						Messages: make([]gollem.Message, 1),
+					}, nil
+				},
+			}, nil
+		},
+	}
+}
+
+// A conflicted attempt releases the version it saved — unless the store handed
+// back the ref the record already names, in which case releasing it would
+// destroy the committed conversation.
+func TestSession_ConflictKeepsRefTheRecordStillNames(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.New()
+	repo := &fragileRepo{Repository: inner, err: agentkit.ErrConflict}
+	store := newContentAddressedStore()
+	reg := agentkit.NewRegistry()
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 1 {
+			repo.armed.Store(true) // conflict the 2nd transition's Apply, after its save.
+		}
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		st.N++
+		if st.N >= 3 {
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		return st, agentkit.Continue[[]byte](), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](store))
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, stableLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	// Every save returned the same ref, so nothing was ever superseded and the
+	// conflicted attempt must not have released it.
+	gt.Value(t, p.HistoryRef).Equal(agentkit.HistoryRef("len-1"))
+	gt.Array(t, store.discarded()).Length(0)
+	got, lerr := store.Load(ctx, pid, p.HistoryRef)
+	gt.NoError(t, lerr)
+	gt.Value(t, histLen(got)).Equal(1)
+}
+
+// When another path finishes the Process first, this worker's terminal Apply
+// conflicts and the record keeps whatever that path wrote — including its
+// HistoryRef. Treating the "already terminal" outcome as its own success would
+// release the version the record still names.
+func TestSession_TerminalLostToAnotherPathKeepsVersion(t *testing.T) {
 	ctx := context.Background()
 	repo := memory.New()
-	hr := &probeHistoryRepo{inner: histmem.New()}
+	store := &probeStore{inner: histmem.New()}
+	reg := agentkit.NewRegistry()
+	var raced atomic.Bool
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		// Another path terminates the Process before this transition commits,
+		// leaving HistoryRef at the version the first transition committed.
+		if raced.CompareAndSwap(false, true) {
+			if cur, gerr := repo.GetProcess(ctx, sys.ProcessID()); gerr == nil {
+				np := agentkit.CloneProcess(cur)
+				np.Status = agentkit.ProcessSucceeded
+				np.Output = []byte("finished-by-another-path")
+				_ = repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{np}})
+			}
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](store))
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, raced.Load()).Equal(true)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("finished-by-another-path")
+
+	// The record names the first transition's version, and it is still there.
+	gt.Value(t, contains(store.discarded(), p.HistoryRef)).Equal(false)
+	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(1)
+}
+
+// Session().History hands out a copy. Mutating it must not reach the committed
+// baseline, which is what a same-lease retry re-seeds from.
+func TestSession_HistoryReturnsACopy(t *testing.T) {
+	ctx := context.Background()
+	hs := histmem.New()
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 1 {
+			// Second transition: the baseline is non-nil here. Mutating what
+			// History() returned must not affect what Generate seeds from.
+			h, herr := sys.Session().History(ctx)
+			if herr != nil {
+				return st, agentkit.Decision[[]byte]{}, herr
+			}
+			h.Messages = append(h.Messages, gollem.Message{Role: gollem.RoleUser})
+		}
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		st.N++
+		if st.N >= 2 {
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		return st, agentkit.Continue[[]byte](), nil
+	}
+	k, repo, ag := registerWithHistory(t, step, growingLLM(), hs)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	// growingLLM adds one message per Generate: two transitions make 2. A leaked
+	// baseline would have carried the strategy's extra message into the second
+	// Generate's seed and committed 3.
+	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(2)
+}
+
+// ---- superseded versions ----
+
+// Once a transition's version is committed, the one it replaced is no longer
+// referenced and the store is told so — that is what keeps the steady state at a
+// couple of versions instead of one per Step.
+func TestSession_SupersededVersionDiscarded(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	store := &probeStore{inner: histmem.New()}
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 3), growingLLM(), store)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	// Three saves, and the two superseded ones released. The committed one is not
+	// among them — it is still loadable.
+	gt.Value(t, store.saveCount()).Equal(3)
+	gt.Array(t, store.discarded()).Length(2)
+	gt.Value(t, contains(store.discarded(), p.HistoryRef)).Equal(false)
+	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(3)
+}
+
+// A transition that does not touch the managed conversation leaves the record's
+// ref alone and releases nothing.
+func TestSession_UntouchedConversationKeepsRef(t *testing.T) {
+	ctx := context.Background()
+	store := &probeStore{inner: histmem.New()}
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil // no Session use at all.
+	}
+	k, repo, ag := registerWithHistory(t, step, growingLLM(), store)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	gt.Value(t, store.saveCount()).Equal(1)
+	gt.Array(t, store.discarded()).Length(0)
+	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(1)
+}
+
+// ---- stale worker ----
+
+// TestSession_StaleWorkerSaveDoesNotAffectCommitted simulates a newer worker
+// reclaiming the Process mid-transition (the lease token changes). The stale
+// worker's Save still runs — there is no fence any more, and none is needed:
+// a version is never rewritten, so all it can do is add one nobody references.
+// What matters is that the record ends up naming the version of the attempt that
+// actually committed.
+func TestSession_StaleWorkerSaveDoesNotAffectCommitted(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	store := &probeStore{inner: histmem.New()}
 	reg := agentkit.NewRegistry()
 	var stole atomic.Bool
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		// On the first attempt, simulate a newer worker reclaiming this Process by
-		// rewriting its lease token. The pre-save fence must then skip this (now
-		// stale) worker's History write.
+		// rewriting its lease token, so this attempt's commit is fenced out.
 		if stole.CompareAndSwap(false, true) {
 			if cur, gerr := repo.GetProcess(ctx, sys.ProcessID()); gerr == nil {
 				np := agentkit.CloneProcess(cur)
@@ -451,7 +852,7 @@ func TestSession_StaleWorkerSaveSkipped(t *testing.T) {
 		}
 		return st, agentkit.Done([]byte("done")), nil
 	}
-	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryRepository[[]byte](hr))
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](store))
 	gt.NoError(t, err)
 	k, err := agentkit.New(repo, growingLLM(), reg)
 	gt.NoError(t, err)
@@ -462,30 +863,33 @@ func TestSession_StaleWorkerSaveSkipped(t *testing.T) {
 		agentkit.WithLease(80*time.Millisecond), agentkit.WithMaxUncleanReclaims(10))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 	gt.Value(t, stole.Load()).Equal(true) // the steal actually happened.
-	gt.Value(t, hr.saveCount()).Equal(1)  // the stale attempt's Save was fenced out.
+
+	// The stale attempt did write a version (2 saves for a one-transition process),
+	// and it cost nothing: the record names the committing attempt's version and it
+	// still resolves.
+	gt.Value(t, store.saveCount()).Equal(2)
+	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(1)
 }
 
 // ---- terminal variants ----
 
 func TestSession_FailTerminalSavesHistory(t *testing.T) {
 	ctx := context.Background()
-	hr := histmem.New()
+	hs := histmem.New()
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Fail[[]byte](agentkit.FailureStrategyError, "boom"), nil
 	}
-	k, repo, ag := registerWithHistory(t, step, growingLLM(), hr)
+	k, repo, ag := registerWithHistory(t, step, growingLLM(), hs)
 
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
 	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
 	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
 
-	stored, err := hr.Load(ctx, string(pid)) // Fail terminal saved History too (D-D).
-	gt.NoError(t, err)
-	gt.Value(t, histLen(stored)).Equal(1)
+	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(1) // Fail terminal saved History too (D-D).
 }
 
 // ---- tools ----
@@ -510,7 +914,7 @@ func TestSession_InjectsClaimTools(t *testing.T) {
 		},
 	}
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		return st, agentkit.Done([]byte("done")), nil
@@ -525,6 +929,236 @@ func TestSession_InjectsClaimTools(t *testing.T) {
 	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 	gt.Value(t, atomic.LoadInt32(&sawTool)).Equal(int32(1))
+}
+
+// lastToolResponse returns the ToolResponseContent of a History's last message,
+// failing the test unless that message is a single tool response.
+func lastToolResponse(t *testing.T, h *gollem.History) *gollem.ToolResponseContent {
+	t.Helper()
+	gt.NotNil(t, h)
+	gt.Value(t, len(h.Messages) > 0).Equal(true)
+	last := h.Messages[len(h.Messages)-1]
+	gt.Value(t, last.Role).Equal(gollem.RoleTool)
+	gt.Array(t, last.Contents).Length(1)
+	tr, err := last.Contents[0].GetToolResponseContent()
+	gt.NoError(t, err)
+	return tr
+}
+
+func TestSession_CallToolAppendsResult(t *testing.T) {
+	ctx := context.Background()
+	hs := histmem.New()
+	var mu sync.Mutex
+	var afterLen int
+	var toolResp *gollem.ToolResponseContent
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		out, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "call-1", Name: "t"})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if out["ok"] != true {
+			return st, agentkit.Decision[[]byte]{}, gollemErr("unexpected tool output")
+		}
+		h, herr := sys.Session().History(ctx)
+		if herr != nil {
+			return st, agentkit.Decision[[]byte]{}, herr
+		}
+		mu.Lock()
+		afterLen = histLen(h)
+		toolResp = lastToolResponse(t, h)
+		mu.Unlock()
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	factory := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{mockTool("t", map[string]any{"ok": true})}, nil
+	}
+	k, repo, ag := registerWithHistory(t, step, growingLLM(), hs, agentkit.WithToolFactory(factory))
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Value(t, afterLen).Equal(2) // the generate's message plus the appended result.
+	gt.Value(t, toolResp.ToolCallID).Equal("call-1")
+	gt.Value(t, toolResp.Name).Equal("t")
+	gt.Value(t, toolResp.IsError).Equal(false)
+	// And it is what got committed, not just what the strategy saw.
+	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(2)
+}
+
+// A failing tool still has to close the pair: the model asked for the call, so
+// the next request must answer it. The error reaches the strategy as well.
+func TestSession_CallToolAppendsErrorResult(t *testing.T) {
+	ctx := context.Background()
+	hs := histmem.New()
+	var mu sync.Mutex
+	var callErr error
+	var toolResp *gollem.ToolResponseContent
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		// No tool named "missing" exists, so the call fails before any Run.
+		_, cerr := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "call-1", Name: "missing"})
+		h, herr := sys.Session().History(ctx)
+		if herr != nil {
+			return st, agentkit.Decision[[]byte]{}, herr
+		}
+		mu.Lock()
+		callErr = cerr
+		toolResp = lastToolResponse(t, h)
+		mu.Unlock()
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	k, repo, ag := registerWithHistory(t, step, growingLLM(), hs)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Value(t, errors.Is(callErr, agentkit.ErrToolNotFound)).Equal(true)
+	gt.Value(t, toolResp.ToolCallID).Equal("call-1")
+	gt.Value(t, toolResp.IsError).Equal(true)
+	gt.Value(t, toolResp.Response["error"] != nil).Equal(true)
+}
+
+// Appending a result to a conversation that does not exist yet would mean
+// inventing the provider identity a History carries, so the call is refused
+// before the tool runs.
+func TestSession_CallToolWithoutHistoryRejected(t *testing.T) {
+	ctx := context.Background()
+	var ran atomic.Bool
+	var mu sync.Mutex
+	var callErr error
+	tool := &mock.ToolMock{
+		SpecFunc: func() gollem.ToolSpec { return gollem.ToolSpec{Name: "t"} },
+		RunFunc: func(_ context.Context, _ map[string]any) (map[string]any, error) {
+			ran.Store(true)
+			return map[string]any{"ok": true}, nil
+		},
+	}
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		_, cerr := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "call-1", Name: "t"})
+		mu.Lock()
+		callErr = cerr
+		mu.Unlock()
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	factory := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{tool}, nil
+	}
+	k, repo, ag := registerWithHistory(t, step, growingLLM(), histmem.New(), agentkit.WithToolFactory(factory))
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Value(t, errors.Is(callErr, agentkit.ErrInvalidRequest)).Equal(true)
+	gt.Value(t, ran.Load()).Equal(false)
+	gt.Value(t, p.HistoryRef).Equal(agentkit.HistoryRef("")) // nothing was appended, nothing saved.
+}
+
+// ---- tool round split across steps ----
+
+// toolThenTextLLM answers the first Generate of each session with a tool call and
+// any later one with text, and grows the history by one message per call. It is
+// the shape a strategy hits when the model asks for a tool and then replies.
+func toolThenTextLLM(callID, toolName string) gollem.LLMClient {
+	return &mock.LLMClientMock{
+		NewSessionFunc: func(_ context.Context, opts ...gollem.SessionOption) (gollem.Session, error) {
+			cfg := gollem.NewSessionConfig(opts...)
+			var seeded []gollem.Message
+			if h := cfg.History(); h != nil {
+				seeded = h.Messages
+			}
+			// The tool call comes only while the conversation is still empty; once
+			// the seeded history carries the tool_use and its result, answer in text.
+			wantTool := len(seeded) == 0
+			return &mock.SessionMock{
+				GenerateFunc: func(_ context.Context, _ []gollem.Input, _ ...gollem.GenerateOption) (*gollem.Response, error) {
+					if wantTool {
+						return &gollem.Response{
+							FunctionCalls: []*gollem.FunctionCall{{ID: callID, Name: toolName}},
+							InputToken:    1, OutputToken: 1,
+						}, nil
+					}
+					return &gollem.Response{Texts: []string{"final"}, InputToken: 1, OutputToken: 1}, nil
+				},
+				HistoryFunc: func() (*gollem.History, error) {
+					grown := make([]gollem.Message, len(seeded)+1)
+					copy(grown, seeded)
+					return &gollem.History{LLType: gollem.LLMTypeClaude, Version: gollem.HistoryVersion, Messages: grown}, nil
+				},
+			}, nil
+		},
+	}
+}
+
+// The obligation this change removes: a Step may commit with the conversation
+// mid-round. Step 1 generates a tool_use and Continues without answering it;
+// Step 2 (a different claim) runs the tool, appends the result, and generates
+// again with no input at all.
+func TestSession_ToolRoundSplitAcrossSteps(t *testing.T) {
+	ctx := context.Background()
+	hs := histmem.New()
+	var mu sync.Mutex
+	var pendingSeen int
+	var finalTexts []string
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			res, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")})
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			mu.Lock()
+			pendingSeen = len(res.FunctionCalls)
+			mu.Unlock()
+			// Commit here, with the conversation ending on the unanswered call.
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		if _, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "call-1", Name: "t"}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		res, err := sys.Session().Generate(ctx, nil) // no input: the result is already in the History.
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		mu.Lock()
+		finalTexts = res.Texts
+		mu.Unlock()
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	factory := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{mockTool("t", map[string]any{"ok": true})}, nil
+	}
+	k, repo, ag := registerWithHistory(t, step, toolThenTextLLM("call-1", "t"), hs, agentkit.WithToolFactory(factory))
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	// One transition per claim, so the second Step genuinely reloads the committed
+	// mid-round conversation instead of carrying it in memory.
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepsPerClaim(1))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Value(t, pendingSeen).Equal(1)
+	gt.Value(t, finalTexts).Equal([]string{"final"})
+	// 1 (tool_use turn) + 1 (appended result) + 1 (final turn).
+	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(3)
 }
 
 // WithLLMSessionOptions is appended last, so gollem.WithSessionHistory passed
@@ -573,7 +1207,7 @@ func TestSession_LLMSessionOptionsOverrideManagedHistory(t *testing.T) {
 		if st.N == 0 {
 			opts = append(opts, agentkit.WithLLMSessionOptions(gollem.WithSessionHistory(injected)))
 		}
-		if _, err := sys.SessionGenerate(ctx, []gollem.Input{gollem.Text("hi")}, opts...); err != nil {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}, opts...); err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
 		if st.N == 0 {
@@ -582,8 +1216,8 @@ func TestSession_LLMSessionOptionsOverrideManagedHistory(t *testing.T) {
 		}
 		return st, agentkit.Done([]byte("done")), nil
 	}
-	hr := histmem.New()
-	k, repo, ag := registerWithHistory(t, step, model, hr)
+	hs := histmem.New()
+	k, repo, ag := registerWithHistory(t, step, model, hs)
 
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
@@ -596,7 +1230,5 @@ func TestSession_LLMSessionOptionsOverrideManagedHistory(t *testing.T) {
 	gt.Value(t, seen[0]).Equal(7) // the override replaced the empty managed History,
 	gt.Value(t, seen[1]).Equal(8) // and its result carried on as the baseline.
 
-	stored, err := hr.Load(ctx, string(pid))
-	gt.NoError(t, err)
-	gt.Value(t, histLen(stored)).Equal(9) // persisted, not just carried in memory.
+	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(9) // persisted, not just carried in memory.
 }
