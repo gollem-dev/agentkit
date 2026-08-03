@@ -199,6 +199,15 @@ func (s *probeStore) discardedPairs() []histCall {
 	return append([]histCall(nil), s.discCalls...)
 }
 
+// discardedRef reports whether any Discard named ref, under ANY process id.
+// Ignoring the pid is the point: a version announced under the WRONG id is
+// exactly the failure to catch here, and the reference stores make such a call a
+// silent no-op (they namespace versions per process), so a pid-qualified check
+// would pass while the kernel was releasing another Process's live version.
+func discardedRef(calls []histCall, ref agentkit.HistoryRef) bool {
+	return slices.ContainsFunc(calls, func(c histCall) bool { return c.ref == ref })
+}
+
 // fragileRepo wraps a Repository and injects `err` into the first Apply that
 // runs while armed (one-shot). Used to simulate a same-lease conflict
 // (ErrConflict) or a crash at commit (a generic error).
@@ -1041,32 +1050,61 @@ func TestSession_InheritedHistorySeedsTheConversation(t *testing.T) {
 // The inherited version must survive the heir's commits. It is the one thing a
 // Discard keyed on the heir's own id would destroy: the issuing Process's record
 // still names it, so releasing it is data loss for a Process nobody touched.
+// Both commit shapes are covered, because the release runs on both paths and
+// they differ in what the heir's own ref holds at the time: a non-terminal commit
+// (worker.go's buildCommit path) and a terminal one reached on the FIRST
+// transition, where the heir's ref is still empty and the inherited pair is the
+// only version it knows about.
 func TestSession_InheritedVersionIsNeverDiscarded(t *testing.T) {
 	ctx := context.Background()
-	var mu sync.Mutex
-	var seen []int
-	store := &probeStore{inner: histmem.New()}
-	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 2), growingLLM(), store)
 
-	issuer := runIssuer(t, k, repo, ag)
-	inherited := histCall{pid: issuer.ID, ref: issuer.HistoryRef}
+	t.Run("continue then done", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		store := &probeStore{inner: histmem.New()}
+		k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 2), growingLLM(), store)
 
-	heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
-	gt.NoError(t, err)
-	heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal)
-	gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
+		issuer := runIssuer(t, k, repo, ag)
+		heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+		gt.NoError(t, err)
+		heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal)
+		gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
 
-	// Never announced as superseded...
-	gt.Value(t, slices.Contains(store.discardedPairs(), inherited)).Equal(false)
-	// ...and still resolvable, which is what the issuer's record needs.
-	gt.Value(t, histLen(committedHistory(t, store, issuer))).Equal(2)
+		// Never announced as superseded, under any id...
+		gt.Value(t, discardedRef(store.discardedPairs(), issuer.HistoryRef)).Equal(false)
+		// ...and still resolvable, which is what the issuer's record needs.
+		gt.Value(t, histLen(committedHistory(t, store, issuer))).Equal(2)
 
-	// The ordinary release did happen, under the heir's own id: its first version
-	// was superseded by its second. saved() is in call order — the issuer's two
-	// saves, then the heir's two.
-	refs := store.saved()
-	gt.Array(t, refs).Length(4)
-	gt.Value(t, slices.Contains(store.discardedPairs(), histCall{pid: heirID, ref: refs[2]})).Equal(true)
+		// The ordinary release still happens, under the heir's own id: its first
+		// version was superseded by its second. saved() is in call order — the
+		// issuer's two saves, then the heir's two. Asserting it keeps a change that
+		// simply stops discarding from satisfying the check above.
+		refs := store.saved()
+		gt.Array(t, refs).Length(4)
+		gt.Value(t, slices.Contains(store.discardedPairs(), histCall{pid: heirID, ref: refs[2]})).Equal(true)
+	})
+
+	t.Run("done on the first transition", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		store := &probeStore{inner: histmem.New()}
+		k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 1), growingLLM(), store)
+
+		issuer := runIssuer(t, k, repo, ag)
+		heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+		gt.NoError(t, err)
+		heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal)
+		gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, heir.HistoryRef).NotEqual(agentkit.HistoryRef("")) // it did commit one.
+
+		// Each Process replaced nothing — the issuer started from an empty
+		// conversation and the heir committed exactly once — so the whole run must
+		// announce nothing at all. A release keyed on the inherited pair would show
+		// up here as the only entry.
+		gt.Array(t, store.discardedPairs()).Length(0)
+		gt.Value(t, discardedRef(store.discardedPairs(), issuer.HistoryRef)).Equal(false)
+		gt.Value(t, histLen(committedHistory(t, store, issuer))).Equal(1)
+	})
 }
 
 // Once the heir has committed a version of its own, that is what later
