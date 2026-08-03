@@ -83,6 +83,11 @@ the contract against a shared store.
    ([ADR-0017](adr/0017-history-is-an-immutable-versioned-store.md)). A store
    that drops it silently resurrects a superseded conversation. It is an
    ordinary string column, empty when nothing has been committed yet.
+   `InheritedHistory` rides along the same way: it names the version of *another*
+   Process this one started its conversation from (`WithInheritedHistory`), it is
+   written once at `Spawn` and never changed, and dropping it is just as silent —
+   the Process starts from an empty conversation instead of the transcript it was
+   supposed to continue.
 
 Every one of these carries weight. The `Rev` CAS is what stops a worker whose
 lease expired from clobbering its successor; the guards are what make the
@@ -119,6 +124,8 @@ The factory must return a fresh, empty repository each call. The suite covers:
   and both attempt counters round-tripping through `Apply`
 - `HistoryRef` round-tripping through `Apply`, including being replaced by a
   later transition and cleared back to empty
+- `InheritedHistory` round-tripping through `Apply`, surviving a later
+  transition unchanged, and not aliasing stored state on read
 - no double-claim, with 100 processes and 100 concurrent claimers
 - deep-copy-on-read for processes, awaits and events
 
@@ -135,6 +142,14 @@ reference; the choice is yours.
 `Metrics`, and so on) arrives typed. Turning a row into your storage format is
 your job — that boundary is exactly where serialization is supposed to live
 ([ADR-0007](adr/0007-kernel-neutral-to-serialization.md)).
+
+**A nested field is still just a row.** `Process.InheritedHistory` is the one
+optional struct on the row (a `ProcessID` and a `HistoryRef`). Two nullable text
+columns or a single JSON column both satisfy the contract; what it must do is
+come back exactly as it went in, `nil` included. Both fields are always set
+together, so a store may treat "either column NULL" as `nil`. Adding it to an
+existing schema needs no backfill and no rewrite of old rows: a Process that
+inherited nothing has none, which is what a NULL already means.
 
 **Claim ordering.** The bundled implementations claim the oldest eligible
 process by `CreatedAt`. Nothing in the contract requires that ordering; pick

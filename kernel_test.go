@@ -2,10 +2,12 @@ package agentkit_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gollem-dev/agentkit"
+	histmem "github.com/gollem-dev/agentkit/historystore/memory"
 	"github.com/gollem-dev/agentkit/repository/memory"
 	"github.com/m-mizutani/gt"
 )
@@ -93,6 +95,78 @@ func TestSpawnValidation(t *testing.T) {
 		gt.NoError(t, err)
 		_, err = ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSubject(subj))
 		gt.Error(t, err).Is(agentkit.ErrSubjectBusy)
+	})
+}
+
+// WithInheritedHistory resolves the version to inherit from the issuing
+// Process's record, so everything that can make that impossible is reported
+// synchronously — before Init runs and before any row is written. A Process
+// carrying a reference nothing can read is never created.
+func TestSpawnInheritedHistoryValidation(t *testing.T) {
+	ctx := context.Background()
+
+	// nothingClaimable asserts no Process is waiting to run, which is how a test
+	// says "the rejected Spawn wrote nothing" without a list API.
+	nothingClaimable := func(t *testing.T, repo agentkit.Repository) {
+		t.Helper()
+		now := time.Now()
+		got, err := repo.ClaimNextProcess(ctx, "probe", now.Add(time.Minute), now)
+		gt.NoError(t, err)
+		gt.Nil(t, got)
+	}
+
+	t.Run("empty process id", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 1), growingLLM(), histmem.New())
+		_, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithInheritedHistory(""))
+		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
+		nothingClaimable(t, repo)
+	})
+
+	t.Run("unknown process", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 1), growingLLM(), histmem.New())
+		_, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"},
+			agentkit.WithInheritedHistory(agentkit.ProcessID("no-such-process")))
+		gt.Error(t, err).Is(agentkit.ErrProcessNotFound)
+		nothingClaimable(t, repo)
+	})
+
+	t.Run("process with no committed conversation", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 1), growingLLM(), histmem.New())
+		// Spawned but never served: its HistoryRef is still empty, so there is no
+		// version to start from.
+		fresh, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		gt.NoError(t, err)
+		_, err = ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithInheritedHistory(fresh))
+		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
+
+		// The only claimable row is that first Process; the rejected Spawn added none.
+		now := time.Now()
+		claimed, err := repo.ClaimNextProcess(ctx, "probe", now.Add(time.Minute), now)
+		gt.NoError(t, err)
+		gt.NotNil(t, claimed)
+		gt.Value(t, claimed.ID).Equal(fresh)
+		nothingClaimable(t, repo)
+	})
+
+	t.Run("agent without a history store", func(t *testing.T) {
+		repo := memory.New()
+		reg := agentkit.NewRegistry()
+		ag, err := agentkit.Register(reg, "a", 1, &scriptStrategy{step: doneStep()}) // no WithHistoryStore.
+		gt.NoError(t, err)
+		model, _ := mockLLM(textResponse("x"))
+		k, err := agentkit.New(repo, model, reg)
+		gt.NoError(t, err)
+
+		_, err = ag.Spawn(ctx, k, scriptInput{Seed: "s"},
+			agentkit.WithInheritedHistory(agentkit.ProcessID("whatever")))
+		gt.Error(t, err).Is(agentkit.ErrHistoryNotConfigured)
+		nothingClaimable(t, repo)
 	})
 }
 

@@ -357,6 +357,56 @@ func TestSpawnChildWithParentHavingNoMetadata(t *testing.T) {
 	gt.Value(t, len(child.Metadata)).Equal(0)
 }
 
+// A strategy cannot obtain a History version to inherit — Syscalls hands out no
+// HistoryRef — so WithInheritedHistory on a child could only carry a reference
+// from outside the runtime, and the one a strategy would reach for (its own) is
+// released by this very transition's commit. It is rejected as the static misuse
+// it is, before any middleware sees the request.
+func TestSpawnChildRejectsInheritedHistory(t *testing.T) {
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var spawnErr error
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: doneStep()})
+	gt.NoError(t, err)
+
+	var childID agentkit.ProcessID
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		id, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"},
+			agentkit.WithInheritedHistory(sys.ProcessID()))
+		mu.Lock()
+		spawnErr, childID = e, id
+		mu.Unlock()
+		// Swallowed on purpose: the point is what SpawnChild returned, and a
+		// committed Process makes the "no child was buffered" check meaningful.
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	gotErr, gotID := spawnErr, childID
+	mu.Unlock()
+	gt.Error(t, gotErr).Is(agentkit.ErrInvalidRequest)
+	gt.Value(t, gotID).Equal(agentkit.ProcessID("")) // no id was minted.
+
+	// And no child row exists: the parent's own commit was the only write.
+	now := time.Now()
+	claimed, err := repo.ClaimNextProcess(ctx, "probe", now.Add(time.Minute), now)
+	gt.NoError(t, err)
+	gt.Nil(t, claimed)
+}
+
 // Inheritance runs before the chain, so a SpawnMiddleware is the place to strip
 // keys a child must not carry.
 func TestSpawnMiddlewareSeesAndCanStripInheritedMetadata(t *testing.T) {

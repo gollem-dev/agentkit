@@ -378,6 +378,10 @@ func cloneProcess(p *agentkit.Process) *agentkit.Process {
 		sub := *p.Subject
 		cp.Subject = &sub
 	}
+	if p.InheritedHistory != nil {
+		ih := *p.InheritedHistory
+		cp.InheritedHistory = &ih
+	}
 	if p.ParentID != nil {
 		id := *p.ParentID
 		cp.ParentID = &id

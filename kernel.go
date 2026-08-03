@@ -210,6 +210,13 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 	if err != nil {
 		return "", err
 	}
+	// Resolved before Init, so a request that cannot succeed does not run Init and
+	// its middleware. It is also before the idempotency lookup, like Init itself:
+	// an idempotent Spawn that returns an existing Process still pays this read.
+	inherited, err := k.resolveInheritedHistory(ctx, cfg, name, b)
+	if err != nil {
+		return "", err
+	}
 	// The id is minted before Init so an Init middleware can correlate its
 	// record with the Process about to be created. A failed Init just discards
 	// it — nothing is persisted yet. This also matches ADR-0009, which already
@@ -249,18 +256,19 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 
 	now := k.clock()
 	proc := &Process{
-		ID:             pid,
-		Agent:          name,
-		Status:         ProcessPending,
-		Metadata:       cfg.metadata,
-		State:          raw,
-		StateVersion:   b.version,
-		RootID:         pid,
-		Subject:        cfg.subject,
-		IdempotencyKey: cfg.idempotencyKey,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		Rev:            0,
+		ID:               pid,
+		Agent:            name,
+		Status:           ProcessPending,
+		Metadata:         cfg.metadata,
+		State:            raw,
+		StateVersion:     b.version,
+		RootID:           pid,
+		Subject:          cfg.subject,
+		InheritedHistory: inherited,
+		IdempotencyKey:   cfg.idempotencyKey,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		Rev:              0,
 	}
 	cs := ChangeSet{
 		Processes: []*Process{proc},
@@ -282,6 +290,45 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 	// path reaches here; an idempotency hit returns above without dispatching.
 	k.dispatch(pid)
 	return pid, nil
+}
+
+// resolveInheritedHistory turns WithInheritedHistory's Process id into the
+// (pid, ref) pair the new Process records, or nil when the option was not used.
+//
+// The version is read from the issuing Process's record HERE and pinned, which
+// is why the option takes no HistoryRef: the only version a caller could safely
+// name is the one that record currently names — every earlier one has already
+// been released by the commit that superseded it — so the kernel resolves it
+// rather than accepting a value that can disagree with the record. Pinning also
+// keeps a later turn of the issuer from changing what this Process starts from.
+//
+// It does NOT check that the version is still in the store, nor that the two
+// agents share a HistoryStore instance: a check would couple Spawn to the blob
+// store and still not be a guarantee (the issuer's next commit can release the
+// version right after it passed). An unreachable version surfaces as a
+// transition error on first Session use instead of being swallowed.
+func (k *Kernel) resolveInheritedHistory(ctx context.Context, cfg *spawnConfig, name AgentName, b StrategyBinding) (*InheritedHistory, error) {
+	if !cfg.hasInheritFrom {
+		return nil, nil
+	}
+	if b.historyStore == nil {
+		return nil, goerr.Wrap(ErrHistoryNotConfigured,
+			"WithInheritedHistory needs an agent registered with WithHistoryStore",
+			goerr.V("agent", name))
+	}
+	if cfg.inheritFrom == "" {
+		return nil, goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory with an empty process id",
+			goerr.V("agent", name))
+	}
+	issuer, err := k.repo.GetProcess(ctx, cfg.inheritFrom) // ErrProcessNotFound propagates.
+	if err != nil {
+		return nil, err
+	}
+	if issuer.HistoryRef == "" {
+		return nil, goerr.Wrap(ErrInvalidRequest, "the process to inherit from has committed no conversation",
+			goerr.V("from", issuer.ID), goerr.V("status", issuer.Status))
+	}
+	return &InheritedHistory{Process: issuer.ID, Ref: issuer.HistoryRef}, nil
 }
 
 // Respond delivers a response to a question await (a confirmation's yes/no is

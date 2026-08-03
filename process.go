@@ -92,8 +92,15 @@ type Process struct {
 	// History in its HistoryStore, or "" when none has been committed. The worker
 	// saves a NEW version before the commit and records its ref here inside the
 	// same Apply, so History rolls back together with State (ADR-0017).
-	HistoryRef   HistoryRef
-	StepAttempts int // failure count of the current transition (reset to 0 on a successful commit).
+	HistoryRef HistoryRef
+	// InheritedHistory names the version another Process committed that this one
+	// starts its conversation from, or nil. Set once at Spawn and never written
+	// again: this Process saves its own versions under its OWN id, and HistoryRef
+	// takes precedence as soon as it commits one. What is left behind is a record
+	// of where the conversation came from. The kernel never Discards the version
+	// named here (ADR-0017).
+	InheritedHistory *InheritedHistory
+	StepAttempts     int // failure count of the current transition (reset to 0 on a successful commit).
 	// UncleanReclaims counts claims that took over this Process after its
 	// previous claim died mid-transition. Same reset scope as StepAttempts.
 	// Maintained by ClaimNextProcess (see the Repository contract), never by the
@@ -142,6 +149,10 @@ func (p *Process) clone() *Process {
 	if p.Subject != nil {
 		s := *p.Subject
 		cp.Subject = &s
+	}
+	if p.InheritedHistory != nil {
+		ih := *p.InheritedHistory
+		cp.InheritedHistory = &ih
 	}
 	if p.ParentID != nil {
 		id := *p.ParentID

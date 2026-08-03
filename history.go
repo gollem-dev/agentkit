@@ -12,6 +12,19 @@ import (
 // version has been committed yet", so a store must never return it.
 type HistoryRef string
 
+// InheritedHistory names a History version another Process committed, which a
+// new Process starts its conversation from (WithInheritedHistory). Both fields
+// are required: a HistoryStore addresses a version by (pid, ref), so the ref
+// alone does not resolve.
+//
+// It is resolved once, at Spawn, from the issuing Process's record, and never
+// rewritten. The kernel only ever READS the version it names — the issuing
+// Process's record may still name it too, so it is never Discarded (ADR-0017).
+type InheritedHistory struct {
+	Process ProcessID  `json:"process"` // whose store key holds Ref.
+	Ref     HistoryRef `json:"ref"`
+}
+
 // HistoryStore persists a Process's conversation History as immutable versions.
 //
 // Which version is current is decided by Process.HistoryRef, which commits in the

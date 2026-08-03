@@ -16,6 +16,13 @@ commit the worker calls `Discard` on the superseded version — a notification, 
 a deletion order. Without the option, `sys.Session()`'s methods return
 `ErrHistoryNotConfigured` rather than silently running without persistence.
 
+A new Process can **start from a version another Process committed**:
+`Spawn(..., WithInheritedHistory(from))` resolves that Process's current
+`HistoryRef` and pins the pair on `Process.InheritedHistory`. It is read-only —
+the inheriting Process saves its own versions under its own id, and the kernel
+never `Discard`s an inherited version, because the issuing Process's record may
+still name it.
+
 ## Context
 
 Every strategy that talks to an LLM must thread `*gollem.History`: read it, pass
@@ -91,6 +98,32 @@ the cause instead of documenting the symptom.
 - **No lease fence around the save.** A worker that lost its lease can only add a
   version nobody references, so the pre-save `ownsLease` re-read the earlier
   design needed is gone, along with its extra `GetProcess` per transition.
+- **A Process may start from another Process's version, by reference only.**
+  `WithInheritedHistory(from ProcessID)` is a `SpawnOption`; the pair it resolves
+  to lands on `Process.InheritedHistory`, a field distinct from `HistoryRef`.
+  That separation is the whole point: `HistoryRef` is what the post-commit
+  `Discard` releases as superseded, and it is released under the *committing*
+  Process's id, so putting an inherited ref there would announce another
+  Process's live version as garbage on the very first commit. Kept apart, the
+  first commit's `prev` is `""` and nothing is released. `ensureLoaded` reads the
+  inherited pair only while `HistoryRef` is empty; once the Process commits a
+  version of its own, that one takes over and the inherited pair is never read
+  again. It is not cleared — it costs no write to keep, and it records where the
+  conversation came from.
+- **The option takes no `HistoryRef`; the kernel resolves it.** The only version
+  a caller could safely name is the one the issuing record currently names —
+  every earlier one has already been released by the commit that superseded it —
+  so accepting a ref would only add a value that can disagree with the record.
+  Resolving at Spawn also pins it: a later turn of the issuer does not change
+  what the new Process starts from. Spawn therefore reads that record, and
+  reports `ErrProcessNotFound`, or `ErrInvalidRequest` when it has committed no
+  conversation, instead of leaving a Process to fail on its first transition.
+- **Not on `SpawnChild`.** `Syscalls` hands out no `HistoryRef`, so a strategy
+  has no version to name; the one it would reach for — its own — is exactly what
+  its current transition's commit releases. Rejected as `ErrInvalidRequest`
+  before the middleware chain, like `WithIdempotencyKey`, and absent from
+  `SpawnRequest`. Permitting it later is a compatible addition; withdrawing it
+  would not be.
 
 ## Alternatives rejected
 
@@ -118,6 +151,22 @@ the cause instead of documenting the symptom.
   instead; immutable versions are that idea carried through.
 - **Reuse `gollem.HistoryRepository`.** Its `Load`/`Save` cannot name a version
   or release one, so keeping it would have kept us in the mutable-key design.
+- **Inheriting by writing the inherited ref into `Process.HistoryRef`.** No new
+  field, and `ensureLoaded` would need no change at all — but the post-commit
+  `discardSuperseded` reads `HistoryRef` as "the version this commit replaced"
+  and releases it under the committing Process's id. The first commit of the
+  inheriting Process would therefore announce the issuer's live version as
+  garbage, under the wrong id.
+- **A `ProcessID` alone on the record, resolved to a version at first use.** One
+  field instead of two, and no read at Spawn. Rejected because what the Process
+  starts from would then depend on when it first runs: a turn the issuer commits
+  in between silently changes the transcript. It would also put a `Repository`
+  read inside the History load path.
+- **Verifying at Spawn that the inherited version is still in the store.** It
+  would couple Spawn to the blob store's availability and still not be a
+  guarantee — the issuer's next commit can release the version immediately after
+  the check passed. An unreachable version fails the first transition instead,
+  which is loud enough.
 - **Flat `SessionGenerate` / `SessionHistory` / `SessionCallTool` methods on
   `Syscalls`.** What the previous version of this ADR chose, when there were two
   of them. A third made the repeated prefix worse than a handle.
@@ -151,10 +200,26 @@ the cause instead of documenting the symptom.
   `HistoryStore` outage stops the process from committing — including a `Done` —
   and it eventually fails as `FailureRetryExhausted`. Liveness is coupled to the
   History store when the agent opts in.
-- Terminal commits save History too, so a future "restart / hand off a finished
-  Process" capability can read the final transcript. A Process cancelled
-  mid-round leaves a committed History ending on an unanswered `tool_use`; a
-  reader of final transcripts has to tolerate that.
+- Terminal commits save History too, which is what makes `WithInheritedHistory`
+  work on a finished Process: its final transcript is still named by its record.
+  A Process cancelled mid-round leaves a committed History ending on an
+  unanswered `tool_use`; an heir has to tolerate that, exactly as a re-run of the
+  same Process would.
+- **The kernel does not promise an inherited version survives.** It pins the pair
+  at Spawn and never releases it, but the *issuing* Process, if it is still
+  running, releases that version as superseded on its next commit — and whether a
+  release is acted on is the store's call, since `Discard` is a notification.
+  Inheriting from a finished Process is therefore the safe use; inheriting from a
+  running one is allowed (branching off its current conversation is a legitimate
+  thing to want) and the version may be gone by the time it is read, surfacing as
+  a failed first transition. The kernel refuses to guess which one a caller meant,
+  and it does no reference counting — that would need a mechanism this ADR
+  deliberately does not have.
+- Metrics, limits and cancellation do **not** cross an inheritance: only the
+  conversation does. A Process that inherits starts with empty `Metrics`, its own
+  `Limit` budget, and its own cancellation. That is what the capability is for —
+  running one question of a longer conversation as a unit that can be stopped and
+  bounded on its own.
 - The kernel still marshals nothing: the `HistoryStore` implementation
   serializes `*gollem.History` (ADR-0007 unchanged). `gollem.History` carries a
   version gate, so a load of an incompatible stored version surfaces as an error
@@ -172,3 +237,4 @@ the cause instead of documenting the symptom.
 |---|---|
 | 2026-07-23 | Initial record: a decoupled, best-effort store under one mutable key per process, with a tolerated duplication window and an obligation to keep a tool round inside one Step. |
 | 2026-08-01 | Rewritten. Versions are immutable and named by `Process.HistoryRef`, committed atomically, so History rolls back with State: the duplication window and the one-Step obligation are both gone, and human-in-the-loop works with the managed conversation. `gollem.HistoryRepository` is replaced by the agentkit `HistoryStore` port (`Save`/`Load`/`Discard`), the flat `Session*` methods by a `Session()` handle that also carries `CallTool`, and the pre-save `ownsLease` fence is removed as unnecessary. |
+| 2026-08-03 | Added `WithInheritedHistory`: a new Process can start from a version another one committed, pinned at Spawn on `Process.InheritedHistory`. It is read-only and never `Discard`ed, which is why it is a field of its own rather than a value written into `HistoryRef` — the post-commit release reads that one. Rejected on `SpawnChild`. |

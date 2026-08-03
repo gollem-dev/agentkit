@@ -29,24 +29,37 @@ type historyState struct {
 }
 
 // ensureLoaded fetches the committed version from the store once per claim, on
-// first use. ref comes from the Process record read at the start of this
-// transition: the record is the only source of "which version is current", so a
-// retry can never disagree with the commit that set it. An empty ref means
-// nothing has been committed yet, which is not an error — the conversation
-// starts empty. A load error (including gollem's History version-gate mismatch)
-// is propagated, never swallowed.
-func (h *historyState) ensureLoaded(ctx context.Context, ref HistoryRef) error {
+// first use. Both ref and inherited come from the Process record read at the
+// start of this transition: the record is the only source of "which version is
+// current", so a retry can never disagree with the commit that set it.
+//
+// An empty ref means this Process has committed nothing yet. That is not an
+// error — the conversation starts empty, unless the record also carries an
+// InheritedHistory, in which case it starts from the version another Process
+// committed, read under THAT Process's id (a store addresses a version by
+// (pid, ref)). Once this Process commits a version of its own, ref names it and
+// the inherited one is never read again.
+//
+// A load error (including gollem's History version-gate mismatch) is
+// propagated, never swallowed.
+func (h *historyState) ensureLoaded(ctx context.Context, ref HistoryRef, inherited *InheritedHistory) error {
 	if h.loaded {
 		return nil
 	}
-	if ref == "" {
+	pid, load := h.pid, ref
+	if load == "" && inherited != nil {
+		pid, load = inherited.Process, inherited.Ref
+	}
+	if load == "" {
 		h.loaded = true
 		return nil
 	}
-	hist, err := h.store.Load(ctx, h.pid, ref)
+	hist, err := h.store.Load(ctx, pid, load)
 	if err != nil {
+		// pid, not h.pid: on an inherited load the two differ, and which one was
+		// asked for is the first thing a reader of this error needs.
 		return goerr.Wrap(err, "load history",
-			goerr.V("process", h.pid), goerr.V("ref", ref))
+			goerr.V("process", pid), goerr.V("ref", load))
 	}
 	h.baseline = hist
 	h.loaded = true
@@ -127,7 +140,7 @@ func (s *syscalls) ready(ctx context.Context) error {
 		return goerr.Wrap(ErrHistoryNotConfigured, "the managed conversation requires WithHistoryStore",
 			goerr.V("agent", s.proc.Agent))
 	}
-	return s.hist.ensureLoaded(ctx, s.proc.HistoryRef)
+	return s.hist.ensureLoaded(ctx, s.proc.HistoryRef, s.proc.InheritedHistory)
 }
 
 // start seeds this transition's working copy from the committed baseline on

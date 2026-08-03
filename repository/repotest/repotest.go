@@ -622,6 +622,50 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		gt.Value(t, cleared.HistoryRef).Equal(agentkit.HistoryRef(""))
 	})
 
+	// InheritedHistory names the version another Process committed that this one
+	// started its conversation from. A Repository that drops it does not fail
+	// loudly: the Process simply starts from an empty conversation, and the model
+	// answers without the transcript it was supposed to continue
+	// ([ADR-0017](../../../docs/adr/0017-history-is-an-immutable-versioned-store.md)).
+	t.Run("InheritedHistoryRoundTrip", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		p := mkProc(pid)
+		gt.Nil(t, p.InheritedHistory) // nil: this Process inherited nothing.
+
+		p.InheritedHistory = &agentkit.InheritedHistory{
+			Process: agentkit.ProcessID("issuer-" + string(pid)),
+			Ref:     agentkit.HistoryRef("inherited-" + string(pid)),
+		}
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{p}}))
+
+		got, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.NotNil(t, got.InheritedHistory)
+		gt.Value(t, *got.InheritedHistory).Equal(agentkit.InheritedHistory{
+			Process: agentkit.ProcessID("issuer-" + string(pid)),
+			Ref:     agentkit.HistoryRef("inherited-" + string(pid)),
+		})
+
+		// It survives later transitions unchanged: the kernel writes it once, at
+		// Spawn, and every commit after that carries it along.
+		got.HistoryRef = agentkit.HistoryRef("own-" + string(pid))
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{got}}))
+
+		back, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.NotNil(t, back.InheritedHistory)
+		gt.Value(t, back.InheritedHistory.Ref).Equal(agentkit.HistoryRef("inherited-" + string(pid)))
+		gt.Value(t, back.HistoryRef).Equal(agentkit.HistoryRef("own-" + string(pid)))
+
+		// Reads must not alias stored state (the deep-copy rule reaches nested
+		// pointers, not just the top-level row).
+		back.InheritedHistory.Ref = "tampered"
+		again, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, again.InheritedHistory.Ref).Equal(agentkit.HistoryRef("inherited-" + string(pid)))
+	})
+
 	t.Run("ClaimLiveLeaseNotClaimed", func(t *testing.T) {
 		repo := factory(t)
 		pid := newPID()
