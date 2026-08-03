@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -94,15 +95,26 @@ func registerWithHistory(t *testing.T, step stepFn, model gollem.LLMClient, hs a
 	return k, repo, ag
 }
 
+// histCall is one (pid, ref) pair a probeStore was asked about. The pid matters
+// once a Process can start from a version another one committed: "which key
+// space was read" and "whose version was released" are then different questions
+// from "how many times".
+type histCall struct {
+	pid agentkit.ProcessID
+	ref agentkit.HistoryRef
+}
+
 // probeStore wraps a HistoryStore, recording every Save (message length and the
-// ref handed back) and every Discard, in order, plus the load count. It can
-// inject Load/Save failures or an empty ref.
+// ref handed back), every Load and every Discard, in order. It can inject
+// Load/Save failures or an empty ref.
 type probeStore struct {
 	inner     agentkit.HistoryStore
 	mu        sync.Mutex
 	saves     []int
 	savedRefs []agentkit.HistoryRef
 	discards  []agentkit.HistoryRef
+	loadCalls []histCall
+	discCalls []histCall
 	loads     int
 	loadErr   error
 	saveErr   error
@@ -132,6 +144,7 @@ func (s *probeStore) Save(ctx context.Context, pid agentkit.ProcessID, h *gollem
 func (s *probeStore) Load(ctx context.Context, pid agentkit.ProcessID, ref agentkit.HistoryRef) (*gollem.History, error) {
 	s.mu.Lock()
 	s.loads++
+	s.loadCalls = append(s.loadCalls, histCall{pid: pid, ref: ref})
 	le := s.loadErr
 	s.mu.Unlock()
 	if le != nil {
@@ -143,6 +156,7 @@ func (s *probeStore) Load(ctx context.Context, pid agentkit.ProcessID, ref agent
 func (s *probeStore) Discard(ctx context.Context, pid agentkit.ProcessID, ref agentkit.HistoryRef) {
 	s.mu.Lock()
 	s.discards = append(s.discards, ref)
+	s.discCalls = append(s.discCalls, histCall{pid: pid, ref: ref})
 	s.mu.Unlock()
 	s.inner.Discard(ctx, pid, ref)
 }
@@ -171,13 +185,27 @@ func (s *probeStore) saved() []agentkit.HistoryRef {
 	return append([]agentkit.HistoryRef(nil), s.savedRefs...)
 }
 
-func contains(refs []agentkit.HistoryRef, want agentkit.HistoryRef) bool {
-	for _, r := range refs {
-		if r == want {
-			return true
-		}
-	}
-	return false
+// loaded returns the (pid, ref) pairs Load was called with, in order.
+func (s *probeStore) loaded() []histCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]histCall(nil), s.loadCalls...)
+}
+
+// discardedPairs returns the (pid, ref) pairs Discard was called with, in order.
+func (s *probeStore) discardedPairs() []histCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]histCall(nil), s.discCalls...)
+}
+
+// discardedRef reports whether any Discard named ref, under ANY process id.
+// Ignoring the pid is the point: a version announced under the WRONG id is
+// exactly the failure to catch here, and the reference stores make such a call a
+// silent no-op (they namespace versions per process), so a pid-qualified check
+// would pass while the kernel was releasing another Process's live version.
+func discardedRef(calls []histCall, ref agentkit.HistoryRef) bool {
+	return slices.ContainsFunc(calls, func(c histCall) bool { return c.ref == ref })
 }
 
 // fragileRepo wraps a Repository and injects `err` into the first Apply that
@@ -546,10 +574,10 @@ func TestSession_SameLeaseConflictReseeds(t *testing.T) {
 	gt.Array(t, saved).Length(4)
 	// The conflicted attempt's version is released — a conflict proves nothing
 	// committed — and it never became the committed one.
-	gt.Value(t, contains(store.discarded(), saved[1])).Equal(true)
+	gt.Value(t, slices.Contains(store.discarded(), saved[1])).Equal(true)
 	gt.Value(t, saved[1]).NotEqual(p.HistoryRef)
 	// The committed version itself is not released.
-	gt.Value(t, contains(store.discarded(), p.HistoryRef)).Equal(false)
+	gt.Value(t, slices.Contains(store.discarded(), p.HistoryRef)).Equal(false)
 }
 
 // ---- crash between save and commit ----
@@ -638,7 +666,7 @@ func TestSession_UnknownApplyErrorKeepsVersion(t *testing.T) {
 	// one either.
 	saved := store.saved()
 	gt.Value(t, len(saved) > 1).Equal(true)
-	gt.Value(t, contains(store.discarded(), saved[0])).Equal(false)
+	gt.Value(t, slices.Contains(store.discarded(), saved[0])).Equal(false)
 	gt.Value(t, saved[0]).NotEqual(p.HistoryRef)
 }
 
@@ -795,7 +823,7 @@ func TestSession_TerminalLostToAnotherPathKeepsVersion(t *testing.T) {
 	gt.Value(t, string(p.Output)).Equal("finished-by-another-path")
 
 	// The record names the first transition's version, and it is still there.
-	gt.Value(t, contains(store.discarded(), p.HistoryRef)).Equal(false)
+	gt.Value(t, slices.Contains(store.discarded(), p.HistoryRef)).Equal(false)
 	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(1)
 }
 
@@ -857,7 +885,7 @@ func TestSession_SupersededVersionDiscarded(t *testing.T) {
 	// among them — it is still loadable.
 	gt.Value(t, store.saveCount()).Equal(3)
 	gt.Array(t, store.discarded()).Length(2)
-	gt.Value(t, contains(store.discarded(), p.HistoryRef)).Equal(false)
+	gt.Value(t, slices.Contains(store.discarded(), p.HistoryRef)).Equal(false)
 	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(3)
 }
 
@@ -955,6 +983,259 @@ func TestSession_FailTerminalSavesHistory(t *testing.T) {
 	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
 
 	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(1) // Fail terminal saved History too (D-D).
+}
+
+// ---- inherited history ----
+
+// runIssuer serves one Process to completion: the "has already committed a
+// conversation" side of an inheritance test. The returned record's HistoryRef
+// names the version an heir inherits.
+func runIssuer(t *testing.T, k *agentkit.Kernel, repo agentkit.Repository, ag agentkit.Agent[scriptInput],
+	extra ...agentkit.ServeOption) *agentkit.Process {
+	t.Helper()
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "issuer"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, extra...)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, p.HistoryRef).NotEqual(agentkit.HistoryRef(""))
+	return p
+}
+
+// A Process spawned with WithInheritedHistory starts its first turn from the
+// conversation another Process committed, read under THAT Process's id.
+func TestSession_InheritedHistorySeedsTheConversation(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	store := &probeStore{inner: histmem.New()}
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 2), growingLLM(), store)
+
+	issuer := runIssuer(t, k, repo, ag)
+	gt.Value(t, histLen(committedHistory(t, store, issuer))).Equal(2)
+
+	heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+	gt.NoError(t, err)
+
+	// The version was resolved at Spawn and recorded; the heir's own ref is still
+	// empty, because it has committed nothing.
+	spawned, err := repo.GetProcess(ctx, heirID)
+	gt.NoError(t, err)
+	gt.NotNil(t, spawned.InheritedHistory)
+	gt.Value(t, *spawned.InheritedHistory).
+		Equal(agentkit.InheritedHistory{Process: issuer.ID, Ref: issuer.HistoryRef})
+	gt.Value(t, spawned.HistoryRef).Equal(agentkit.HistoryRef(""))
+
+	mu.Lock()
+	issuerTurns := len(seen)
+	mu.Unlock()
+	// committedHistory reads through the probe too, so the heir's loads are the
+	// ones recorded from here on.
+	before := len(store.loaded())
+
+	heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal)
+	gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
+	byHeir := store.loaded()[before:]
+
+	mu.Lock()
+	got := append([]int(nil), seen[issuerTurns:]...)
+	mu.Unlock()
+	// The heir's first turn carried the issuer's two messages, not zero.
+	gt.Value(t, got).Equal([]int{2, 3})
+	gt.Value(t, histLen(committedHistory(t, store, heir))).Equal(4)
+	// One load for the whole run, and it named the ISSUER's key space. The issuer's
+	// own run loaded nothing: it started from an empty conversation in one claim.
+	gt.Value(t, byHeir).Equal([]histCall{{pid: issuer.ID, ref: issuer.HistoryRef}})
+}
+
+// The inherited version must survive the heir's commits. It is the one thing a
+// Discard keyed on the heir's own id would destroy: the issuing Process's record
+// still names it, so releasing it is data loss for a Process nobody touched.
+// Both commit shapes are covered, because the release runs on both paths and
+// they differ in what the heir's own ref holds at the time: a non-terminal commit
+// (worker.go's buildCommit path) and a terminal one reached on the FIRST
+// transition, where the heir's ref is still empty and the inherited pair is the
+// only version it knows about.
+func TestSession_InheritedVersionIsNeverDiscarded(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("continue then done", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		store := &probeStore{inner: histmem.New()}
+		k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 2), growingLLM(), store)
+
+		issuer := runIssuer(t, k, repo, ag)
+		heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+		gt.NoError(t, err)
+		heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal)
+		gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
+
+		// Never announced as superseded, under any id...
+		gt.Value(t, discardedRef(store.discardedPairs(), issuer.HistoryRef)).Equal(false)
+		// ...and still resolvable, which is what the issuer's record needs.
+		gt.Value(t, histLen(committedHistory(t, store, issuer))).Equal(2)
+
+		// The ordinary release still happens, under the heir's own id: its first
+		// version was superseded by its second. saved() is in call order — the
+		// issuer's two saves, then the heir's two. Asserting it keeps a change that
+		// simply stops discarding from satisfying the check above.
+		refs := store.saved()
+		gt.Array(t, refs).Length(4)
+		gt.Value(t, slices.Contains(store.discardedPairs(), histCall{pid: heirID, ref: refs[2]})).Equal(true)
+	})
+
+	t.Run("done on the first transition", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		store := &probeStore{inner: histmem.New()}
+		k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 1), growingLLM(), store)
+
+		issuer := runIssuer(t, k, repo, ag)
+		heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+		gt.NoError(t, err)
+		heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal)
+		gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, heir.HistoryRef).NotEqual(agentkit.HistoryRef("")) // it did commit one.
+
+		// Each Process replaced nothing — the issuer started from an empty
+		// conversation and the heir committed exactly once — so the whole run must
+		// announce nothing at all. A release keyed on the inherited pair would show
+		// up here as the only entry.
+		gt.Array(t, store.discardedPairs()).Length(0)
+		gt.Value(t, discardedRef(store.discardedPairs(), issuer.HistoryRef)).Equal(false)
+		gt.Value(t, histLen(committedHistory(t, store, issuer))).Equal(1)
+	})
+}
+
+// Once the heir has committed a version of its own, that is what later
+// transitions read. The inherited version is never consulted again.
+func TestSession_InheritedRefIsNotReadAfterOwnCommit(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	store := &probeStore{inner: histmem.New()}
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 2), growingLLM(), store)
+
+	issuer := runIssuer(t, k, repo, ag)
+
+	heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+	gt.NoError(t, err)
+	// One transition per claim, so the second transition genuinely re-loads from
+	// the store instead of reusing the claim's in-memory baseline.
+	heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal, agentkit.WithMaxStepsPerClaim(1))
+	gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
+
+	loads := store.loaded()
+	gt.Array(t, loads).Length(2)
+	gt.Value(t, loads[0]).Equal(histCall{pid: issuer.ID, ref: issuer.HistoryRef})
+	// The second load is the heir's own first version, under the heir's own id.
+	gt.Value(t, loads[1].pid).Equal(heirID)
+	gt.Value(t, loads[1].ref).Equal(store.saved()[2])
+	gt.Value(t, histLen(committedHistory(t, store, heir))).Equal(4)
+}
+
+// The version is pinned at Spawn, not resolved at first use: a turn the issuing
+// Process commits afterwards does not change what the heir starts from.
+func TestSession_InheritedVersionIsPinnedAtSpawn(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	store := &probeStore{inner: histmem.New()}
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 1), growingLLM(), store)
+
+	issuer := runIssuer(t, k, repo, ag)
+	pinned := issuer.HistoryRef
+
+	heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+	gt.NoError(t, err)
+
+	// The issuer moves on: a new, much longer version becomes what its record
+	// names. Written directly, because a terminal Process runs no more transitions.
+	longer := &gollem.History{
+		LLType:   gollem.LLMTypeClaude,
+		Version:  gollem.HistoryVersion,
+		Messages: make([]gollem.Message, 9),
+	}
+	moved, err := store.Save(ctx, issuer.ID, longer)
+	gt.NoError(t, err)
+	advanced := agentkit.CloneProcess(issuer)
+	advanced.HistoryRef = moved
+	gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{advanced}}))
+
+	mu.Lock()
+	issuerTurns := len(seen)
+	mu.Unlock()
+
+	heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal)
+	gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	got := append([]int(nil), seen[issuerTurns:]...)
+	mu.Unlock()
+	gt.Value(t, got).Equal([]int{1}) // the pinned version's length, not the 9 above.
+	gt.Value(t, store.loaded()).Equal([]histCall{{pid: issuer.ID, ref: pinned}})
+}
+
+// The kernel does not verify at Spawn that the inherited version is still in the
+// store (D-6): it cannot promise it either way, because the issuer's next commit
+// can release it. What it must do is fail loudly rather than start the
+// conversation over from empty.
+func TestSession_InheritedVersionMissingFailsTheProcess(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	store := &probeStore{inner: histmem.New()}
+	k, repo, ag := registerWithHistory(t, sessionStep(&seen, &mu, 1), growingLLM(), store)
+
+	issuer := runIssuer(t, k, repo, ag)
+	heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+	gt.NoError(t, err)
+
+	// The version goes away between Spawn and the first transition.
+	store.Discard(ctx, issuer.ID, issuer.HistoryRef)
+
+	heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal, agentkit.WithMaxStepAttempts(1))
+	gt.Value(t, heir.Status).Equal(agentkit.ProcessFailed)
+	gt.NotNil(t, heir.Failure)
+	gt.Value(t, heir.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	gt.Value(t, heir.HistoryRef).Equal(agentkit.HistoryRef("")) // nothing was committed.
+}
+
+// Re-runnability: an attempt that did not commit re-runs from the SAME inherited
+// baseline, so the conversation carries no duplicated turn.
+func TestSession_InheritedHistoryRerunDoesNotDouble(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	inner := memory.New()
+	repo := &fragileRepo{Repository: inner, err: gollemErr("disk gone at commit")}
+	store := &probeStore{inner: histmem.New()}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1,
+		&scriptStrategy{step: sessionStep(&seen, &mu, 2)}, agentkit.WithHistoryStore[[]byte](store))
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	issuer := runIssuer(t, k, repo, ag)
+
+	heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+	gt.NoError(t, err)
+	// Armed after the insert, so the next Apply — the heir's FIRST commit, whose
+	// History save has already run — is the one that fails.
+	repo.armed.Store(true)
+
+	heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal,
+		agentkit.WithLease(80*time.Millisecond), agentkit.WithMaxUncleanReclaims(10))
+	gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, repo.fired.Load()).Equal(true) // the commit really did fail once.
+
+	// A clean run of two turns on top of the issuer's two messages is 4. The
+	// aborted attempt's version was saved but never named, and the re-run started
+	// from the inherited version again — not from the abandoned attempt.
+	gt.Value(t, histLen(committedHistory(t, store, heir))).Equal(4)
+	// And the inherited version is still intact after all of it.
+	gt.Value(t, histLen(committedHistory(t, store, issuer))).Equal(2)
 }
 
 // ---- tools ----

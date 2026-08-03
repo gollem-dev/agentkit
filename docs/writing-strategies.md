@@ -300,6 +300,38 @@ Keeping `History` in your own checkpointed state via raw `sys.Generate` +
 `agentkit.WithHistory(...)` is still fully supported, and is what
 `strategy/simple` does.
 
+### Continuing a finished Process's conversation
+
+One long conversation does not have to be one Process. Spawn a new one per turn
+and pass the previous Process's id:
+
+```go
+next, err := chat.Spawn(ctx, kernel, chatInput{Prompt: "and what about Friday?"},
+    agentkit.WithInheritedHistory(previous))
+```
+
+The new Process starts its first `Session().Generate` from the conversation
+`previous` committed — including the results of tools it ran — while its
+`Metrics`, its `Limit` budget and its cancellation are its own. That is the point
+of doing it this way: one question is one unit of work you can bound and stop
+without touching the ones before it.
+
+What crosses is the conversation and nothing else. State does not: the new
+Process runs `Init` on the input you give it, like any other.
+
+**Inherit from a Process that is finished.** agentkit pins the version at `Spawn`
+and never releases it, but it cannot keep the *issuing* Process from releasing it:
+if `previous` is still running, its next commit reports that version as
+superseded, and reclaiming it is then the store's decision
+([ADR-0017](adr/0017-history-is-an-immutable-versioned-store.md)). Inheriting
+from a running Process is allowed — branching off its current conversation is a
+reasonable thing to want — but the version can be gone by the time it is read,
+which surfaces as a failing first transition, not as an empty conversation.
+
+`Spawn` fails synchronously if `previous` does not exist, or has committed no
+conversation yet, or the agent was registered without `WithHistoryStore`. It is
+not available on `SpawnChild`: a strategy has no `HistoryRef` to name.
+
 ## Running tools
 
 ```go

@@ -207,6 +207,37 @@ func TestPostRenamePoisonsRepository(t *testing.T) {
 	gt.Value(t, got.ID).Equal(pid)
 }
 
+// A Process spawned with WithInheritedHistory carries the (pid, ref) pair naming
+// the version it started its conversation from. It is a nested pointer, so it
+// exercises the snapshot's JSON round-trip differently from the scalar fields;
+// losing it would silently restart the conversation from empty.
+func TestPersistedInheritedHistorySurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	pid := newPID(t)
+
+	r1, err := filesystem.New(dir)
+	gt.NoError(t, err)
+	p := mkProc(pid)
+	p.InheritedHistory = &agentkit.InheritedHistory{
+		Process: agentkit.ProcessID("issuer-" + string(pid)),
+		Ref:     agentkit.HistoryRef("v-inherited"),
+	}
+	gt.NoError(t, r1.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{p}}))
+	gt.NoError(t, r1.Close())
+
+	r2, err := filesystem.New(dir)
+	gt.NoError(t, err)
+	defer func() { gt.NoError(t, r2.Close()) }()
+	got, err := r2.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.NotNil(t, got.InheritedHistory)
+	gt.Value(t, *got.InheritedHistory).Equal(agentkit.InheritedHistory{
+		Process: agentkit.ProcessID("issuer-" + string(pid)),
+		Ref:     agentkit.HistoryRef("v-inherited"),
+	})
+}
+
 func TestPersistedClaimSurvivesReopen(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

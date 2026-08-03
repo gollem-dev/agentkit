@@ -36,6 +36,10 @@ func TestProcessClone(t *testing.T) {
 			Metrics:  agentkit.Metrics{LLMCalls: 1},
 			ParentID: &parent,
 			WakeAt:   &wake,
+			InheritedHistory: &agentkit.InheritedHistory{
+				Process: agentkit.ProcessID("p-issuer"),
+				Ref:     agentkit.HistoryRef("v-1"),
+			},
 		}
 		cp := agentkit.CloneProcess(orig)
 
@@ -45,6 +49,7 @@ func TestProcessClone(t *testing.T) {
 		cp.Metrics.LLMCalls = 99
 		cp.Failure.Message = "changed"
 		*cp.ParentID = agentkit.ProcessID("p-other")
+		cp.InheritedHistory.Ref = agentkit.HistoryRef("v-other")
 
 		// original is untouched
 		gt.Value(t, orig.Metadata["tenant"]).Equal("acme")
@@ -52,6 +57,7 @@ func TestProcessClone(t *testing.T) {
 		gt.Value(t, orig.Metrics.LLMCalls).Equal(int64(1))
 		gt.Value(t, orig.Failure.Message).Equal("boom")
 		gt.Value(t, *orig.ParentID).Equal(parent)
+		gt.Value(t, orig.InheritedHistory.Ref).Equal(agentkit.HistoryRef("v-1"))
 	})
 
 	t.Run("nil clones to nil", func(t *testing.T) {

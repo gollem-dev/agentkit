@@ -193,6 +193,11 @@ type spawnConfig struct {
 	// empty one", which SpawnChild needs: the first inherits the parent's map,
 	// the second is how a caller says the child gets nothing.
 	hasMetadata bool
+	inheritFrom ProcessID
+	// hasInheritFrom separates "the caller named none" from "the caller named an
+	// empty id", so the latter is reported as the misuse it is instead of being
+	// read as "no inheritance".
+	hasInheritFrom bool
 }
 
 // WithIdempotencyKey makes Spawn return the existing Process's ID if one already
@@ -217,6 +222,32 @@ func WithSubject(ref SubjectRef) SpawnOption {
 // empty map meaning "this child gets none".
 func WithMetadata(m map[string]string) SpawnOption {
 	return func(c *spawnConfig) { c.metadata = m; c.hasMetadata = true }
+}
+
+// WithInheritedHistory starts the new Process's conversation from the version
+// `from` has committed, instead of from an empty one. Use it to continue a
+// finished Process's conversation in a Process of its own — one whose Metrics,
+// limits and cancellation are its own (ADR-0017).
+//
+// The version is resolved from `from`'s record at Spawn and pinned on the new
+// Process, so a later turn of `from` does not change what this one starts from.
+// The new Process saves its own versions under its own id, and the kernel never
+// Discards the inherited one.
+//
+// `from` must exist and must have committed a conversation, or Spawn fails with
+// ErrProcessNotFound / ErrInvalidRequest; the agent must be registered with
+// WithHistoryStore, or ErrHistoryNotConfigured. What the kernel does NOT
+// promise is that the inherited version survives: if `from` is still running,
+// its next commit releases the version this Process was pointed at (Discard is
+// a notification, so whether it is really reclaimed is the store's call).
+// Inherit from a finished Process, or accept that.
+//
+// Not usable on SpawnChild: a strategy has no way to obtain a version to
+// inherit (Syscalls hands out no HistoryRef), so the option would only be
+// reachable with a ref smuggled in from outside. Specifying it there is
+// ErrInvalidRequest.
+func WithInheritedHistory(from ProcessID) SpawnOption {
+	return func(c *spawnConfig) { c.inheritFrom = from; c.hasInheritFrom = true }
 }
 
 func newSpawnConfig(opts []SpawnOption) *spawnConfig {
@@ -465,6 +496,10 @@ func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts .
 	// A static misuse, rejected before any middleware sees the request.
 	if cfg.hasIdempotencyKey {
 		return "", goerr.Wrap(ErrInvalidRequest, "WithIdempotencyKey is not allowed on SpawnChild (D48)")
+	}
+	if cfg.hasInheritFrom {
+		return "", goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory is not allowed on SpawnChild",
+			goerr.V("from", cfg.inheritFrom))
 	}
 	// A child runs under its parent's infrastructure scope, so the map carries
 	// over when the caller named none — a ToolFactory keying off metadata["tenant"]
