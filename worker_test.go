@@ -196,6 +196,10 @@ func TestUC1_GenerateThenDone(t *testing.T) {
 	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
 	gt.Value(t, p.Metrics.InputTokens).Equal(int64(5))
 	gt.Value(t, p.Metrics.Steps).Equal(int64(1))
+	// textResponse sets no cache fields, so this is the "no caching" case
+	// (indistinguishable from a non-Claude provider) — the breakdown stays 0.
+	gt.Value(t, p.Metrics.CacheReadInputTokens).Equal(int64(0))
+	gt.Value(t, p.Metrics.CacheCreationInputTokens).Equal(int64(0))
 	gt.Value(t, *count).Equal(1)
 	events, _ := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
 	gt.Bool(t, hasEvent(events, agentkit.EventProcessCreated)).True()
@@ -731,6 +735,74 @@ func TestChildrenWakeup(t *testing.T) {
 	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithPollConcurrency(4))
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 	gt.Value(t, string(p.Output)).Equal("2") // both children succeeded and were collected.
+}
+
+// TestChildMetricsRollUpToParent exercises worker.go:1122
+// (pClone.Metrics = pClone.Metrics.add(child.Metrics)), the fold that runs on
+// the child's own terminal transition. The parent itself never calls
+// Generate, so every token counter on its final Metrics — cache breakdown
+// included — has to have come from the child.
+func TestChildMetricsRollUpToParent(t *testing.T) {
+	ctx := context.Background()
+	// Four distinct values so a fold that swaps two counters cannot pass by
+	// coincidence.
+	model, _ := mockLLM(&gollem.Response{
+		Texts:                   []string{"child done"},
+		InputToken:              21,
+		OutputToken:             23,
+		CacheCreationInputToken: 27,
+		CacheReadInputToken:     29,
+	})
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			res, err := sys.Generate(c, []gollem.Input{gollem.Text(st.Seed)})
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			return st, agentkit.Done([]byte(res.Texts[0])), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			id, e := child.SpawnChild(c, sys, scriptInput{Seed: "r1"})
+			if e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kid", id)), nil
+		}
+		aw, ok := sys.Await("kid")
+		if !ok || aw.Status != agentkit.AwaitResponded {
+			return st, agentkit.Decision[[]byte]{}, gollemErr("child not ready")
+		}
+		return st, agentkit.Done([]byte("parent done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	// The parent never calls Generate itself, so every token counter here is
+	// the child's own, folded in once at the child's terminal transition. The
+	// parent commits two of its own transitions (spawn+suspend, then
+	// collect+done), the child one (Generate+Done) — Steps rolls up the same
+	// way the token counters do, so the parent's final Steps is its own 2 plus
+	// the child's 1.
+	gt.Value(t, p.Metrics).Equal(agentkit.Metrics{
+		InputTokens: 21, OutputTokens: 23, CacheCreationInputTokens: 27, CacheReadInputTokens: 29,
+		LLMCalls: 1, Spawns: 1, Steps: 3,
+	})
 }
 
 // hookRepo wraps a Repository so a test can force a precise interleaving: onApply

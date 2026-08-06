@@ -350,6 +350,12 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		pid := newPID()
 		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mkProc(pid)}}))
 
+		// Every counter gets its own distinct value, so a mapper that assigns the
+		// wrong column to the wrong field cannot pass by coincidence.
+		wantMetrics := agentkit.Metrics{
+			InputTokens: 1, OutputTokens: 2, CacheReadInputTokens: 3, CacheCreationInputTokens: 4,
+			LLMCalls: 5, ToolCalls: 6, Steps: 7, Spawns: 8,
+		}
 		key := agentkit.AwaitKey(uniqueStr("kids"))
 		kid := newPID()
 		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{
@@ -359,7 +365,7 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 				Results: []agentkit.ChildResult{{
 					ProcessID: kid,
 					Status:    agentkit.ProcessSucceeded,
-					Metrics:   agentkit.Metrics{LLMCalls: 3, InputTokens: 42},
+					Metrics:   wantMetrics,
 				}},
 				CreatedAt: time.Now(),
 			}},
@@ -368,8 +374,7 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		got, err := repo.ListAwaits(ctx, pid)
 		gt.NoError(t, err)
 		gt.Array(t, got).Length(1)
-		gt.Value(t, got[0].Results[0].Metrics.LLMCalls).Equal(int64(3))
-		gt.Value(t, got[0].Results[0].Metrics.InputTokens).Equal(int64(42))
+		gt.Value(t, got[0].Results[0].Metrics).Equal(wantMetrics)
 
 		// Reads must not alias stored state. Metrics is a struct of scalars now, so
 		// an implementation that copies the ChildResult at all satisfies this; the
@@ -378,7 +383,26 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		got[0].Results[0].Metrics.LLMCalls = 999
 		again, err := repo.ListAwaits(ctx, pid)
 		gt.NoError(t, err)
-		gt.Value(t, again[0].Results[0].Metrics.LLMCalls).Equal(int64(3))
+		gt.Value(t, again[0].Results[0].Metrics).Equal(wantMetrics)
+	})
+
+	// Process.Metrics is the committed cumulative usage a root Limiter reads
+	// after a restart; an implementor storing it as discrete columns rather than
+	// a JSON blob must round-trip all eight counters, not just the ones an
+	// earlier fixture happened to touch.
+	t.Run("ProcessMetricsRoundTrip", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		p := mkProc(pid)
+		p.Metrics = agentkit.Metrics{
+			InputTokens: 11, OutputTokens: 22, CacheReadInputTokens: 33, CacheCreationInputTokens: 44,
+			LLMCalls: 55, ToolCalls: 66, Steps: 77, Spawns: 88,
+		}
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{p}}))
+
+		got, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, got.Metrics).Equal(p.Metrics)
 	})
 
 	t.Run("ListEventsOnProcessWithNoEvents", func(t *testing.T) {

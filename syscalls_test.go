@@ -2,6 +2,7 @@ package agentkit_test
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -504,5 +505,67 @@ func TestListEventsCursorAndLimit(t *testing.T) {
 		got, err := k.ListEvents(ctx, pid, agentkit.WithAfterEvent("no-such-event"))
 		gt.Error(t, err).Is(agentkit.ErrEventNotFound)
 		gt.Array(t, got).Length(0)
+	})
+}
+
+// --- prompt-cache token breakdown --------------------------------------------
+
+// cacheBreakdown mirrors the four token fields GenerateResult carries, so a
+// step can smuggle what it saw out through Process.Output for the test to
+// inspect after the transition commits.
+type cacheBreakdown struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+}
+
+func TestGenerateBasePropagatesCacheTokenBreakdown(t *testing.T) {
+	ctx := context.Background()
+	// Four distinct values so a mapper that assigns the wrong field to the
+	// wrong counter cannot pass by coincidence.
+	model, _ := mockLLM(&gollem.Response{
+		Texts:                   []string{"ok"},
+		InputToken:              11,
+		OutputToken:             13,
+		CacheCreationInputToken: 17,
+		CacheReadInputToken:     19,
+	})
+
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		res, err := sys.Generate(c, []gollem.Input{gollem.Text(st.Seed)})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		out, err := json.Marshal(cacheBreakdown{
+			InputTokens:              res.InputTokens,
+			OutputTokens:             res.OutputTokens,
+			CacheReadInputTokens:     res.CacheReadInputTokens,
+			CacheCreationInputTokens: res.CacheCreationInputTokens,
+		})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done(out), nil
+	}
+
+	k, repo, ag := setupScript(t, step, model)
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "hello"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	// GenerateResult carried the breakdown to the strategy.
+	var got cacheBreakdown
+	gt.NoError(t, json.Unmarshal(p.Output, &got))
+	gt.Value(t, got).Equal(cacheBreakdown{
+		InputTokens: 11, OutputTokens: 13, CacheReadInputTokens: 19, CacheCreationInputTokens: 17,
+	})
+
+	// Metrics (committed) carries the same breakdown, plus the counters
+	// generateBase and the transition themselves add.
+	gt.Value(t, p.Metrics).Equal(agentkit.Metrics{
+		InputTokens: 11, OutputTokens: 13, CacheReadInputTokens: 19, CacheCreationInputTokens: 17,
+		LLMCalls: 1, Steps: 1,
 	})
 }

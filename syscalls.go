@@ -94,12 +94,14 @@ type Syscalls interface {
 // round-trippable; History is included so the strategy can fold it into its
 // checkpointed state and pass it to the next Generate.
 type GenerateResult struct {
-	Texts         []string               `json:"texts"`
-	Thoughts      []string               `json:"thoughts,omitempty"`
-	FunctionCalls []*gollem.FunctionCall `json:"function_calls,omitempty"`
-	InputTokens   int                    `json:"input_tokens"`
-	OutputTokens  int                    `json:"output_tokens"`
-	History       *gollem.History        `json:"history"` // session history after the call (save it, pass it next time).
+	Texts                    []string               `json:"texts"`
+	Thoughts                 []string               `json:"thoughts,omitempty"`
+	FunctionCalls            []*gollem.FunctionCall `json:"function_calls,omitempty"`
+	InputTokens              int                    `json:"input_tokens"`
+	OutputTokens             int                    `json:"output_tokens"`
+	CacheReadInputTokens     int                    `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens int                    `json:"cache_creation_input_tokens,omitempty"`
+	History                  *gollem.History        `json:"history"` // session history after the call (save it, pass it next time).
 }
 
 // GenerateOption configures a Generate. Only input is required (D26). The
@@ -447,17 +449,21 @@ func (s *syscalls) generateBase(ctx context.Context, req *GenerateRequest) (*Gen
 		return nil, goerr.Wrap(err, "session history")
 	}
 	result := &GenerateResult{
-		Texts:         resp.Texts,
-		Thoughts:      resp.Thoughts,
-		FunctionCalls: resp.FunctionCalls,
-		InputTokens:   resp.InputToken,
-		OutputTokens:  resp.OutputToken,
-		History:       hist,
+		Texts:                    resp.Texts,
+		Thoughts:                 resp.Thoughts,
+		FunctionCalls:            resp.FunctionCalls,
+		InputTokens:              resp.InputToken,
+		OutputTokens:             resp.OutputToken,
+		CacheReadInputTokens:     resp.CacheReadInputToken,
+		CacheCreationInputTokens: resp.CacheCreationInputToken,
+		History:                  hist,
 	}
 	s.meter(ctx, Metrics{
-		InputTokens:  int64(resp.InputToken),
-		OutputTokens: int64(resp.OutputToken),
-		LLMCalls:     1,
+		InputTokens:              int64(resp.InputToken),
+		OutputTokens:             int64(resp.OutputToken),
+		CacheReadInputTokens:     int64(resp.CacheReadInputToken),
+		CacheCreationInputTokens: int64(resp.CacheCreationInputToken),
+		LLMCalls:                 1,
 	})
 	return result, nil // not journaled: a replay re-calls the LLM (re-charge allowed, D44).
 }

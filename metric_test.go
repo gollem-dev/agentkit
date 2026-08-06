@@ -22,10 +22,14 @@ func TestAddMetrics(t *testing.T) {
 	})
 
 	t.Run("every counter is summed", func(t *testing.T) {
-		a := agentkit.Metrics{InputTokens: 1, OutputTokens: 2, LLMCalls: 3, ToolCalls: 4, Steps: 5, Spawns: 6}
+		a := agentkit.Metrics{
+			InputTokens: 1, OutputTokens: 2, CacheReadInputTokens: 3, CacheCreationInputTokens: 4,
+			LLMCalls: 5, ToolCalls: 6, Steps: 7, Spawns: 8,
+		}
 		out := agentkit.AddMetrics(a, a)
 		gt.Value(t, out).Equal(agentkit.Metrics{
-			InputTokens: 2, OutputTokens: 4, LLMCalls: 6, ToolCalls: 8, Steps: 10, Spawns: 12,
+			InputTokens: 2, OutputTokens: 4, CacheReadInputTokens: 6, CacheCreationInputTokens: 8,
+			LLMCalls: 10, ToolCalls: 12, Steps: 14, Spawns: 16,
 		})
 	})
 
@@ -49,10 +53,12 @@ func TestMetricsJSONMatchesTheFormerMapKeys(t *testing.T) {
 
 	t.Run("marshal names every counter", func(t *testing.T) {
 		b := gt.R1(json.Marshal(agentkit.Metrics{
-			InputTokens: 1, OutputTokens: 2, LLMCalls: 3, ToolCalls: 4, Steps: 5, Spawns: 6,
+			InputTokens: 1, OutputTokens: 2, CacheReadInputTokens: 3, CacheCreationInputTokens: 4,
+			LLMCalls: 5, ToolCalls: 6, Steps: 7, Spawns: 8,
 		})).NoError(t)
 		gt.Value(t, string(b)).Equal(
-			`{"input_tokens":1,"output_tokens":2,"llm_calls":3,"tool_calls":4,"steps":5,"spawns":6}`)
+			`{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4,` +
+				`"llm_calls":5,"tool_calls":6,"steps":7,"spawns":8}`)
 	})
 
 	t.Run("unmarshal reads a snapshot written as a map", func(t *testing.T) {
