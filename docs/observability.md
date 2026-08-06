@@ -12,18 +12,32 @@ Four separate mechanisms, easy to confuse. They differ in one property —
 
 ## Metrics
 
-The kernel maintains six counters per process, as the fields of `Metrics`:
-`InputTokens`, `OutputTokens`, `LLMCalls`, `ToolCalls`, `Steps`, `Spawns`.
-
-The set is closed — there is no way to add a seventh — which is why `Metrics` is
-a struct rather than a map. Its JSON field names are the lowercase forms
-(`input_tokens` and so on), the same keys the map used, so a `Repository` that
-stores a process as JSON reads back what it wrote before the type changed
-without a migration.
+The kernel maintains a fixed set of eight counters per process, the fields of
+`Metrics`. The set is closed — there is no way to add a ninth — which is why
+`Metrics` is a struct rather than a map. Its JSON field names are the lowercase
+forms of the Go field names (`input_tokens` and so on), the same keys the map
+used, so a `Repository` that stores a process as JSON reads back what it wrote
+before the type changed without a migration.
 
 The bytes are not identical, though: metrics that are all zero used to be `null`
-and are now `{}`. A key outside the six is dropped when read and does not survive
-the next write — the kernel never wrote one, but the map type could hold one.
+and are now `{}`. A key outside the set is dropped when read and does not
+survive the next write — the kernel never wrote one, but the map type could
+hold one.
+
+Two of the counters, `CacheReadInputTokens` and `CacheCreationInputTokens`, are
+a prompt-cache breakdown of `InputTokens` — components of it, not additions:
+`InputTokens` stays the true total a Generate call spent (uncached input +
+cache writes + cache reads). `InputTokens - CacheReadInputTokens` is the input
+*not* served from cache — uncached input plus any cache write, not a single
+price tier, since a cache write is commonly billed at a premium over uncached
+input and a cache read at a discount. Pricing depends on model, provider and
+contract, so derive it from these three counts rather than reading either
+subtraction as "the" billed amount. Only Claude reports cache writes;
+`CacheCreationInputTokens` is 0 for a provider that does not, which reads the
+same as "no caching was used" and is not corrected. `GenerateResult` carries
+the same breakdown for a single call, alongside its existing `InputTokens` /
+`OutputTokens`, so a `GenerateMiddleware` can see one call's cache usage
+without diffing cumulative `Metrics`.
 
 Read the committed totals from `proc.Metrics`, or the live value inside a
 strategy with `sys.Metrics()` — which returns committed totals plus what the

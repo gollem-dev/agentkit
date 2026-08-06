@@ -3,9 +3,11 @@
 ## Summary
 
 The kernel **measures**; the strategy **decides**. Measurement is a fixed set of
-counters — a `Metrics` struct of six `int64` fields (input tokens, output tokens,
-LLM calls, tool calls, steps, spawns). The decision is a required method on
-`Strategy`:
+eight `int64` counters, the fields of `Metrics`. Two of them are a prompt-cache
+breakdown: components of input tokens, not additions to it — `InputTokens`
+stays the true total, and `InputTokens - CacheReadInputTokens` is the input not
+served from cache (uncached input plus any cache write, not a single price
+tier). The decision is a required method on `Strategy`:
 
 ```go
 Limit(ctx context.Context, proc *Process, metrics Metrics) LimitDecision
@@ -91,7 +93,9 @@ budget without the next check seeing it.
 read an index into something that might be missing. The json tags reproduce the
 map's former keys, so a snapshot written before the change reads back without a
 migration — not that the bytes are identical: all-zero metrics moved from `null`
-to `{}`, and a key outside the six is dropped on read.
+to `{}`, and a key outside the original six is dropped on read. The same closed-
+set property holds for any field added since: it grows what the struct declares,
+never what a caller can address.
 
 **The verdict is three-valued, because stopping is not the only useful answer.**
 A budget that can only refuse forces a run to end at the cap with no chance for
@@ -283,3 +287,4 @@ statuses and puts the reason where every other failure reason already lives.
 | 2026-07-26 | `Process.Metrics` now includes every terminated child, counted once each, so one `Limiter` expresses a subtree budget. Previously a tree budget needed the caller's own accounting keyed by `RootID`, which a fan-out strategy made mandatory. The signature is unchanged. The fold is keyed to the child's terminal transition rather than to await resolution — the first attempt keyed it to the await, which double-counted a child named by two await keys and missed one nobody waited on. |
 | 2026-07-26 | The `Limiter` returns a `LimitDecision` instead of an `error`, adding a third verdict: continue while telling the strategy the budget is running out. A two-valued return could only end a run at the cap, giving an agent no chance to wrap up on its own terms. The message is read through `Syscalls.LimitStatus()` or `EffectContext.Limit` and the kernel does nothing with it — injecting it would put model-facing vocabulary in the kernel. `LimitStop` takes a string because both call sites already discarded the error type. The verdict is re-evaluated after each effect is counted so it and `Metrics()` describe the same moment; a refusal there is stored but does not fail the effect, which is what lets a strategy finish with the result that crossed the cap. Being called twice per effect makes read-only-ness a stated requirement rather than an implicit one. `Metrics` became a struct: the counter set is closed by this record, so a map advertised keys that never existed. Its json tags reproduce the map's keys, so old snapshots read back without a migration — though all-zero metrics moved from `null` to `{}` and an unknown key is dropped. |
 | 2026-07-26 | The decision moved from a Kernel-wide injected closure (`WithLimiter`) to a required `Strategy.Limit` method, and the Kernel option was deleted rather than kept alongside. One limiter per Kernel forced a per-agent budget to be a `switch` on the `proc.Agent` string, where a missing case falls through to "no limit" — an optional slot cannot express that every agent has answered, and a required method can. Keeping both would have needed a composition rule and doubled the call count to deliver what the method already covers, since `Process.Metrics` folds in terminated children and a whole-tree budget is the root's own `Limit`. The method takes no `S`: the boundary evaluation runs before `DecodeState`. Per-spawn was rejected because a closure cannot be persisted on the Process row. The boundary call is wrapped by `callLimit` so a panic there becomes a transition error instead of killing the worker, and the bundled strategies gained their own `WithLimiter` option. |
+| 2026-08-06 | `Metrics` grew two counters, `CacheReadInputTokens` and `CacheCreationInputTokens`, so a caller can separate the input a Generate call served from the prompt cache from the input it did not. Both are components of `InputTokens`, not additions to it: `InputTokens` keeps meaning the true total gollem reports, so no existing `Limit` implementation changes what it sees. `InputTokens - CacheReadInputTokens` is the input not served from cache — uncached input plus any cache write — not a single price tier, since a cache write is commonly billed at a premium over uncached input and a cache read at a discount; agentkit carries the three counts and leaves pricing to the caller. Only Claude reports cache writes; the field is 0 for a provider that does not, indistinguishable from "no caching" and left uncorrected rather than teaching the kernel a provider-capability flag. The set is still closed at eight fields — a caller still cannot add a ninth. |
