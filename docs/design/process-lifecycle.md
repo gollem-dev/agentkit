@@ -306,7 +306,9 @@ be used to fence.
 ```
 re-read the process
   ├─ lease token changed?  → abandon, another worker owns it now
-  └─ cancel requested?     → finalize as cancelled
+  └─ cancel requested?     → conversation mid-round and deferrals left?
+                             ├─ yes → run one more transition, ask again
+                             └─ no  → finalize as cancelled
 Limit check                → failed(limit_exceeded) if it stops; otherwise its
                              verdict seeds Syscalls.LimitStatus()
 DecodeState(version, bytes)
@@ -436,3 +438,23 @@ as with any other termination.
 An external caller's commit conflict is propagated as `ErrConflict` rather than
 being silently retried, so the caller re-reads and re-decides — unlike a worker,
 an external caller has no lease to prove it should win.
+
+### The worker does not stop mid-round
+
+The boundary a worker reaches when it sees the cancel is not one the strategy
+chose, and the conversation committed there may end on a tool call nobody
+answered. Storing that as the final transcript makes it unusable — no provider
+accepts the sequence. So the worker checks the committed managed conversation and
+runs the strategy's next transition instead of finalizing, up to
+`WithMaxCancelDeferrals` times, after which it finalizes regardless
+([ADR-0020](../adr/0020-cancel-waits-for-a-closed-conversation.md)).
+
+The check is derived from `Process.HistoryRef`, not stored, so a worker taking
+over after a crash reaches the same answer. It is skipped entirely for an agent
+without a `HistoryStore`, and whenever the version cannot be read.
+
+**This only covers the stopping points the kernel chooses.** A `pending` or
+`waiting` Process is finalized inline as above — its conversation is stored as it
+stands. So is a Process ended by a crash, by `WithMaxStepAttempts`, or by
+`WithMaxUncleanReclaims`: there the transition itself failed, and there is no
+later boundary to prefer.

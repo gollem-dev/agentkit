@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gollem-dev/agentkit"
+	histmem "github.com/gollem-dev/agentkit/historystore/memory"
 	"github.com/gollem-dev/agentkit/repository/memory"
 	"github.com/gollem-dev/gollem"
 	"github.com/gollem-dev/gollem/mock"
@@ -2401,4 +2402,332 @@ func TestRetryBackoffNegativeIsFlooredAtZero(t *testing.T) {
 	// The retry still happened -- flooring the wait is not the same as skipping
 	// the requeue.
 	gt.Value(t, calls.Load()).Equal(int32(2))
+}
+
+// --- cancelling at a conversation boundary ---
+
+// openToolCallLLM hands back a History that carries the tool_call content
+// itself, so a committed conversation really does end on a call nothing has
+// answered — the state the cancel branch has to recognise. toolThenTextLLM grows
+// the message count without content, which is enough for the History tests but
+// invisible to this check.
+func openToolCallLLM(t *testing.T, callID, toolName string) gollem.LLMClient {
+	t.Helper()
+	call, err := gollem.NewToolCallContent(callID, toolName, map[string]any{})
+	gt.NoError(t, err)
+	return &mock.LLMClientMock{
+		NewSessionFunc: func(_ context.Context, opts ...gollem.SessionOption) (gollem.Session, error) {
+			cfg := gollem.NewSessionConfig(opts...)
+			var seeded []gollem.Message
+			if h := cfg.History(); h != nil {
+				seeded = h.Messages
+			}
+			return &mock.SessionMock{
+				GenerateFunc: func(_ context.Context, _ []gollem.Input, _ ...gollem.GenerateOption) (*gollem.Response, error) {
+					return &gollem.Response{
+						FunctionCalls: []*gollem.FunctionCall{{ID: callID, Name: toolName}},
+						InputToken:    1, OutputToken: 1,
+					}, nil
+				},
+				HistoryFunc: func() (*gollem.History, error) {
+					grown := append(append([]gollem.Message{}, seeded...),
+						gollem.Message{Role: gollem.RoleAssistant, Contents: []gollem.MessageContent{call}})
+					return &gollem.History{LLType: gollem.LLMTypeClaude, Version: gollem.HistoryVersion, Messages: grown}, nil
+				},
+			}, nil
+		},
+	}
+}
+
+// boundaryGate stops the worker once at a transition boundary — the loop-top
+// re-read — so a test can land a Cancel with nothing in flight. Cancelling
+// mid-transition would conflict with that transition's own Apply and send the
+// worker down the rebuild path, which is a different thing to test.
+type boundaryGate struct {
+	base    agentkit.Repository
+	mu      sync.Mutex
+	armed   bool
+	reached chan struct{}
+	release chan struct{}
+}
+
+func newBoundaryGate(base agentkit.Repository) *boundaryGate {
+	return &boundaryGate{base: base, armed: true, reached: make(chan struct{}), release: make(chan struct{})}
+}
+
+// onGet fires on the first read that finds a committed transition, and disarms
+// itself BEFORE blocking: Cancel reads the same row through the same repo, so an
+// armed gate would hold the very call it is waiting for.
+func (g *boundaryGate) onGet(pid agentkit.ProcessID) error {
+	g.mu.Lock()
+	if !g.armed {
+		g.mu.Unlock()
+		return nil
+	}
+	p, err := g.base.GetProcess(context.Background(), pid)
+	if err != nil || p.StateSeq < 1 {
+		g.mu.Unlock()
+		return nil
+	}
+	g.armed = false
+	g.mu.Unlock()
+	close(g.reached)
+	<-g.release
+	return nil
+}
+
+// cancelAtBoundary spawns the Process, waits for the gate, cancels there, and
+// serves until the Process is terminal.
+func cancelAtBoundary(t *testing.T, k *agentkit.Kernel, base agentkit.Repository,
+	ag agentkit.Agent[scriptInput], gate *boundaryGate, extra ...agentkit.ServeOption) *agentkit.Process {
+	t.Helper()
+	ctx := context.Background()
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	go func() {
+		<-gate.reached
+		_ = k.Cancel(ctx, pid, "user stopped")
+		close(gate.release)
+	}()
+	return serveUntil(t, k, base, pid, 5*time.Second, isTerminal, extra...)
+}
+
+// setupCancelScript wires the gated repo, the open-tool-call model and a tool
+// the strategy can answer the call with. store may be nil, for an agent that
+// opted into no managed conversation.
+func setupCancelScript(t *testing.T, step stepFn, store agentkit.HistoryStore) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput], *boundaryGate) {
+	t.Helper()
+	base := memory.New()
+	gate := newBoundaryGate(base)
+	hr := &hookRepo{Repository: base, onGet: gate.onGet}
+
+	reg := agentkit.NewRegistry()
+	var regOpts []agentkit.RegisterOption[[]byte]
+	if store != nil {
+		regOpts = append(regOpts, agentkit.WithHistoryStore[[]byte](store))
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, regOpts...)
+	gt.NoError(t, err)
+
+	k, err := agentkit.New(hr, openToolCallLLM(t, "c1", "probe"), reg,
+		agentkit.WithToolFactory(func(context.Context, *agentkit.Process) ([]gollem.Tool, error) {
+			return []gollem.Tool{mockTool("probe", map[string]any{"ok": true})}, nil
+		}))
+	gt.NoError(t, err)
+	return k, base, ag, gate
+}
+
+// The transition that answers the call runs AFTER the cancel is observed: the
+// worker does not stop on a conversation ending in an unanswered tool call.
+func TestCancelWaitsForTheToolRoundToClose(t *testing.T) {
+	hs := histmem.New()
+	var steps atomic.Int32
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.Add(1)
+		switch st.N {
+		case 0:
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		case 1:
+			if _, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "c1", Name: "probe"}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 2
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+
+	k, base, ag, gate := setupCancelScript(t, step, hs)
+	p := cancelAtBoundary(t, k, base, ag, gate)
+
+	gt.Value(t, p.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, steps.Load()).Equal(int32(2)) // the answering transition ran.
+	gt.Bool(t, agentkit.HasOpenToolCallForTest(committedHistory(t, hs, p))).False()
+}
+
+// The wait is only for a round in progress. A strategy that closed its round
+// inside the transition is stopped where it stands, with nothing extra run.
+func TestCancelStopsAtOnceOnAClosedConversation(t *testing.T) {
+	hs := histmem.New()
+	var steps atomic.Int32
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.Add(1)
+		if st.N == 0 {
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			if _, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "c1", Name: "probe"}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+
+	k, base, ag, gate := setupCancelScript(t, step, hs)
+	p := cancelAtBoundary(t, k, base, ag, gate)
+
+	gt.Value(t, p.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, steps.Load()).Equal(int32(1))
+	gt.Bool(t, agentkit.HasOpenToolCallForTest(committedHistory(t, hs, p))).False()
+}
+
+// The deferred transition is an ordinary one, so it can finish the Process. A
+// pending cancel does not override a terminal decision the strategy reached.
+func TestCancelDoesNotOverrideATerminalTransition(t *testing.T) {
+	hs := histmem.New()
+	var steps atomic.Int32
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.Add(1)
+		if st.N == 0 {
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		if _, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "c1", Name: "probe"}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+
+	k, base, ag, gate := setupCancelScript(t, step, hs)
+	p := cancelAtBoundary(t, k, base, ag, gate)
+
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, steps.Load()).Equal(int32(2))
+	gt.Bool(t, agentkit.HasOpenToolCallForTest(committedHistory(t, hs, p))).False()
+}
+
+// A conversation that never closes does not hold a cancelled Process: the bound
+// ends it, and the transcript is left as it stands.
+func TestCancelBoundEndsAnUnclosedConversation(t *testing.T) {
+	hs := histmem.New()
+	var steps atomic.Int32
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.Add(1)
+		if st.N == 0 {
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+		}
+		return st, agentkit.Continue[[]byte](), nil // never answers the call.
+	}
+
+	k, base, ag, gate := setupCancelScript(t, step, hs)
+	p := cancelAtBoundary(t, k, base, ag, gate, agentkit.WithMaxCancelDeferrals(2))
+
+	gt.Value(t, p.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, steps.Load()).Equal(int32(3)) // the first transition, then exactly two deferrals.
+	gt.Bool(t, agentkit.HasOpenToolCallForTest(committedHistory(t, hs, p))).True()
+}
+
+// Zero is the behaviour from before the check existed, kept reachable.
+func TestCancelWithoutDeferralsStopsAtOnce(t *testing.T) {
+	hs := histmem.New()
+	var steps atomic.Int32
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.Add(1)
+		if st.N == 0 {
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+		}
+		return st, agentkit.Continue[[]byte](), nil
+	}
+
+	k, base, ag, gate := setupCancelScript(t, step, hs)
+	p := cancelAtBoundary(t, k, base, ag, gate, agentkit.WithMaxCancelDeferrals(0))
+
+	gt.Value(t, p.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, steps.Load()).Equal(int32(1))
+	gt.Bool(t, agentkit.HasOpenToolCallForTest(committedHistory(t, hs, p))).True()
+}
+
+// An agent that keeps History in its own state has no managed conversation for
+// the kernel to read, so its cancels are unchanged.
+func TestCancelIsImmediateWithoutAHistoryStore(t *testing.T) {
+	var steps atomic.Int32
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.Add(1)
+		if st.N == 0 {
+			if _, err := sys.Generate(ctx, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+		}
+		return st, agentkit.Continue[[]byte](), nil
+	}
+
+	k, base, ag, gate := setupCancelScript(t, step, nil)
+	p := cancelAtBoundary(t, k, base, ag, gate)
+
+	gt.Value(t, p.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, steps.Load()).Equal(int32(1))
+}
+
+// A waiting Process is not at a boundary any worker owns, so Cancel finalizes it
+// inline as it always has — including when the conversation is mid-round. The
+// deferral covers the stopping points the kernel chooses, not this one.
+func TestCancelWhileWaitingStillFinalizesInline(t *testing.T) {
+	ctx := context.Background()
+	hs := histmem.New()
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Suspend[[]byte](agentkit.Timer("later", sys.Now().Add(time.Hour))), nil
+	}
+
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](hs))
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, openToolCallLLM(t, "c1", "probe"), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessWaiting
+	})
+
+	gt.NoError(t, k.Cancel(ctx, pid, "user stopped"))
+	p, err := repo.GetProcess(ctx, pid)
+	gt.NoError(t, err)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessCancelled)
+	gt.Bool(t, agentkit.HasOpenToolCallForTest(committedHistory(t, hs, p))).True()
+}
+
+// The bound has to stay below the claim: reached only after the claim released,
+// it would restart on the next claim and never land.
+func TestCancelDeferralBoundIsClampedBelowTheClaim(t *testing.T) {
+	cases := map[string]struct {
+		opts []agentkit.ServeOption
+		want int
+	}{
+		"default is the rest of the claim": {nil, 15},
+		"follows a smaller claim":          {[]agentkit.ServeOption{agentkit.WithMaxStepsPerClaim(4)}, 3},
+		"explicit value is kept":           {[]agentkit.ServeOption{agentkit.WithMaxCancelDeferrals(2)}, 2},
+		"negative becomes none":            {[]agentkit.ServeOption{agentkit.WithMaxCancelDeferrals(-1)}, 0},
+		"clamped under a short claim": {[]agentkit.ServeOption{
+			agentkit.WithMaxStepsPerClaim(1), agentkit.WithMaxCancelDeferrals(4),
+		}, 0},
+		"an invalid claim length falls back to the default": {
+			[]agentkit.ServeOption{agentkit.WithMaxStepsPerClaim(0)}, 15,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			gt.Value(t, agentkit.MaxCancelDeferralsForTest(tc.opts...)).Equal(tc.want)
+		})
+	}
 }

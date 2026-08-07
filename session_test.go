@@ -1630,3 +1630,111 @@ func TestSession_LLMSessionOptionsOverrideManagedHistory(t *testing.T) {
 
 	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(9) // persisted, not just carried in memory.
 }
+
+// --- the conversation check a cancel consults (worker.go's cancel branch) ---
+
+func toolCallMsg(t *testing.T, id, name string) gollem.Message {
+	t.Helper()
+	c, err := gollem.NewToolCallContent(id, name, map[string]any{})
+	gt.NoError(t, err)
+	return gollem.Message{Role: gollem.RoleAssistant, Contents: []gollem.MessageContent{c}}
+}
+
+func toolRespMsg(t *testing.T, id, name string) gollem.Message {
+	t.Helper()
+	c, err := gollem.NewToolResponseContent(id, name, map[string]any{"ok": true}, false)
+	gt.NoError(t, err)
+	return gollem.Message{Role: gollem.RoleTool, Contents: []gollem.MessageContent{c}}
+}
+
+func textMsg(t *testing.T, text string) gollem.Message {
+	t.Helper()
+	c, err := gollem.NewTextContent(text)
+	gt.NoError(t, err)
+	return gollem.Message{Role: gollem.RoleAssistant, Contents: []gollem.MessageContent{c}}
+}
+
+func history(msgs ...gollem.Message) *gollem.History {
+	return &gollem.History{LLType: gollem.LLMTypeClaude, Version: gollem.HistoryVersion, Messages: msgs}
+}
+
+// A conversation is open when any tool call is unanswered, wherever it sits.
+func TestHasOpenToolCall(t *testing.T) {
+	corruptCall := gollem.MessageContent{Type: gollem.MessageContentTypeToolCall, Data: []byte("{{")}
+	corruptResp := gollem.MessageContent{Type: gollem.MessageContentTypeToolResponse, Data: []byte("{{")}
+	thinking, err := gollem.NewThinkingContent("hmm")
+	gt.NoError(t, err)
+
+	cases := map[string]struct {
+		h    *gollem.History
+		want bool
+	}{
+		"nil history": {nil, false},
+		"no messages": {history(), false},
+		"content that is no tool round": {history(
+			textMsg(t, "hello"),
+			gollem.Message{Role: gollem.RoleAssistant, Contents: []gollem.MessageContent{thinking}},
+		), false},
+		"call answered":   {history(toolCallMsg(t, "c1", "tool"), toolRespMsg(t, "c1", "tool")), false},
+		"call unanswered": {history(toolCallMsg(t, "c1", "tool")), true},
+		"answer then reopen": {history(
+			toolCallMsg(t, "c1", "tool"), toolRespMsg(t, "c1", "tool"),
+			toolCallMsg(t, "c2", "tool"),
+		), true},
+		"one of two answered": {history(
+			toolCallMsg(t, "c1", "tool"), toolCallMsg(t, "c2", "tool"),
+			toolRespMsg(t, "c1", "tool"),
+		), true},
+		"answer names another call": {history(
+			toolCallMsg(t, "c1", "tool"), toolRespMsg(t, "other", "tool"),
+		), true},
+		"undecodable call": {history(
+			gollem.Message{Role: gollem.RoleAssistant, Contents: []gollem.MessageContent{corruptCall}},
+		), true},
+		"undecodable answer": {history(
+			toolCallMsg(t, "c1", "tool"),
+			gollem.Message{Role: gollem.RoleTool, Contents: []gollem.MessageContent{corruptResp}},
+		), true},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			gt.Value(t, agentkit.HasOpenToolCallForTest(tc.h)).Equal(tc.want)
+		})
+	}
+}
+
+// Whenever the kernel cannot see the conversation, a cancel proceeds: an agent
+// that opted into no store must cancel exactly as it did before the check
+// existed, and an unreadable version must not pin a cancelled Process.
+func TestConversationClosedWhenUnknowable(t *testing.T) {
+	ctx := context.Background()
+	k, _, _ := registerWithHistory(t, doneStep(), growingLLM(), histmem.New())
+
+	t.Run("no store", func(t *testing.T) {
+		gt.Bool(t, k.ConversationClosedForTest(ctx, nil, "p1", "ref-1")).True()
+	})
+
+	t.Run("nothing committed yet", func(t *testing.T) {
+		gt.Bool(t, k.ConversationClosedForTest(ctx, histmem.New(), "p1", "")).True()
+	})
+
+	t.Run("version will not load", func(t *testing.T) {
+		store := &probeStore{inner: histmem.New(), loadErr: gollemErr("store down")}
+		gt.Bool(t, k.ConversationClosedForTest(ctx, store, "p1", "ref-1")).True()
+	})
+
+	t.Run("open version loads", func(t *testing.T) {
+		store := histmem.New()
+		ref, err := store.Save(ctx, "p1", history(toolCallMsg(t, "c1", "tool")))
+		gt.NoError(t, err)
+		gt.Bool(t, k.ConversationClosedForTest(ctx, store, "p1", ref)).False()
+	})
+
+	t.Run("closed version loads", func(t *testing.T) {
+		store := histmem.New()
+		ref, err := store.Save(ctx, "p1", history(toolCallMsg(t, "c1", "tool"), toolRespMsg(t, "c1", "tool")))
+		gt.NoError(t, err)
+		gt.Bool(t, k.ConversationClosedForTest(ctx, store, "p1", ref)).True()
+	})
+}
