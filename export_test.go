@@ -21,6 +21,23 @@ func (b StrategyBinding) LimitForTest(ctx context.Context, proc *Process, m Metr
 	return b.limit(ctx, proc, m)
 }
 
+// HasOpenToolCallForTest exposes hasOpenToolCall, the conversation check a
+// cancel consults before it stops at a transition boundary.
+func HasOpenToolCallForTest(h *gollem.History) bool { return hasOpenToolCall(h) }
+
+// ConversationClosedForTest drives conversationClosed the way a cancel check
+// reaches it on a claim that has not touched the Session yet: nothing loaded, so
+// the answer comes from store and ref alone.
+func (k *Kernel) ConversationClosedForTest(ctx context.Context, store HistoryStore, pid ProcessID, ref HistoryRef) bool {
+	return k.conversationClosed(ctx, &historyState{store: store, pid: pid}, &Process{ID: pid, HistoryRef: ref})
+}
+
+// MaxCancelDeferralsForTest reports the deferral bound Serve would run with,
+// after the clamp against maxStepsPerClaim.
+func MaxCancelDeferralsForTest(opts ...ServeOption) int {
+	return newServeConfig(opts).maxCancelDeferrals
+}
+
 // CallLimitForTest exposes callLimit, the boundary wrapper that turns a panicking
 // Limit into a transition error.
 func CallLimitForTest(ctx context.Context, f Limiter, proc *Process, m Metrics) (LimitDecision, error) {

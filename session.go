@@ -294,6 +294,63 @@ func discardSuperseded(ctx context.Context, store HistoryStore, pid ProcessID, p
 	discardHistory(ctx, store, pid, prev)
 }
 
+// hasOpenToolCall reports whether h holds a tool call with no matching tool
+// response. Position does not matter: the question is whether the conversation
+// has an unanswered call anywhere, not whether the last message is one.
+//
+// A content it cannot decode counts as open. Reading a corrupt record as
+// "answered" would assert something the kernel cannot see; the only caller
+// bounds how long an open answer can hold a cancel, so erring this way costs a
+// few transitions rather than a broken transcript.
+func hasOpenToolCall(h *gollem.History) bool {
+	if h == nil {
+		return false
+	}
+	open := map[string]struct{}{}
+	for _, m := range h.Messages {
+		for i := range m.Contents {
+			switch m.Contents[i].Type {
+			case gollem.MessageContentTypeToolCall:
+				c, err := m.Contents[i].GetToolCallContent()
+				if err != nil {
+					return true
+				}
+				open[c.ID] = struct{}{}
+			case gollem.MessageContentTypeToolResponse:
+				c, err := m.Contents[i].GetToolResponseContent()
+				if err != nil {
+					return true
+				}
+				delete(open, c.ToolCallID)
+			}
+		}
+	}
+	return len(open) > 0
+}
+
+// conversationClosed reports whether this Process's committed managed
+// conversation is a point a cancel may stop at.
+//
+// It answers true whenever the kernel cannot tell — the agent opted into no
+// store, nothing has been committed yet, the stored version will not load — so
+// an agent that does not use the managed conversation cancels exactly as it did
+// before this check existed. Blocking a cancel on a version nobody can read
+// would trade a promptly stopped Process for nothing.
+func (k *Kernel) conversationClosed(ctx context.Context, hs *historyState, proc *Process) bool {
+	if hs == nil || hs.store == nil {
+		return true
+	}
+	// InheritedHistory matters here as much as HistoryRef: a Process that has
+	// committed no version of its own still has a conversation, and it can be one
+	// another Process left mid-round.
+	if err := hs.ensureLoaded(ctx, proc.HistoryRef, proc.InheritedHistory); err != nil {
+		k.logger.Warn("cannot read the committed conversation; cancelling at this boundary",
+			"process", proc.ID, "ref", proc.HistoryRef, "error", err)
+		return true
+	}
+	return !hasOpenToolCall(hs.baseline)
+}
+
 // discardUncommitted releases the version an attempt saved but did not commit.
 // Callers must be certain the commit did not happen; an unknown outcome keeps
 // the version. The same-ref guard as discardSuperseded applies for the same

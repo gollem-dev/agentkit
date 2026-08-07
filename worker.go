@@ -23,6 +23,7 @@ type serveConfig struct {
 	maxStepsPerClaim   int
 	maxStepAttempts    int
 	maxUncleanReclaims int
+	maxCancelDeferrals int
 	pollConcurrency    int // soft limit: number of parallel poll (claim) loops.
 	maxConcurrent      int // hard limit: max claims driven at once (poll + eager).
 	retryBackoff       RetryBackoff
@@ -66,6 +67,21 @@ func WithPollInterval(d time.Duration) ServeOption {
 // A value < 1 is treated as the default (0 would run no transition and release,
 // which under eager dispatch re-submits in a tight loop).
 func WithMaxStepsPerClaim(n int) ServeOption { return func(c *serveConfig) { c.maxStepsPerClaim = n } }
+
+// WithMaxCancelDeferrals bounds how many transitions a claim may run after it
+// observes a cancel request while the managed conversation still holds a tool
+// call nobody answered. Default: one less than WithMaxStepsPerClaim, i.e. the
+// rest of the claim. Zero finalizes at the first boundary, which is the
+// behaviour from before this option existed. It is clamped below
+// WithMaxStepsPerClaim so a cancel always lands inside the claim that observed
+// it rather than surviving a release and starting the count over.
+//
+// Raising it does not make a cancel land on a usable transcript by itself: only
+// a strategy that answers its tool calls produces a boundary worth waiting for.
+// See docs/writing-strategies.md.
+func WithMaxCancelDeferrals(n int) ServeOption {
+	return func(c *serveConfig) { c.maxCancelDeferrals = n }
+}
 
 // WithMaxStepAttempts sets the step retry limit. Default: 3. This bounds
 // attempts that ended in an ERROR; a claim that died mid-transition is bounded
@@ -137,6 +153,14 @@ const defaultMaxConcurrent = 64
 // transitions one claim runs.
 const defaultMaxStepsPerClaim = 16
 
+// defaultMaxCancelDeferrals gives a cancelled Process the rest of its claim to
+// close the conversation, so the claim itself is the bound rather than a second
+// number chosen independently of it. A strategy that closes its tool rounds
+// needs one transition; one that does not would not close in five either, so a
+// smaller number saves nothing and only cuts short the legitimate shape that
+// answers one call per transition.
+const defaultMaxCancelDeferrals = defaultMaxStepsPerClaim - 1
+
 func newServeConfig(opts []ServeOption) serveConfig {
 	host, _ := os.Hostname()
 	cfg := serveConfig{
@@ -146,6 +170,7 @@ func newServeConfig(opts []ServeOption) serveConfig {
 		maxStepsPerClaim:   defaultMaxStepsPerClaim,
 		maxStepAttempts:    3,
 		maxUncleanReclaims: 3,
+		maxCancelDeferrals: defaultMaxCancelDeferrals,
 		pollConcurrency:    1,
 		maxConcurrent:      defaultMaxConcurrent,
 		retryBackoff:       defaultRetryBackoff,
@@ -173,6 +198,16 @@ func newServeConfig(opts []ServeOption) serveConfig {
 	// release -> re-dispatch loop that churns goroutines and hammers the store.
 	if cfg.maxStepsPerClaim < 1 {
 		cfg.maxStepsPerClaim = defaultMaxStepsPerClaim
+	}
+	// Clamped after maxStepsPerClaim, against its final value. A deferral bound at
+	// or above it would let the claim end before the bound is reached: the Process
+	// would be released, re-claimed, and start counting again, so a conversation
+	// that never closes would keep a cancel pending indefinitely.
+	if cfg.maxCancelDeferrals < 0 {
+		cfg.maxCancelDeferrals = 0
+	}
+	if cfg.maxCancelDeferrals >= cfg.maxStepsPerClaim {
+		cfg.maxCancelDeferrals = cfg.maxStepsPerClaim - 1
 	}
 	return cfg
 }
@@ -432,6 +467,11 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 	}
 	k.expireDueAwaits(ctx, proc)
 
+	// Claim-local, deliberately not persisted: the count only has to bound this
+	// claim, because the clamp in newServeConfig keeps it below maxStepsPerClaim
+	// and a cancel therefore always lands before the claim can end.
+	cancelDeferrals := 0
+
 	for i := 0; i < cfg.maxStepsPerClaim; i++ {
 		fresh, err := k.repo.GetProcess(ctx, proc.ID)
 		if err != nil {
@@ -441,7 +481,17 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 			return ClaimAbandoned // lost the lease between transitions.
 		}
 		if fresh.CancelRequested {
-			return k.finalizeClaimed(ctx, fresh, cancelledWith(fresh.CancelReason), claimToken, Metrics{})
+			// Stopping here would leave the stored conversation ending on a tool call
+			// nobody answered — unusable as a transcript to send anywhere. Running the
+			// strategy's next transition is what closes it; the bound is what keeps a
+			// conversation that never closes from holding a cancelled Process here.
+			// The bound is tested first so a spent budget costs no History read.
+			if cancelDeferrals >= cfg.maxCancelDeferrals || k.conversationClosed(ctx, hs, fresh) {
+				return k.finalizeClaimed(ctx, fresh, cancelledWith(fresh.CancelReason), claimToken, Metrics{})
+			}
+			cancelDeferrals++
+			k.logger.Info("cancel deferred: the managed conversation has an unanswered tool call",
+				"process", fresh.ID, "deferrals", cancelDeferrals, "limit", cfg.maxCancelDeferrals)
 		}
 		proc = fresh
 		// Bounded before Step rather than after a failure, because an unclean

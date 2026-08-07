@@ -332,6 +332,44 @@ which surfaces as a failing first transition, not as an empty conversation.
 conversation yet, or the agent was registered without `WithHistoryStore`. It is
 not available on `SpawnChild`: a strategy has no `HistoryRef` to name.
 
+### Where a cancel can stop
+
+Cancelling a *running* Process does not stop it at whichever boundary it happens
+to reach. When the worker sees the cancel it looks at the conversation the last
+transition committed, and while that conversation still holds a tool call nobody
+answered it does not finalize — it runs your next transition and looks again.
+Stopping there would leave a stored transcript that cannot be sent anywhere.
+
+**That only helps if your loop reaches a boundary where every call has an
+answer.** The kernel never forces the round closed and never invents a result;
+it only declines to stop while one is missing. A loop that answers its calls
+gets a clean stopping point on the very next transition. A loop that does not
+gets nothing out of this.
+
+`Session().CallTool` is what closes a round, and it closes one whatever happens:
+exactly one tool response is appended per call — for an unknown tool, bad
+arguments, a failing `Run`, or a middleware that refused — so even a failing tool
+leaves the conversation closed. The error still comes back to you.
+
+**If the round never closes**, the wait is bounded by `WithMaxCancelDeferrals`
+(default: the rest of the claim). At the bound the Process is cancelled with the
+conversation exactly as it stands. The transitions that ran in the meantime were
+real: their tools ran, their LLM calls were paid for, and their usage is in
+`Process.Metrics`. A loop that leaves rounds open therefore gets the worst of
+both — a slower cancel *and* a transcript that ends mid-round.
+
+Two cases the wait does not cover:
+
+- **Waiting, not running.** `Cancel` on a Process parked in `waiting` finalizes
+  it immediately, because no worker holds it. The approval strategy above
+  suspends with the `tool_use` open, so a cancel there stores it that way.
+- **History you keep yourself.** With raw `sys.Generate` the conversation lives
+  in your state, where the kernel cannot read it, so those cancels are immediate.
+
+And it only covers the stops the kernel *chooses*. A crash, a spent
+`WithMaxStepAttempts` budget, or the unclean-reclaim bound ends the Process
+wherever its last commit left it.
+
 ## Running tools
 
 ```go
