@@ -69,6 +69,24 @@ type Syscalls interface {
 	// --- observation ---
 	Emit(ctx context.Context, typ EventType, payload []byte) error // flushed on commit. Encoding is the caller's.
 	Metrics() Metrics                                              // proc.Metrics (committed) + this run's accumulation.
+	// Count adds n to the caller-defined counter named by key, which must come
+	// from DefineMetricKey. It is how a strategy counts what the kernel cannot
+	// measure on its own; a tool counts its own consumption by implementing
+	// MeteredTool instead.
+	//
+	// The count lands in this transition's accumulation and commits with it,
+	// exactly like the counters the kernel measures — so it is visible to
+	// Metrics() at once, rolls up into the parent when this Process terminates,
+	// and is folded in on requeue rather than lost.
+	//
+	// Like a metered effect, it re-evaluates Limit, so LimitStatus() reflects the
+	// new total. It cannot be refused: what it records has already happened.
+	// A verdict of LimitKindStop is stored and enforced at the next effect's
+	// check or the next transition boundary, and Count still returns nil.
+	//
+	// It returns ErrInvalidRequest for a nil key or a negative n. n == 0 does
+	// nothing at all.
+	Count(ctx context.Context, key MetricKey, n int64) error
 	// LimitStatus reports this Strategy's most recent Limit verdict, starting
 	// with the one taken at the transition boundary. Switch on Kind() and read
 	// Message().
@@ -355,6 +373,24 @@ func (s *syscalls) Metrics() Metrics { return s.proc.Metrics.add(s.runMetrics) }
 
 func (s *syscalls) LimitStatus() LimitDecision { return s.limit }
 
+func (s *syscalls) Count(ctx context.Context, key MetricKey, n int64) error {
+	if key == nil {
+		return goerr.Wrap(ErrInvalidRequest, "nil metric key")
+	}
+	if n < 0 {
+		return goerr.Wrap(ErrInvalidRequest, "negative metric count",
+			goerr.V("metric", key.String()), goerr.V("count", n))
+	}
+	if n == 0 {
+		// Nothing was consumed, so nothing moves — including the verdict. A
+		// Limiter is allowed to consult state of its own, and re-running it here
+		// would report a change this call did not cause.
+		return nil
+	}
+	s.meter(ctx, Metrics{}.WithCount(key, n))
+	return nil
+}
+
 // meter folds an effect's usage into this run's metrics and re-evaluates the
 // Limit, so LimitStatus() and Metrics() always describe the same moment: a
 // strategy reading either one right after a Generate sees the tokens that
@@ -490,11 +526,32 @@ func (s *syscalls) toolCallBase(ctx context.Context, req *ToolCallRequest) (map[
 		return nil, err
 	}
 	out, terr := tool.Run(ctx, req.Call.Arguments)
-	s.meter(ctx, Metrics{ToolCalls: 1})
+	m := Metrics{ToolCalls: 1}
+	if mt, ok := tool.(MeteredTool); ok {
+		m = s.foldMetered(m, mt.Metered(req.Call, out, terr), req.Call.Name)
+	}
+	s.meter(ctx, m)
 	// A replay re-executes; side-effecting tools must be made idempotent by the
 	// author (D44/D45). Run errors are returned to the strategy (the Process is
 	// not dropped).
 	return out, terr
+}
+
+// foldMetered adds a MeteredTool's report to the metrics for that call. An
+// entry the kernel cannot count — a nil key, or a value that would make a
+// cumulative counter go backwards — is dropped with a log line rather than
+// silently, and rather than failing the call: Metered runs after Run, so the
+// effect is already done and its result is worth more than the accounting.
+func (s *syscalls) foldMetered(m Metrics, reported map[MetricKey]int64, tool string) Metrics {
+	for k, n := range reported {
+		if k == nil || n < 0 {
+			s.k.logger.Warn("dropped invalid tool-reported metric",
+				slog.String("tool", tool), slog.String("metric", keyName(k)), slog.Int64("count", n))
+			continue
+		}
+		m = m.WithCount(k, m.Count(k)+n)
+	}
+	return m
 }
 
 func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts ...SpawnOption) (ProcessID, error) {

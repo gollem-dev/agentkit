@@ -2,12 +2,22 @@
 
 ## Summary
 
-The kernel **measures**; the strategy **decides**. Measurement is a fixed set of
-eight `int64` counters, the fields of `Metrics`. Two of them are a prompt-cache
-breakdown: components of input tokens, not additions to it — `InputTokens`
-stays the true total, and `InputTokens - CacheReadInputTokens` is the input not
-served from cache (uncached input plus any cache write, not a single price
-tier). The decision is a required method on `Strategy`:
+The kernel **measures**; the strategy **decides**. Measurement is `Metrics`:
+eight `int64` counters the kernel maintains itself, which are struct fields and
+a closed set, plus any number of counters the caller defined, which are not.
+Two of the eight are a prompt-cache breakdown: components of input tokens, not
+additions to it — `InputTokens` stays the true total, and
+`InputTokens - CacheReadInputTokens` is the input not served from cache
+(uncached input plus any cache write, not a single price tier).
+
+A caller-defined counter is named by a `MetricKey`, a sealed interface whose only
+values come from `DefineMetricKey`, so a counter cannot be addressed by a string
+literal at the point of use. Two things write one: `Syscalls.Count`, for what a
+strategy knows itself, and the optional `MeteredTool` interface, for what only a
+tool knows. Both feed the same counters, which are read back through
+`Metrics.Count` and roll up into the parent exactly like the eight.
+
+The decision is a required method on `Strategy`:
 
 ```go
 Limit(ctx context.Context, proc *Process, metrics Metrics) LimitDecision
@@ -88,14 +98,59 @@ question is the `Governor` mistake this record already rejected once.
 current run has accumulated so far. There is no way for an effect to consume
 budget without the next check seeing it.
 
-**The counters are a struct, not a map.** The set is closed by this record, so
-`map[Metric]int64` advertised a key space that does not exist and made every
-read an index into something that might be missing. The json tags reproduce the
-map's former keys, so a snapshot written before the change reads back without a
-migration — not that the bytes are identical: all-zero metrics moved from `null`
-to `{}`, and a key outside the original six is dropped on read. The same closed-
-set property holds for any field added since: it grows what the struct declares,
-never what a caller can address.
+**The kernel's own counters are struct fields, not map entries.** That set is
+closed by this record, so `map[Metric]int64` advertised a key space that does not
+exist and made every read an index into something that might be missing. The
+wire names reproduce the map's former keys, so a snapshot written before the
+change reads back without a migration — not that the bytes are identical:
+all-zero metrics moved from `null` to `{}`, and a key outside the original six is
+dropped on read. Adding a field since grows what the struct declares, never what
+a caller can address.
+
+**Caller-defined counters are a map, because that set is open — and the key type
+is what keeps it safe.** The kernel can only measure what it performs itself:
+tokens, calls, spawns. Documents fetched, credits charged, rows written are
+knowledge the caller has and the kernel does not, and a budget over them was
+previously expressible only outside agentkit, where it lost the one thing the
+kernel provides — a total that survives a crash and folds children into their
+parent.
+
+A `map[string]int64` would have brought back exactly the defect this record
+removed: a name is written at each use site, and a typo produces a second
+counter that reads zero rather than a compile error. So the key is `MetricKey`, a
+sealed interface (`.claude/rules/go.md`: a marker method blocks construction
+*and* external implementation, which an opaque struct does not). Its only
+implementation is a comparable **value** type, so identity is the name — two
+`DefineMetricKey` calls with the same name are equal and index the same entry.
+That is the opposite of `ModelRole`, deliberately: a role is never persisted,
+while a counter is, and a key rebuilt from a stored name under pointer identity
+would never match the one the caller holds.
+
+There is no registry behind `DefineMetricKey`, so two packages choosing the same
+name get the same counter. Detecting that would need mutable package state and
+would make a name no code in this binary defines — which is exactly what a
+Repository reads back — impossible to reconstruct. Namespace the name instead.
+
+The counters live in an unexported field read through `Count` / `Counters` and
+rebuilt through `WithCount`, and nothing mutates the map in place. An exported
+map would be handed to a `Limiter` directly at the transition boundary
+(`callLimit` passes `proc.Metrics`), where writing to it would corrupt the row —
+and read-only-ness is something this record asks of a `Limiter` in prose, not in
+the type. Keeping it unexported also means a Repository's clone needs no deep
+copy. The cost is that `Metrics` owns its own `MarshalJSON`; it already declared
+its wire names here, and a map keyed by an interface cannot be encoded from a
+struct tag at all.
+
+**Two write paths, because they know different things.** A strategy cannot see
+inside a tool, and a tool cannot reach the strategy's syscalls. `Syscalls.Count`
+covers the first, `MeteredTool` the second, and both land in the same counters —
+this is one mechanism with two inputs, not two mechanisms answering one question.
+`Count` re-evaluates `Limit` like a metered effect so `LimitStatus()` and
+`Metrics()` still describe the same moment, and cannot be refused: what it
+records has already happened. A `MeteredTool` report is taken after `Run`,
+including a `Run` that failed, and an entry the kernel cannot count — a nil key,
+a negative value — is dropped with a log line rather than failing a call whose
+effect already happened.
 
 **The verdict is three-valued, because stopping is not the only useful answer.**
 A budget that can only refuse forces a run to end at the cap with no chance for
@@ -199,9 +254,33 @@ statuses and puts the reason where every other failure reason already lives.
   on model, date and contract — knowledge the kernel does not have and cannot
   acquire. Emitting a number it cannot compute correctly would be worse than
   emitting nothing. Callers derive cost from the token counters.
-- **Tool-reported metrics.** `gollem.Tool.Run` returns `map[string]any`, and
-  conforming to that signature (ADR-0001) matters more. Tools count as
-  `tool_calls` only. An optional interface can add this later without a break.
+- **Changing `Tool.Run` so it can return usage.** `gollem.Tool.Run` returns
+  `map[string]any` and conforming to that signature (ADR-0001) matters more, so
+  a tool reports through the separate optional `MeteredTool` interface. A tool
+  that does not implement it still counts as `tool_calls` and nothing else.
+- **`map[string]int64` for the caller-defined counters.** The defect this record
+  removed, in another form: the name is written at each use site, and a typo
+  makes a second counter that reads zero instead of a compile error.
+- **An opaque struct (`MetricKey struct{ name string }`) instead of a sealed
+  interface.** It blocks construction but not the zero value, so
+  `var k agentkit.MetricKey` is a key that looks valid and addresses nothing. The
+  interface has exactly one invalid form, `nil`.
+- **A registry inside `DefineMetricKey` that rejects a duplicate name.** Needs
+  mutable package state, and makes a name no code in this binary defines
+  impossible to reconstruct — which is what a Repository does on every read.
+  Panicking at init because another library chose the same name is also not a
+  failure a library gets to impose.
+- **Exporting the counter map on `Metrics`.** It would reach a `Limiter`
+  writable, and at the transition boundary that map is the Process row's own.
+- **Making `Metrics` itself an interface, so a caller supplies the accumulation
+  logic.** It collides with three things at once: a Repository would have to
+  serialize a type it cannot know (ADR-0007); a worker resuming after a crash
+  would have nothing to rebuild the accumulator from, which is why a per-spawn
+  `Limiter` was rejected above; and `reportToParent` folds a child's metrics into
+  a parent running a *different* strategy, so there would be no defined meaning
+  for the fold. A strategy that wants accumulation the kernel does not provide
+  already has a place for it — its own checkpointed state — and what it gives up
+  there is precisely the cross-process roll-up.
 - **Giving the `Limiter` a second argument for subtree totals**, or widening it
   into a request struct. Both reopen the shape question this record closed, to
   deliver something the existing `Metrics` argument can carry once the counters
@@ -278,6 +357,19 @@ statuses and puts the reason where every other failure reason already lives.
 - Reading "what did this one Process spend" is no longer a single field once it
   has children. The per-Process figure is recoverable from the children's own
   rows, which keep their own totals.
+- **`Metrics` is no longer comparable with `==`**, because of the map. Compare
+  with `reflect.DeepEqual`. Empty is normalised to a nil map so two values
+  carrying the same numbers compare equal however each was built.
+- **A `Repository` must carry counters whose names it cannot know in advance.**
+  One storing JSON gets this for free; one storing discrete columns enumerates
+  them with `Counters()` and rebuilds with `WithCount`. `repotest.Run` covers it.
+- A snapshot written before caller-defined counters existed loads as "none", and
+  one written after them is read by an older binary with the counters dropped —
+  the same way an unknown key has always been dropped. Rolling back loses them;
+  the kernel's eight are unaffected.
+- **A caller-defined counter is at-least-once, like every other.** A retried
+  transition counts again, and the failed attempt's count is folded on requeue
+  rather than lost (ADR-0003).
 
 ## History
 
@@ -288,3 +380,4 @@ statuses and puts the reason where every other failure reason already lives.
 | 2026-07-26 | The `Limiter` returns a `LimitDecision` instead of an `error`, adding a third verdict: continue while telling the strategy the budget is running out. A two-valued return could only end a run at the cap, giving an agent no chance to wrap up on its own terms. The message is read through `Syscalls.LimitStatus()` or `EffectContext.Limit` and the kernel does nothing with it — injecting it would put model-facing vocabulary in the kernel. `LimitStop` takes a string because both call sites already discarded the error type. The verdict is re-evaluated after each effect is counted so it and `Metrics()` describe the same moment; a refusal there is stored but does not fail the effect, which is what lets a strategy finish with the result that crossed the cap. Being called twice per effect makes read-only-ness a stated requirement rather than an implicit one. `Metrics` became a struct: the counter set is closed by this record, so a map advertised keys that never existed. Its json tags reproduce the map's keys, so old snapshots read back without a migration — though all-zero metrics moved from `null` to `{}` and an unknown key is dropped. |
 | 2026-07-26 | The decision moved from a Kernel-wide injected closure (`WithLimiter`) to a required `Strategy.Limit` method, and the Kernel option was deleted rather than kept alongside. One limiter per Kernel forced a per-agent budget to be a `switch` on the `proc.Agent` string, where a missing case falls through to "no limit" — an optional slot cannot express that every agent has answered, and a required method can. Keeping both would have needed a composition rule and doubled the call count to deliver what the method already covers, since `Process.Metrics` folds in terminated children and a whole-tree budget is the root's own `Limit`. The method takes no `S`: the boundary evaluation runs before `DecodeState`. Per-spawn was rejected because a closure cannot be persisted on the Process row. The boundary call is wrapped by `callLimit` so a panic there becomes a transition error instead of killing the worker, and the bundled strategies gained their own `WithLimiter` option. |
 | 2026-08-06 | `Metrics` grew two counters, `CacheReadInputTokens` and `CacheCreationInputTokens`, so a caller can separate the input a Generate call served from the prompt cache from the input it did not. Both are components of `InputTokens`, not additions to it: `InputTokens` keeps meaning the true total gollem reports, so no existing `Limit` implementation changes what it sees. `InputTokens - CacheReadInputTokens` is the input not served from cache — uncached input plus any cache write — not a single price tier, since a cache write is commonly billed at a premium over uncached input and a cache read at a discount; agentkit carries the three counts and leaves pricing to the caller. Only Claude reports cache writes; the field is 0 for a provider that does not, indistinguishable from "no caching" and left uncorrected rather than teaching the kernel a provider-capability flag. The set is still closed at eight fields — a caller still cannot add a ninth. |
+| 2026-08-10 | `Metrics` gained caller-defined counters, so the set is no longer closed. The kernel's own eight still are — a caller cannot add a ninth of those — but it can now name counters of its own. They exist because the kernel can only measure what it performs itself, while a budget over documents fetched or credits charged had to live outside agentkit and lost the roll-up and the crash-durable total by doing so. The key is `MetricKey`, a sealed interface whose sole implementation is a comparable value type, so a counter cannot be named by a string literal at the point of use (the `map[string]int64` defect this record already removed once) and a key rebuilt from a stored name still matches the caller's — the opposite of `ModelRole`'s pointer identity, because a counter is persisted and a role is not. There is no registry, so a duplicate name is one counter; namespace it. Two paths write one, `Syscalls.Count` for what a strategy knows and the optional `MeteredTool` for what only a tool knows, both landing in the same counters — one mechanism with two inputs, not two mechanisms for one question. The map is unexported and never mutated in place, since `callLimit` hands a `Limiter` the row's own `Metrics` and read-only-ness is asked of it in prose rather than in the type; that costs `Metrics` its own `MarshalJSON` (a map keyed by an interface cannot be encoded from a struct tag) and its comparability with `==`. Making `Metrics` itself an interface was rejected: a Repository could not serialize it, a resuming worker could not rebuild it, and the parent/child fold crosses strategies. |

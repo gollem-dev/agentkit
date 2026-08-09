@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,6 +155,49 @@ func TestLoadsSnapshotWrittenWhenMetricsWasAMap(t *testing.T) {
 	gt.Array(t, awaits[0].Results).Length(1)
 	gt.Value(t, awaits[0].Results[0].Metrics.LLMCalls).Equal(int64(3))
 	gt.Value(t, awaits[0].Results[0].Metrics.OutputTokens).Equal(int64(7))
+
+	// The same snapshot predates caller-defined counters entirely, so every row
+	// in it has to read back as "none" rather than failing the load.
+	gt.Value(t, parent.Metrics.Counters()).Nil()
+	gt.Value(t, awaits[0].Results[0].Metrics.Counters()).Nil()
+}
+
+// Caller-defined counters are persisted beside the kernel's own, under a nested
+// object keyed by the name DefineMetricKey was given. This asserts the snapshot
+// on disk, not just a Go round trip, because that file is what a later binary —
+// or another implementation — has to read.
+func TestCallerDefinedCountersSurviveAReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	docs := agentkit.DefineMetricKey("fs-test.docs_fetched")
+
+	repo, err := filesystem.New(dir)
+	gt.NoError(t, err)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	p := &agentkit.Process{
+		ID: "p-1", Agent: "fs-test", Status: agentkit.ProcessPending, RootID: "p-1",
+		Metrics:   agentkit.Metrics{LLMCalls: 2}.WithCount(docs, 41),
+		Rev:       0, // an insert
+		CreatedAt: now, UpdatedAt: now,
+	}
+	gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{p}}))
+	gt.NoError(t, repo.Close())
+
+	// The snapshot is written with MarshalIndent, so assert on the pieces rather
+	// than on one compact line.
+	raw := string(gt.R1(os.ReadFile(filepath.Join(dir, "state.json"))).NoError(t))
+	gt.Bool(t, strings.Contains(raw, `"custom"`)).True()
+	gt.Bool(t, strings.Contains(raw, `"fs-test.docs_fetched": 41`)).True()
+
+	reopened, err := filesystem.New(dir)
+	gt.NoError(t, err)
+	defer func() { gt.NoError(t, reopened.Close()) }()
+
+	got, err := reopened.GetProcess(ctx, "p-1")
+	gt.NoError(t, err)
+	gt.Value(t, got.Metrics.Count(docs)).Equal(int64(41))
+	gt.Value(t, got.Metrics.LLMCalls).Equal(int64(2))
 }
 
 func TestLockRejectsSecondOpen(t *testing.T) {

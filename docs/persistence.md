@@ -143,6 +143,13 @@ reference; the choice is yours.
 your job — that boundary is exactly where serialization is supposed to live
 ([ADR-0007](adr/0007-kernel-neutral-to-serialization.md)).
 
+**`Metrics` is not a fixed column list.** Beside the eight counters the kernel
+maintains, it carries counters the caller defined, whose names you cannot know in
+advance. A store that keeps the row as JSON gets them for free; one that maps
+columns must enumerate them with `Counters()` and rebuild them with
+`WithCount(agentkit.DefineMetricKey(name), n)`. `repotest.Run` fails an
+implementation that drops them.
+
 **A nested field is still just a row.** `Process.InheritedHistory` is the one
 optional struct on the row (a `ProcessID` and a `HistoryRef`). Two nullable text
 columns or a single JSON column both satisfy the contract; what it must do is

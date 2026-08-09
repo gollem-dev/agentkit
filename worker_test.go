@@ -806,6 +806,127 @@ func TestChildMetricsRollUpToParent(t *testing.T) {
 	})
 }
 
+// A counter the caller defined rolls up exactly like the eight the kernel
+// measures, which is what makes a subtree budget expressible as one Limit on the
+// root. The parent counts nothing itself, so whatever it ends up holding came
+// from the child.
+func TestCallerDefinedCountersRollUpToParent(t *testing.T) {
+	ctx := context.Background()
+	docs := agentkit.DefineMetricKey("test.rollup.docs")
+	model, _ := mockLLM(textResponse("x"))
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{
+		step: func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if e := sys.Count(c, docs, 4); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			return st, agentkit.Done([]byte("child done")), nil
+		},
+	})
+	gt.NoError(t, err)
+
+	var fromResult int64
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			id, e := child.SpawnChild(c, sys, scriptInput{Seed: "r1"})
+			if e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kid", id)), nil
+		}
+		aw, ok := sys.Await("kid")
+		if !ok || aw.Status != agentkit.AwaitResponded {
+			return st, agentkit.Decision[[]byte]{}, gollemErr("child not ready")
+		}
+		fromResult = aw.Results[0].Metrics.Count(docs)
+		return st, agentkit.Done([]byte("parent done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	// Folded into the parent's row at the child's terminal transition...
+	gt.Value(t, p.Metrics.Count(docs)).Equal(int64(4))
+	// ...and carried to the parent's strategy through ChildResult, which is a
+	// separate path from the accounting.
+	gt.Value(t, fromResult).Equal(int64(4))
+
+	kid := gt.R1(repo.GetProcess(ctx, aChildOf(t, ctx, repo, pid))).NoError(t)
+	gt.Value(t, kid.Metrics.Count(docs)).Equal(int64(4))
+}
+
+// aChildOf returns the single child of pid, so a test can assert on the row that
+// did the counting as well as the one it rolled up into.
+func aChildOf(t *testing.T, ctx context.Context, repo agentkit.Repository, pid agentkit.ProcessID) agentkit.ProcessID {
+	t.Helper()
+	awaits := gt.R1(repo.ListAwaits(ctx, pid)).NoError(t)
+	for _, aw := range awaits {
+		if len(aw.Children) > 0 {
+			return aw.Children[0]
+		}
+	}
+	t.Fatal("no child await found")
+	return ""
+}
+
+// A caller-defined counter is folded on requeue like the kernel's own, so a
+// crash-looping Process cannot spend an unbounded amount of one invisibly.
+func TestCallerDefinedCountersFoldOnRequeue(t *testing.T) {
+	docs := agentkit.DefineMetricKey("test.requeue.docs")
+
+	t.Run("a failed attempt is still counted", func(t *testing.T) {
+		step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if e := sys.Count(c, docs, 5); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			return st, agentkit.Decision[[]byte]{}, gollemErr("boom")
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, repo, ag := setupScript(t, step, model)
+		pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+		gt.NoError(t, err)
+
+		p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+		gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+		gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+		gt.Value(t, p.Metrics.Count(docs)).Equal(int64(5))
+	})
+
+	// The retry re-does the work, so it counts again — at-least-once, the same
+	// contract a re-run Generate has (ADR-0003). What must not happen is the
+	// failed attempt's count being lost, or the retry starting from it.
+	t.Run("a retry adds to what the failed attempt left", func(t *testing.T) {
+		step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if e := sys.Count(c, docs, 5); e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			if sys.Attempt().Errors == 0 {
+				return st, agentkit.Decision[[]byte]{}, gollemErr("boom")
+			}
+			return st, agentkit.Done([]byte("ok")), nil
+		}
+		model, _ := mockLLM(textResponse("x"))
+		k, repo, ag := setupScript(t, step, model)
+		pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+		gt.NoError(t, err)
+
+		p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(1))
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, p.Metrics.Count(docs)).Equal(int64(10))
+		gt.Value(t, p.Metrics.Steps).Equal(int64(1)) // one committed transition
+	})
+}
+
 // hookRepo wraps a Repository so a test can force a precise interleaving: onApply
 // fires just before each Apply; failApply can reject one outright; onGet can fail
 // a GetProcess.

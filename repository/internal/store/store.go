@@ -438,7 +438,10 @@ func cloneChildResults(rs []agentkit.ChildResult) []agentkit.ChildResult {
 			f := *r.Failure
 			out[i].Failure = &f
 		}
-		// Metrics needs no copy: it is a struct of scalars, copied by out[i] = r.
+		// Metrics needs no copy. Its scalars are copied by out[i] = r, and the
+		// caller-defined counters it also carries are a map nothing ever mutates
+		// in place — the field is unexported and every operation on it builds a
+		// fresh map — so sharing it with the stored value is safe.
 	}
 	return out
 }
