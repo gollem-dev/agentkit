@@ -351,11 +351,14 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mkProc(pid)}}))
 
 		// Every counter gets its own distinct value, so a mapper that assigns the
-		// wrong column to the wrong field cannot pass by coincidence.
+		// wrong column to the wrong field cannot pass by coincidence. The last two
+		// are caller-defined, which an implementation cannot enumerate from a
+		// fixed column list — it has to carry whatever Counters() reports.
 		wantMetrics := agentkit.Metrics{
 			InputTokens: 1, OutputTokens: 2, CacheReadInputTokens: 3, CacheCreationInputTokens: 4,
 			LLMCalls: 5, ToolCalls: 6, Steps: 7, Spawns: 8,
-		}
+		}.WithCount(agentkit.DefineMetricKey("repotest.docs"), 9).
+			WithCount(agentkit.DefineMetricKey("repotest.credits"), 10)
 		key := agentkit.AwaitKey(uniqueStr("kids"))
 		kid := newPID()
 		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{
@@ -376,11 +379,15 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 		gt.Array(t, got).Length(1)
 		gt.Value(t, got[0].Results[0].Metrics).Equal(wantMetrics)
 
-		// Reads must not alias stored state. Metrics is a struct of scalars now, so
-		// an implementation that copies the ChildResult at all satisfies this; the
-		// case still runs because one returning a pointer into its own storage
-		// would not.
+		// Reads must not alias stored state. The kernel's counters are scalars, so
+		// an implementation that copies the ChildResult at all satisfies that much;
+		// the case still runs because one returning a pointer into its own storage
+		// would not. The caller-defined ones are a map, and WithCount is the only
+		// way to change them — it builds a fresh one, so the stored value cannot be
+		// reached through what a read handed back.
 		got[0].Results[0].Metrics.LLMCalls = 999
+		got[0].Results[0].Metrics = got[0].Results[0].Metrics.
+			WithCount(agentkit.DefineMetricKey("repotest.docs"), 999)
 		again, err := repo.ListAwaits(ctx, pid)
 		gt.NoError(t, err)
 		gt.Value(t, again[0].Results[0].Metrics).Equal(wantMetrics)
@@ -388,21 +395,40 @@ func Run(t *testing.T, factory func(t *testing.T) agentkit.Repository) {
 
 	// Process.Metrics is the committed cumulative usage a root Limiter reads
 	// after a restart; an implementor storing it as discrete columns rather than
-	// a JSON blob must round-trip all eight counters, not just the ones an
-	// earlier fixture happened to touch.
+	// a JSON blob must round-trip all eight kernel counters, not just the ones an
+	// earlier fixture happened to touch — and every caller-defined one beside
+	// them, whose names it cannot know in advance.
 	t.Run("ProcessMetricsRoundTrip", func(t *testing.T) {
 		repo := factory(t)
 		pid := newPID()
+		docs := agentkit.DefineMetricKey("repotest.docs")
 		p := mkProc(pid)
 		p.Metrics = agentkit.Metrics{
 			InputTokens: 11, OutputTokens: 22, CacheReadInputTokens: 33, CacheCreationInputTokens: 44,
 			LLMCalls: 55, ToolCalls: 66, Steps: 77, Spawns: 88,
-		}
+		}.WithCount(docs, 99)
 		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{p}}))
 
 		got, err := repo.GetProcess(ctx, pid)
 		gt.NoError(t, err)
 		gt.Value(t, got.Metrics).Equal(p.Metrics)
+		gt.Value(t, got.Metrics.Count(docs)).Equal(int64(99))
+	})
+
+	// A Process stored before caller-defined counters existed carries none, and
+	// must read back as "none" rather than as an empty set that compares
+	// differently from a fresh row.
+	t.Run("ProcessMetricsWithNoCallerDefinedCounters", func(t *testing.T) {
+		repo := factory(t)
+		pid := newPID()
+		p := mkProc(pid)
+		p.Metrics = agentkit.Metrics{LLMCalls: 3}
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{p}}))
+
+		got, err := repo.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, got.Metrics).Equal(agentkit.Metrics{LLMCalls: 3})
+		gt.Value(t, got.Metrics.Counters()).Nil()
 	})
 
 	t.Run("ListEventsOnProcessWithNoEvents", func(t *testing.T) {

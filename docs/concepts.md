@@ -193,8 +193,10 @@ See [persistence.md](persistence.md).
 ## Metrics, Limit, Event, Middleware
 
 - **`Metrics`** — counters the kernel maintains: input/output tokens, LLM calls,
-  tool calls, steps, spawns. A child adds its counters to its parent's when it
-  terminates, once each, so a root's are the tree's.
+  tool calls, steps, spawns. Counters of your own sit beside them, named by
+  `DefineMetricKey` and written with `Syscalls.Count` or a `MeteredTool`. A child
+  adds its counters to its parent's when it terminates, once each, so a root's
+  are the tree's.
 - **`Strategy.Limit`** — the method deciding whether to continue, called at every
   transition boundary and both before and after every effect. The kernel
   measures; the strategy decides. It is a veto, not a place to wait. Besides

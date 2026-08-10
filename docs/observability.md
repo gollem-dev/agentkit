@@ -12,12 +12,15 @@ Four separate mechanisms, easy to confuse. They differ in one property —
 
 ## Metrics
 
-The kernel maintains a fixed set of eight counters per process, the fields of
-`Metrics`. The set is closed — there is no way to add a ninth — which is why
-`Metrics` is a struct rather than a map. Its JSON field names are the lowercase
-forms of the Go field names (`input_tokens` and so on), the same keys the map
-used, so a `Repository` that stores a process as JSON reads back what it wrote
-before the type changed without a migration.
+The kernel maintains eight counters per process itself, the fields of `Metrics`.
+That set is closed — there is no way to add a ninth — which is why they are
+struct fields rather than map entries. You can add counters of your own beside
+them; see [counting what the kernel cannot](#counting-what-the-kernel-cannot).
+
+The JSON field names of the eight are the lowercase forms of the Go field names
+(`input_tokens` and so on), the same keys the map used, so a `Repository` that
+stores a process as JSON reads back what it wrote before the type changed
+without a migration.
 
 The bytes are not identical, though: metrics that are all zero used to be `null`
 and are now `{}`. A key outside the set is dropped when read and does not
@@ -54,6 +57,67 @@ child rolled up its own children the same way, a root ends up holding what the
 whole tree spent. Two things follow: `proc.Metrics` on a process with children is
 a subtree figure rather than that one process's own spend, and a child still
 running is not in it yet.
+
+### Counting what the kernel cannot
+
+The kernel counts what it performs: tokens, calls, spawns. Documents fetched,
+credits an upstream API charged, rows written — it has no way to see any of
+that. Define a counter for it and it is carried like the eight: committed with
+the transition, rolled up from children, and readable from `Limit`.
+
+Name it once, in a package variable:
+
+```go
+var MetricDocsFetched = agentkit.DefineMetricKey("myapp.docs_fetched")
+```
+
+`DefineMetricKey` is the only way to make a `MetricKey`, so a counter can never
+be addressed by a string literal at a call site — a typo is a compile error
+rather than a second counter that silently reads zero. Identity is the name, so
+two calls with the same name are the same counter: prefix yours, or another
+package's counter and yours become one.
+
+A strategy counts what it knows itself:
+
+```go
+if err := sys.Count(ctx, MetricDocsFetched, 1); err != nil {
+    return st, agentkit.Decision[[]byte]{}, err
+}
+```
+
+A tool counts what only it knows, by implementing `MeteredTool` — the kernel
+calls `Metered` after every `Run`, including one that returned an error:
+
+```go
+func (t *fetchTool) Metered(_ gollem.FunctionCall, _ map[string]any,
+    _ error) map[agentkit.MetricKey]int64 {
+    return map[agentkit.MetricKey]int64{MetricDocsFetched: 1}
+}
+```
+
+Read them back with `Count`, which returns 0 for a counter nothing has written:
+
+```go
+func (s *myStrategy) Limit(_ context.Context, _ *agentkit.Process,
+    m agentkit.Metrics) agentkit.LimitDecision {
+    if m.Count(MetricDocsFetched) > 100 {
+        return agentkit.LimitStop("fetched too many documents")
+    }
+    return agentkit.LimitPass()
+}
+```
+
+Both paths reject what the kernel cannot count: `Count` returns
+`ErrInvalidRequest` for a nil key or a negative n, and an invalid entry in a
+tool's report is dropped with a log line rather than failing a call whose effect
+has already happened. `Count` re-evaluates `Limit` like a metered effect, so
+`LimitStatus()` moves with it — but it is never itself refused, because what it
+records has already happened.
+
+If what you want to accumulate is not a running total that can be summed across
+processes — a rate, a maximum, a decaying average — it does not belong here.
+Keep it in your strategy's own checkpointed state, where you control the
+arithmetic; what you give up is the roll-up from children.
 
 ## Limit
 

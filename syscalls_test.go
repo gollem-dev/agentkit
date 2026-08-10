@@ -569,3 +569,264 @@ func TestGenerateBasePropagatesCacheTokenBreakdown(t *testing.T) {
 		LLMCalls: 1, Steps: 1,
 	})
 }
+
+// --- Syscalls.Count ---------------------------------------------------------
+
+// A counter the caller defined is only useful if a Limit can read it, so these
+// assert the whole path: counted in a Step, visible at once, committed on the
+// row, and moving the verdict the way a metered effect does.
+
+func TestSyscallsCountRejectsWhatItCannotCount(t *testing.T) {
+	docs := agentkit.DefineMetricKey("test.count.docs")
+	var nilKeyErr, negativeErr, zeroErr error
+	var afterZero agentkit.Metrics
+
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		nilKeyErr = sys.Count(c, nil, 1)
+		negativeErr = sys.Count(c, docs, -1)
+		zeroErr = sys.Count(c, docs, 0)
+		afterZero = sys.Metrics()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model)
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	gt.Error(t, nilKeyErr).Is(agentkit.ErrInvalidRequest)
+	gt.Error(t, negativeErr).Is(agentkit.ErrInvalidRequest)
+	gt.NoError(t, zeroErr)
+	// A rejected or empty count leaves nothing behind, on the run or the row.
+	gt.Value(t, afterZero.Count(docs)).Equal(int64(0))
+	gt.Value(t, p.Metrics.Count(docs)).Equal(int64(0))
+}
+
+func TestSyscallsCountAccumulatesAndCommits(t *testing.T) {
+	docs := agentkit.DefineMetricKey("test.count.docs")
+	credits := agentkit.DefineMetricKey("test.count.credits")
+	var live agentkit.Metrics
+
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		gt.NoError(t, sys.Count(c, docs, 2))
+		gt.NoError(t, sys.Count(c, docs, 3))
+		gt.NoError(t, sys.Count(c, credits, 7))
+		live = sys.Metrics()
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model)
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	// Adds rather than replaces: two counts of the same key make five.
+	gt.Value(t, live.Count(docs)).Equal(int64(5))
+	gt.Value(t, live.Count(credits)).Equal(int64(7))
+	// And the same numbers are on the committed row, beside the kernel's own.
+	gt.Value(t, p.Metrics.Count(docs)).Equal(int64(5))
+	gt.Value(t, p.Metrics.Count(credits)).Equal(int64(7))
+	gt.Value(t, p.Metrics.Steps).Equal(int64(1))
+}
+
+// Count re-evaluates Limit the way a metered effect does, so LimitStatus() and
+// Metrics() still describe the same moment. It cannot be refused — what it
+// records has already happened — but the refusal it provokes binds the next
+// effect.
+func TestSyscallsCountMovesTheVerdictWithoutFailing(t *testing.T) {
+	docs := agentkit.DefineMetricKey("test.count.docs")
+	var countErr, genErr error
+	var verdict agentkit.LimitDecision
+
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		countErr = sys.Count(c, docs, 3)
+		verdict = sys.LimitStatus()
+		_, genErr = sys.Generate(c, []gollem.Input{gollem.Text("go")})
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	limiter := func(_ context.Context, _ *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
+		if m.Count(docs) >= 3 {
+			return agentkit.LimitStop("too many documents")
+		}
+		return agentkit.LimitPass()
+	}
+	model, count := mockLLM(textResponse("x"))
+	k, repo, ag := setupScriptLimited(t, step, model, limiter)
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	gt.NoError(t, countErr) // the count itself is never refused
+	gt.Value(t, verdict.Kind()).Equal(agentkit.LimitKindStop)
+	gt.Value(t, verdict.Message()).Equal("too many documents")
+	// The Generate that followed is the one that actually gets refused.
+	gt.Error(t, genErr).Is(agentkit.ErrLimitExceeded)
+	gt.Value(t, *count).Equal(0)
+}
+
+// --- MeteredTool ------------------------------------------------------------
+
+// meteredTool is a gollem.Tool that also reports its own consumption. It records
+// what Metered was called with, which is what a tool holding no state between
+// calls depends on.
+type meteredTool struct {
+	name         string
+	result       map[string]any
+	runErr       error
+	report       map[agentkit.MetricKey]int64
+	panicOnMeter bool
+
+	mu    sync.Mutex
+	calls []meteredCall
+}
+
+type meteredCall struct {
+	call   gollem.FunctionCall
+	result map[string]any
+	err    error
+}
+
+func (t *meteredTool) Spec() gollem.ToolSpec { return gollem.ToolSpec{Name: t.name} }
+
+func (t *meteredTool) Run(_ context.Context, _ map[string]any) (map[string]any, error) {
+	return t.result, t.runErr
+}
+
+func (t *meteredTool) Metered(call gollem.FunctionCall, result map[string]any,
+	runErr error) map[agentkit.MetricKey]int64 {
+	if t.panicOnMeter {
+		panic("metering exploded")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.calls = append(t.calls, meteredCall{call: call, result: result, err: runErr})
+	return t.report
+}
+
+func (t *meteredTool) seen() []meteredCall {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]meteredCall(nil), t.calls...)
+}
+
+// runToolStep calls the tool once and finishes, whatever the tool returned.
+func runToolStep(t *testing.T, tool gollem.Tool) (*agentkit.Process, error) {
+	t.Helper()
+	var toolErr error
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		_, toolErr = sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: tool.Spec().Name,
+			Arguments: map[string]any{"q": "go"}})
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	tf := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{tool}, nil
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model, agentkit.WithToolFactory(tf))
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	return serveUntil(t, k, repo, pid, 3*time.Second, isTerminal), toolErr
+}
+
+func TestMeteredToolCountsBesideToolCalls(t *testing.T) {
+	bytesFetched := agentkit.DefineMetricKey("test.tool.bytes")
+
+	t.Run("the report is folded in with tool_calls", func(t *testing.T) {
+		tool := &meteredTool{name: "fetch", result: map[string]any{"ok": true},
+			report: map[agentkit.MetricKey]int64{bytesFetched: 4096}}
+		p, err := runToolStep(t, tool)
+		gt.NoError(t, err)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, p.Metrics.ToolCalls).Equal(int64(1))
+		gt.Value(t, p.Metrics.Count(bytesFetched)).Equal(int64(4096))
+
+		// Metered saw that Run's own call and result.
+		seen := tool.seen()
+		gt.Array(t, seen).Length(1)
+		gt.Value(t, seen[0].call.Name).Equal("fetch")
+		gt.Value(t, seen[0].call.Arguments).Equal(map[string]any{"q": "go"})
+		gt.Value(t, seen[0].result).Equal(map[string]any{"ok": true})
+		gt.NoError(t, seen[0].err)
+	})
+
+	t.Run("a nil report counts nothing extra", func(t *testing.T) {
+		tool := &meteredTool{name: "fetch", result: map[string]any{"ok": true}}
+		p, err := runToolStep(t, tool)
+		gt.NoError(t, err)
+		gt.Value(t, p.Metrics.ToolCalls).Equal(int64(1))
+		gt.Value(t, p.Metrics.Counters()).Nil()
+	})
+
+	// The effect has already run when Metered is called, so a bug in the
+	// accounting drops the bad entry and keeps everything else.
+	t.Run("invalid entries are dropped, the rest are kept", func(t *testing.T) {
+		negative := agentkit.DefineMetricKey("test.tool.negative")
+		tool := &meteredTool{name: "fetch", report: map[agentkit.MetricKey]int64{
+			bytesFetched: 512,
+			negative:     -1,
+			nil:          9,
+		}}
+		p, err := runToolStep(t, tool)
+		gt.NoError(t, err)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, p.Metrics.ToolCalls).Equal(int64(1))
+		gt.Value(t, p.Metrics.Count(bytesFetched)).Equal(int64(512))
+		gt.Value(t, p.Metrics.Count(negative)).Equal(int64(0))
+	})
+
+	// A call that failed halfway may still have spent something.
+	t.Run("a failed Run is still metered", func(t *testing.T) {
+		runErr := gollemErr("upstream refused")
+		tool := &meteredTool{name: "fetch", runErr: runErr,
+			report: map[agentkit.MetricKey]int64{bytesFetched: 128}}
+		p, err := runToolStep(t, tool)
+		gt.Error(t, err) // the Run error reaches the strategy
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, p.Metrics.ToolCalls).Equal(int64(1))
+		gt.Value(t, p.Metrics.Count(bytesFetched)).Equal(int64(128))
+
+		seen := tool.seen()
+		gt.Array(t, seen).Length(1)
+		gt.Value(t, seen[0].err).Equal(runErr)
+	})
+
+	t.Run("a plain tool is unchanged", func(t *testing.T) {
+		p, err := runToolStep(t, mockTool("plain", map[string]any{"ok": true}))
+		gt.NoError(t, err)
+		gt.Value(t, p.Metrics.ToolCalls).Equal(int64(1))
+		gt.Value(t, p.Metrics.Counters()).Nil()
+	})
+}
+
+// Metered is tool-author code running inside the transition, so a panic there
+// goes to the worker's recover — a transition error, exactly like a panic in Run.
+func TestMeteredToolPanicIsATransitionError(t *testing.T) {
+	tool := &meteredTool{name: "fetch", panicOnMeter: true}
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.CallTool(c, gollem.FunctionCall{ID: "1", Name: "fetch",
+			Arguments: map[string]any{}}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte("ok")), nil
+	}
+	tf := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{tool}, nil
+	}
+	model, _ := mockLLM(textResponse("x"))
+	k, repo, ag := setupScript(t, step, model, agentkit.WithToolFactory(tf))
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithMaxStepAttempts(0))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureRetryExhausted)
+	// The panic lands between Run and the meter that follows it, so this call is
+	// not counted — the same window a panic in Run itself falls into.
+	gt.Value(t, p.Metrics.ToolCalls).Equal(int64(0))
+}

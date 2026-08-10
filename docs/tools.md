@@ -163,7 +163,30 @@ A tool's own error is returned to the strategy — it does **not** fail the
 process. Most strategies feed it back to the model as a `FunctionResponse` error
 so the model can recover, which is what `strategy/simple` does.
 
-Every call counts one `tool_calls` metric. Tools cannot report metrics of their
-own, because `gollem.Tool.Run` returns a fixed `map[string]any` and conforming to
-that signature matters more; this can be added later as an optional interface
-without a breaking change ([ADR-0010](adr/0010-limiter-is-one-function.md)).
+Every call counts one `tool_calls` metric.
+
+A tool's own cost — the tokens an embedded model call spent, the credits an
+upstream API charged — is knowledge only the tool has. To have it counted, and
+therefore available to a `Limit`, implement `MeteredTool`:
+
+```go
+var MetricAPICredits = agentkit.DefineMetricKey("myapp.api_credits")
+
+func (t *fetchTool) Metered(_ gollem.FunctionCall, _ map[string]any,
+    _ error) map[agentkit.MetricKey]int64 {
+    return map[agentkit.MetricKey]int64{MetricAPICredits: t.lastCharge}
+}
+```
+
+`Metered` is called once after every `Run`, including one that returned an
+error — a call that failed halfway may still have spent something. It runs on
+the transition hot path, so it must not block or perform I/O. An entry the kernel
+cannot count (a nil key, a negative value) is dropped and logged; the call
+itself still succeeds, because its effect has already happened. `Run` itself
+keeps its `gollem.Tool` signature, which is why this is a separate optional
+interface rather than a change to it
+([ADR-0010](adr/0010-limiter-is-one-function.md)). A tool that does not implement
+it counts as `tool_calls` and nothing else.
+
+See [counting what the kernel cannot](observability.md#counting-what-the-kernel-cannot)
+for the strategy-side counterpart, `Syscalls.Count`.
