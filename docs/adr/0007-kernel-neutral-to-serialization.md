@@ -62,8 +62,11 @@ Push all encoding out.
     result already crosses gollem's typed API as `map[string]any` on both sides
     (`gollem.Tool.Run`, `Syscalls.CallTool`), so no format decision is being
     imposed that the caller did not already make.
-  - A marshal failure is a transition error, surfaced with the tool's name —
-    not swallowed, and not turned into a partial conversation.
+  - A marshal failure is returned to the strategy, surfaced with the tool's name
+    — not swallowed. It does not leave the conversation open: an error response
+    built from a map that cannot fail to marshal answers the call in place of
+    the result, because a caller cannot tell this failure from an ordinary
+    tool failure, and carrying on is the documented behaviour for that one.
 
 The bundled strategies choose JSON, but that is `strategy/simple` and
 `strategy/planexec` picking a contract for their own types — not a kernel rule.
@@ -108,3 +111,4 @@ The bundled strategies choose JSON, but that is `strategy/simple` and
 | 2026-07-23 | Conversation History may now be persisted in a decoupled store ([ADR-0017](0017-history-is-an-immutable-versioned-store.md)) rather than only inside strategy state. The decision here is unchanged: the kernel still marshals nothing; the store implementation serializes `*gollem.History`, exactly as a `Repository` serializes a row. |
 | 2026-08-01 | ADR-0017's store became the agentkit `HistoryStore` port, whose `Save` mints and returns the key naming a version. Naming it in the kernel — a content hash, say — would have meant marshaling History there, so the store owns both the serialization and the key. |
 | 2026-08-01 | The same change added `Session().CallTool`, which encodes a tool's result into a `gollem.Message` so it can be appended to the conversation without another LLM turn. That is a third place where encoding happens, so "exactly two places" is now stated with a named exception rather than left to read as absolute. |
+| 2026-08-17 | A marshal failure there no longer aborts before appending: it is still returned, but the call is answered with an error response the kernel builds, so the documented "exactly one tool_response per call" holds on every path ([ADR-0017](0017-history-is-an-immutable-versioned-store.md)). |

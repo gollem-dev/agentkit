@@ -1377,17 +1377,19 @@ func TestSession_CallToolAppendsErrorResult(t *testing.T) {
 	gt.Value(t, toolResp.Response["error"] != nil).Equal(true)
 }
 
-// A tool result that cannot be encoded into a conversation message leaves the
-// pair open, so the transition has to fail rather than commit a History the next
-// request cannot answer. The tool has already run by then — that is unavoidable
-// — but nothing is appended.
-func TestSession_CallToolEncodeFailureAppendsNothing(t *testing.T) {
+// A tool result that cannot be encoded into a conversation message still closes
+// the pair: the caller cannot tell this case apart from an ordinary tool
+// failure, so an error result stands in for the one that could not be built. The
+// error reaches the strategy as well, because the recorded answer no longer
+// carries what the tool produced.
+func TestSession_CallToolEncodeFailureAppendsErrorResult(t *testing.T) {
 	ctx := context.Background()
 	hs := histmem.New()
 	var ran atomic.Bool
 	var mu sync.Mutex
 	var callErr error
 	var lenAfterCall int
+	var toolResp *gollem.ToolResponseContent
 	tool := &mock.ToolMock{
 		SpecFunc: func() gollem.ToolSpec { return gollem.ToolSpec{Name: "t"} },
 		RunFunc: func(_ context.Context, _ map[string]any) (map[string]any, error) {
@@ -1407,7 +1409,7 @@ func TestSession_CallToolEncodeFailureAppendsNothing(t *testing.T) {
 			return st, agentkit.Decision[[]byte]{}, herr
 		}
 		mu.Lock()
-		callErr, lenAfterCall = cerr, histLen(h)
+		callErr, lenAfterCall, toolResp = cerr, histLen(h), lastToolResponse(t, h)
 		mu.Unlock()
 		return st, agentkit.Done([]byte("done")), nil
 	}
@@ -1425,8 +1427,11 @@ func TestSession_CallToolEncodeFailureAppendsNothing(t *testing.T) {
 	defer mu.Unlock()
 	gt.Value(t, ran.Load()).Equal(true) // the tool did run,
 	gt.Error(t, callErr)                // the failure reached the strategy,
-	gt.Value(t, lenAfterCall).Equal(1)  // and nothing was appended.
-	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(1)
+	gt.Value(t, lenAfterCall).Equal(2)  // and the call was still answered.
+	gt.Value(t, toolResp.ToolCallID).Equal("call-1")
+	gt.Value(t, toolResp.IsError).Equal(true)
+	gt.Value(t, toolResp.Response["error"] != nil).Equal(true)
+	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(2)
 }
 
 // Appending a result to a conversation that does not exist yet would mean
@@ -1557,6 +1562,203 @@ func TestSession_ToolRoundSplitAcrossSteps(t *testing.T) {
 	gt.Value(t, finalTexts).Equal([]string{"final"})
 	// 1 (tool_use turn) + 1 (appended result) + 1 (final turn).
 	gt.Value(t, histLen(committedHistory(t, hs, p))).Equal(3)
+}
+
+// ---- a parallel tool round ----
+
+// parallelToolLLM answers the first Generate of a fresh conversation with ONE
+// turn carrying a call per id, and any later one with text. It grows the history
+// by one message per call, like growingLLM.
+func parallelToolLLM(toolName string, ids ...string) gollem.LLMClient {
+	return &mock.LLMClientMock{
+		NewSessionFunc: func(_ context.Context, opts ...gollem.SessionOption) (gollem.Session, error) {
+			cfg := gollem.NewSessionConfig(opts...)
+			var seeded []gollem.Message
+			if h := cfg.History(); h != nil {
+				seeded = h.Messages
+			}
+			wantTools := len(seeded) == 0
+			return &mock.SessionMock{
+				GenerateFunc: func(_ context.Context, _ []gollem.Input, _ ...gollem.GenerateOption) (*gollem.Response, error) {
+					if !wantTools {
+						return &gollem.Response{Texts: []string{"final"}, InputToken: 1, OutputToken: 1}, nil
+					}
+					calls := make([]*gollem.FunctionCall, 0, len(ids))
+					for _, id := range ids {
+						calls = append(calls, &gollem.FunctionCall{ID: id, Name: toolName})
+					}
+					return &gollem.Response{FunctionCalls: calls, InputToken: 1, OutputToken: 1}, nil
+				},
+				HistoryFunc: func() (*gollem.History, error) {
+					grown := make([]gollem.Message, len(seeded)+1)
+					copy(grown, seeded)
+					return &gollem.History{LLType: gollem.LLMTypeClaude, Version: gollem.HistoryVersion, Messages: grown}, nil
+				},
+			}, nil
+		},
+	}
+}
+
+// trailingToolResponses returns the ToolResponseContent values of a History's
+// last message, failing the test unless that message is a tool message.
+func trailingToolResponses(t *testing.T, h *gollem.History) []*gollem.ToolResponseContent {
+	t.Helper()
+	gt.NotNil(t, h)
+	gt.Value(t, len(h.Messages) > 0).Equal(true)
+	last := h.Messages[len(h.Messages)-1]
+	gt.Value(t, last.Role).Equal(gollem.RoleTool)
+	out := make([]*gollem.ToolResponseContent, 0, len(last.Contents))
+	for i := range last.Contents {
+		tr, err := last.Contents[i].GetToolResponseContent()
+		gt.NoError(t, err)
+		out = append(out, tr)
+	}
+	return out
+}
+
+// A provider counts tool results per turn, so the results answering one turn's
+// two calls have to land in ONE tool message even though the strategy calls
+// CallTool once per call.
+func TestSession_CallToolGroupsOneRoundIntoOneMessage(t *testing.T) {
+	ctx := context.Background()
+	hs := histmem.New()
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		res, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if len(res.FunctionCalls) != 2 {
+			return st, agentkit.Decision[[]byte]{}, gollemErr("expected two calls in the round")
+		}
+		for _, call := range res.FunctionCalls {
+			if _, err := sys.Session().CallTool(ctx, *call); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	factory := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{mockTool("t", map[string]any{"ok": true})}, nil
+	}
+	k, repo, ag := registerWithHistory(t, step, parallelToolLLM("t", "call-1", "call-2"), hs,
+		agentkit.WithToolFactory(factory))
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	committed := committedHistory(t, hs, p)
+	// 1 (the tool_use turn) + 1 (both results), not one message per result.
+	gt.Value(t, histLen(committed)).Equal(2)
+	got := trailingToolResponses(t, committed)
+	gt.Array(t, got).Length(2)
+	gt.Value(t, got[0].ToolCallID).Equal("call-1")
+	gt.Value(t, got[1].ToolCallID).Equal("call-2")
+}
+
+// Grouping writes into a message the working copy owns, never into the claim's
+// committed baseline. The dangerous shape is a retry of a transition that
+// appends into a tool message the PREVIOUS transition committed: if the working
+// copy shared that message's Contents, the abandoned attempt's response would
+// stay in the baseline and the retry would answer the same call twice.
+func TestSession_CallToolRetryDoesNotDoubleTheResult(t *testing.T) {
+	ctx := context.Background()
+	hs := histmem.New()
+	inner := memory.New()
+	repo := &fragileRepo{Repository: inner, err: agentkit.ErrConflict}
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		switch st.N {
+		case 0:
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		case 1:
+			// Commit the first result, so the baseline now ends on a tool message.
+			if _, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "call-1", Name: "t"}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 2
+			return st, agentkit.Continue[[]byte](), nil
+		default:
+			repo.armed.Store(true) // one-shot: fires on this transition's first Apply.
+			if _, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "call-2", Name: "t"}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			return st, agentkit.Done([]byte("done")), nil
+		}
+	}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](hs))
+	gt.NoError(t, err)
+	factory := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{mockTool("t", map[string]any{"ok": true})}, nil
+	}
+	k, err := agentkit.New(repo, parallelToolLLM("t", "call-1", "call-2"), reg, agentkit.WithToolFactory(factory))
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, repo.fired.Load()).Equal(true) // the retry really happened.
+
+	committed := committedHistory(t, hs, p)
+	gt.Value(t, histLen(committed)).Equal(2)
+	got := trailingToolResponses(t, committed)
+	gt.Array(t, got).Length(2) // one response per call, not three.
+	gt.Value(t, got[0].ToolCallID).Equal("call-1")
+	gt.Value(t, got[1].ToolCallID).Equal("call-2")
+}
+
+// The same round, split across transitions: the second Step re-seeds from the
+// committed version, and its result must still join the message the first Step
+// committed rather than open a second turn.
+func TestSession_CallToolGroupsRoundAcrossSteps(t *testing.T) {
+	ctx := context.Background()
+	hs := histmem.New()
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		switch st.N {
+		case 0:
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		case 1:
+			if _, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "call-1", Name: "t"}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 2
+			return st, agentkit.Continue[[]byte](), nil
+		default:
+			if _, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "call-2", Name: "t"}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			return st, agentkit.Done([]byte("done")), nil
+		}
+	}
+	factory := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{mockTool("t", map[string]any{"ok": true})}, nil
+	}
+	k, repo, ag := registerWithHistory(t, step, parallelToolLLM("t", "call-1", "call-2"), hs,
+		agentkit.WithToolFactory(factory))
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	// One transition per claim, so each CallTool starts from a re-loaded committed
+	// version rather than from a working copy held in memory.
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepsPerClaim(1))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	committed := committedHistory(t, hs, p)
+	gt.Value(t, histLen(committed)).Equal(2)
+	got := trailingToolResponses(t, committed)
+	gt.Array(t, got).Length(2)
+	gt.Value(t, got[0].ToolCallID).Equal("call-1")
+	gt.Value(t, got[1].ToolCallID).Equal("call-2")
 }
 
 // WithLLMSessionOptions is appended last, so gollem.WithSessionHistory passed

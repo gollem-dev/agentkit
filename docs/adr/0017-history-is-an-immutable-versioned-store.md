@@ -76,10 +76,22 @@ the cause instead of documenting the symptom.
   Step can close a `tool_use`/`tool_result` pair without spending another LLM
   turn, and the following `Generate` can be called with no input at all. Exactly
   one `tool_response` is appended per call, carrying `IsError` when the call
-  failed: the model asked for the call, so the next request has to answer it.
-  This is the one place the kernel builds a `gollem.Message`; it still does not
-  interpret History, and it cannot tell a model-requested call from a strategy's
-  own, so `Syscalls.CallTool` remains the one to use for the latter.
+  failed — including when the result itself cannot be encoded, where an error
+  response stands in for it and the error is returned as well: the model asked
+  for the call, so the next request has to answer it. This is the one place the
+  kernel builds a `gollem.Message`; it still does not interpret History, and it
+  cannot tell a model-requested call from a strategy's own, so
+  `Syscalls.CallTool` remains the one to use for the latter.
+- **Results answering one model turn go into one `gollem.Message`.** A call
+  appends into the trailing message when that message is already a `RoleTool`
+  one, and starts a new message otherwise. Providers count tool results per turn
+  and gollem maps one `Message` to one turn, so a strategy calling `CallTool`
+  once per call of a parallel round — the shape the generate/act split
+  encourages, since each result has to be committed as it completes — would
+  otherwise answer one turn in several, which Claude and Gemini reject. The
+  grouping rule is exact rather than approximate: a further tool call cannot
+  appear without an assistant message in between, so consecutive tool messages
+  always answer the same call turn.
 - **Save precedes commit.** In `worker.go` the save runs ahead of both
   `buildCommit` (which records the ref it returns) and the `commitTerminal` on
   the Done/Fail path, because the commit is the completion marker: durable work
@@ -238,3 +250,4 @@ the cause instead of documenting the symptom.
 | 2026-07-23 | Initial record: a decoupled, best-effort store under one mutable key per process, with a tolerated duplication window and an obligation to keep a tool round inside one Step. |
 | 2026-08-01 | Rewritten. Versions are immutable and named by `Process.HistoryRef`, committed atomically, so History rolls back with State: the duplication window and the one-Step obligation are both gone, and human-in-the-loop works with the managed conversation. `gollem.HistoryRepository` is replaced by the agentkit `HistoryStore` port (`Save`/`Load`/`Discard`), the flat `Session*` methods by a `Session()` handle that also carries `CallTool`, and the pre-save `ownsLease` fence is removed as unnecessary. |
 | 2026-08-03 | Added `WithInheritedHistory`: a new Process can start from a version another one committed, pinned at Spawn on `Process.InheritedHistory`. It is read-only and never `Discard`ed, which is why it is a field of its own rather than a value written into `HistoryRef` — the post-commit release reads that one. Rejected on `SpawnChild`. |
+| 2026-08-17 | `Session().CallTool` groups the results of one model turn into one `gollem.Message` instead of appending a message per call, and answers a call whose result cannot be encoded with an error response instead of leaving the pair open. One message per call made a parallel tool round answer one turn in several, which Claude and Gemini reject permanently, since the shape is in the committed history. |

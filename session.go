@@ -99,10 +99,16 @@ type Session interface {
 	// the two apart.
 	//
 	// Exactly one tool_response is appended per call, whatever the outcome. On an
-	// error (unknown tool, invalid arguments, a failing Run, or a middleware that
-	// refused) the appended result carries IsError with the error text, and the
-	// error is ALSO returned. Leaving the pair open is not an option — the model
-	// asked for this call and the next request has to answer it.
+	// error (unknown tool, invalid arguments, a failing Run, a middleware that
+	// refused, or a result the conversation format cannot encode) the appended
+	// result carries IsError with the error text, and the error is ALSO returned.
+	// Leaving the pair open is not an option — the model asked for this call and
+	// the next request has to answer it.
+	//
+	// Results that answer the SAME model turn are appended to one tool message,
+	// not one message each: a provider counts tool results per turn, so calling
+	// this once per call of a parallel tool round still produces a conversation
+	// the next request can send.
 	//
 	// It needs the conversation to already hold a History (a Generate earlier in
 	// this transition, or a committed one), because a History carries the provider
@@ -188,19 +194,40 @@ func (c managedSession) CallTool(ctx context.Context, call gollem.FunctionCall) 
 	}
 	content, cerr := gollem.NewToolResponseContent(call.ID, call.Name, resp, isErr)
 	if cerr != nil {
-		// The tool already ran, but the conversation cannot be closed on it. Fail
-		// the transition rather than commit a History with an open pair.
-		return out, goerr.Wrap(cerr, "build tool response content", goerr.V("tool", call.Name))
+		// The tool ran but its result holds something encoding/json refuses. The
+		// pair still has to be closed: the caller cannot tell this apart from an
+		// ordinary tool failure, and the documented behaviour for that one is to
+		// report the error and carry on — which would commit an open pair. So
+		// answer the call with an error result built from a map that cannot fail
+		// to encode, and still return the error, since the recorded answer no
+		// longer carries what the tool produced.
+		fallback, ferr := gollem.NewToolResponseContent(call.ID, call.Name, map[string]any{"error": cerr.Error()}, true)
+		if ferr != nil {
+			return out, goerr.Wrap(cerr, "build tool response content", goerr.V("tool", call.Name))
+		}
+		content, terr = fallback, goerr.Wrap(cerr, "build tool response content", goerr.V("tool", call.Name))
 	}
 
 	// Clone before appending: sessWorking may still be the claim's committed
 	// baseline, which a same-lease retry re-seeds from and must not observe this
-	// transition's writes.
+	// transition's writes. Clone deep-copies each message's Contents, so writing
+	// into the trailing message below cannot reach the baseline either.
 	next := s.sessWorking.Clone()
-	next.Messages = append(next.Messages, gollem.Message{
-		Role:     gollem.RoleTool,
-		Contents: []gollem.MessageContent{content},
-	})
+	// Group into the trailing tool message rather than starting a new one:
+	// providers count tool results per TURN, and gollem maps one Message to one
+	// turn, so the N results answering one parallel tool_use turn have to land in
+	// one message or the next request is rejected. Consecutive tool messages
+	// always answer the same call turn — a further tool call cannot appear
+	// without an assistant message in between — so grouping by run is exact, not
+	// just convenient.
+	if n := len(next.Messages); n > 0 && next.Messages[n-1].Role == gollem.RoleTool {
+		next.Messages[n-1].Contents = append(next.Messages[n-1].Contents, content)
+	} else {
+		next.Messages = append(next.Messages, gollem.Message{
+			Role:     gollem.RoleTool,
+			Contents: []gollem.MessageContent{content},
+		})
+	}
 	s.sessWorking = next
 	s.sessDirty = true
 	return out, terr
