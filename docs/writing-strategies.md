@@ -290,6 +290,12 @@ func (s *approve) Step(ctx context.Context, sys agentkit.Syscalls, st state) (st
 }
 ```
 
+**A round with several calls can be answered one call at a time.** Call
+`Session().CallTool` once per call and commit whenever you like: the results
+answering the same model turn are appended to one message, even across `Step`s,
+because a provider counts tool results per turn and would reject a turn answered
+in several.
+
 Use `Session().CallTool` only for a call the **model** asked for. For a call your
 strategy makes on its own — fetching something to build a prompt, say — use
 `sys.CallTool`: there is no `tool_use` for it, and appending a `tool_result`
@@ -348,8 +354,9 @@ gets nothing out of this.
 
 `Session().CallTool` is what closes a round, and it closes one whatever happens:
 exactly one tool response is appended per call — for an unknown tool, bad
-arguments, a failing `Run`, or a middleware that refused — so even a failing tool
-leaves the conversation closed. The error still comes back to you.
+arguments, a failing `Run`, a middleware that refused, or a result that cannot be
+encoded into a conversation message — so even a failing tool leaves the
+conversation closed. The error still comes back to you.
 
 **If the round never closes**, the wait is bounded by `WithMaxCancelDeferrals`
 (default: the rest of the claim). At the bound the Process is cancelled with the
