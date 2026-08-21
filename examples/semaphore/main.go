@@ -61,7 +61,7 @@ func (editor) Init(in input) (state, error) {
 	if in.Doc == "" {
 		return state{}, goerr.New("doc is required")
 	}
-	return state{Doc: in.Doc, Prompt: in.Prompt}, nil
+	return state(in), nil
 }
 
 func (editor) Limit(context.Context, *agentkit.Process, agentkit.Metrics) agentkit.LimitDecision {
@@ -218,7 +218,10 @@ func run(ctx context.Context, w io.Writer, docs, perDoc int, work time.Duration)
 			agentkit.WithPollInterval(20*time.Millisecond),
 			agentkit.WithPollConcurrency(docs))
 	}()
-	defer func() { stop(); <-served }()
+	// Deferred in this order so they unwind the other way round: stop() first, so
+	// Serve returns, and only then wait for it.
+	defer func() { <-served }()
+	defer stop()
 
 	docIDs := make([]string, 0, docs)
 	for i := range docs {
