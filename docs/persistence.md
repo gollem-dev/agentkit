@@ -89,6 +89,33 @@ the contract against a shared store.
    the Process starts from an empty conversation instead of the transcript it was
    supposed to continue.
 
+9. **The semaphore is enforced here, not in the worker**
+   ([ADR-0021](adr/0021-key-scoped-concurrency-is-a-process-semaphore.md)). For a
+   `(Key, Value)` pair, its **holder set** is the `RootID`s of the rows carrying
+   that pair with `semaphore_held` true and a non-terminal status, and its
+   **effective limit** is the smallest `slots` among those rows. Three
+   obligations follow:
+   - **The claim predicate.** A row with `semaphore_held` false is a claim target
+     only if adding its `RootID` to the holder set keeps the size within
+     `min(effective limit, its own slots)`. The claim sets `semaphore_held` in
+     the same atomic write. Note both halves: the row's own `slots` is in the
+     minimum, and "its tree already holds the pair" is not sufficient by itself.
+   - **`Apply` must not worsen occupancy.** Refuse when the result is over the
+     effective limit *and* worse than before — more holders, or the same holders
+     under a smaller limit. Also refuse a change to an existing row's `semaphore`
+     and any write turning `semaphore_held` back to false.
+   - **`GetSemaphoreStatus`** reports one pair's holders, effective limit, waiting
+     count and oldest waiting time. A pair nothing references is a zero value, not
+     an error.
+
+   Two mistakes here are worse than not implementing the feature. If the claim
+   predicate admits what `Apply` refuses, `ClaimNextProcess` returns an error and
+   the same row is picked again on every poll, so the worker stops making
+   progress. And if the `Apply` check is written as "the state must never be over
+   the limit", one over-limit pair rejects every `Apply` on every Process —
+   including the terminal commits that would clear it — because a `ChangeSet` may
+   touch several rows.
+
 Every one of these carries weight. The `Rev` CAS is what stops a worker whose
 lease expired from clobbering its successor; the guards are what make the
 `WaitChildren` check-then-act atomic; the fresh lease token is what lets a worker
@@ -151,9 +178,21 @@ together, so a store may treat "either column NULL" as `nil`. Adding it to an
 existing schema needs no backfill and no rewrite of old rows: a Process that
 inherited nothing has none, which is what a NULL already means.
 
+**The semaphore columns.** `Process.Semaphore` is the second optional struct on
+the row (a key, a value and a slot count), plus a boolean `SemaphoreHeld`. In SQL
+that is `semaphore_key text NULL`, `semaphore_value text NULL`,
+`semaphore_slots integer NULL` and
+`semaphore_held boolean NOT NULL DEFAULT false`. Adding them to an existing schema
+needs no backfill: a Process under no semaphore has none, which is what NULL and
+`false` already mean. Dropping them is not silent in the same way the History
+fields are — the limit simply stops being enforced.
+
 **Claim ordering.** The bundled implementations claim the oldest eligible
 process by `CreatedAt`. Nothing in the contract requires that ordering; pick
-whatever your store makes cheap and fair.
+whatever your store makes cheap and fair. Note that this ordering is not a
+queueing promise even in the bundled stores: eager dispatch claims a named
+Process through `Apply`, so a Process waiting for a semaphore slot can be
+overtaken by a newer one.
 
 **`WakeAt` gates a `pending` row too**, not only a `waiting` one — that is what
 makes the worker's retry backoff real. A `waiting` row differs in one way: it
@@ -163,7 +202,10 @@ for a response and must never wake by itself.
 **Indexes worth having.** The claim predicate (status, `WakeAt`, `LeaseUntil`),
 `idempotency_key`, `Subject` restricted to open processes, and
 `(process_id, await_key)`. The last three are also the uniqueness constraints, so
-they can be the same indexes.
+they can be the same indexes. For the semaphore, the query the claim predicate and
+the `Apply` check both need is "the holder set of this pair", so
+`(semaphore_key, semaphore_value)` restricted to rows with `semaphore_held` true
+and a non-terminal status.
 
 **Wakeup is polling.** There is no push notification in the contract. A
 `LISTEN`/`NOTIFY`-style optimization is store-specific; requiring it would tax

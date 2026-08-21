@@ -517,7 +517,11 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		// requeued as infrastructure, which does not spend StepAttempts, so a Limit
 		// that always panics would requeue forever. Charging it to the strategy
 		// bounds it at retry_exhausted. No effect has run yet, hence Metrics{}.
-		limit, lerr := callLimit(ctx, b.limit, proc, proc.Metrics)
+		// A COPY, not the row: buildCommit clones this same proc to build the commit,
+		// so a Limit that wrote to it would persist the write. Metadata is the
+		// harmless case; Semaphore and SemaphoreHeld are not — clearing the latter
+		// would hand this Process a run outside its own limit.
+		limit, lerr := callLimit(ctx, b.limit, proc.clone(), proc.Metrics)
 		if lerr != nil {
 			return k.failOrRequeue(ctx, cfg, proc, claimToken, lerr, Metrics{})
 		}
@@ -633,6 +637,10 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 // pending — is silent (a poller or another dispatch got there first). Any other
 // error is a repository fault worth surfacing, so it is logged before abandoning
 // (the row is recovered by polling either way).
+//
+// For a row carrying a Semaphore, ErrConflict now also means "the pair was
+// full". That is the same outcome as losing the race and needs no distinct
+// handling: the row stays pending and a poller claims it once a slot frees.
 func (k *Kernel) claimSpecific(ctx context.Context, pid ProcessID, cfg serveConfig) (*Process, bool) {
 	proc, err := k.repo.GetProcess(ctx, pid)
 	if err != nil {
@@ -655,6 +663,13 @@ func (k *Kernel) claimSpecific(ctx context.Context, pid ProcessID, cfg serveConf
 	c.Status = ProcessRunning
 	c.LeaseOwner = cfg.workerID
 	c.LeaseToken = uuid.Must(uuid.NewV7()).String() // fresh fence identity per claim.
+	if c.Semaphore != nil {
+		// Take the slot in the same write. The count is NOT checked here: this path
+		// has only GetProcess and Apply, and any figure read separately could be
+		// stale by the time the Apply lands. The Apply's own occupancy check is what
+		// decides, and a refusal comes back as ErrConflict below.
+		c.SemaphoreHeld = true
+	}
 	lu := now.Add(cfg.lease)
 	c.LeaseUntil = &lu
 	c.UpdatedAt = now

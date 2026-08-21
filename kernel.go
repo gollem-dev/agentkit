@@ -210,6 +210,13 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 	if err != nil {
 		return "", err
 	}
+	// Before Init for the same reason as the read below: a request that cannot
+	// succeed should not run strategy code. There is no middleware chain on this
+	// entry point, so cfg is the final word on what the caller named.
+	sem, err := resolveSemaphore(b, cfg.semaphoreRequest())
+	if err != nil {
+		return "", err
+	}
 	// Resolved before Init, so a request that cannot succeed does not run Init and
 	// its middleware. It is also before the idempotency lookup, like Init itself:
 	// an idempotent Spawn that returns an existing Process still pays this read.
@@ -264,6 +271,7 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 		StateVersion:     b.version,
 		RootID:           pid,
 		Subject:          cfg.subject,
+		Semaphore:        sem,
 		InheritedHistory: inherited,
 		IdempotencyKey:   cfg.idempotencyKey,
 		CreatedAt:        now,
@@ -424,6 +432,20 @@ func (k *Kernel) Cancel(ctx context.Context, pid ProcessID, reason string) error
 // GetProcess returns the Process (read-through to the Repository).
 func (k *Kernel) GetProcess(ctx context.Context, pid ProcessID) (*Process, error) {
 	return k.repo.GetProcess(ctx, pid)
+}
+
+// GetSemaphoreStatus reports the occupancy of one semaphore (key, value) pair:
+// how many process trees hold it, the effective limit, how many Processes are
+// waiting for it, and how old the oldest of those is. A pair nothing references
+// is a zero-valued status, not an error.
+//
+// This is an OBSERVATION, not a reservation. A slot it reports free may be taken
+// before the caller acts on the answer, so it cannot stand in for admission
+// control — that is what the semaphore itself does. What it is for is the
+// backlog: WithSemaphore lets a Spawn succeed against a full pair and nothing
+// bounds how many wait, so a caller that needs to throttle needs this figure.
+func (k *Kernel) GetSemaphoreStatus(ctx context.Context, key, value string) (*SemaphoreStatus, error) {
+	return k.repo.GetSemaphoreStatus(ctx, key, value)
 }
 
 // ListAwaits returns the Process's awaits.

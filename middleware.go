@@ -393,6 +393,15 @@ type ToolCallMiddleware func(next ToolCallHandler) ToolCallHandler
 
 // --- SpawnChild -------------------------------------------------------------
 
+// SemaphoreRequest is the (key, value) a Spawn named, before the slot count is
+// resolved. It carries no Slots on purpose: that figure comes from the agent
+// definition of whichever agent the chain settles on, so a middleware cannot
+// raise a limit by rewriting the request.
+type SemaphoreRequest struct {
+	Key   string
+	Value string
+}
+
 // SpawnRequest is one SpawnChild. The launch options are resolved into fields
 // so a middleware can read them; WithIdempotencyKey is rejected before the
 // chain runs because it is never valid on a child.
@@ -401,6 +410,12 @@ type SpawnRequest struct {
 	Agent    AgentName
 	Metadata map[string]string
 	Subject  *SubjectRef
+	// Semaphore is the (key, value) this Spawn named, or nil when it named none.
+	// A middleware may rewrite it, and MUST if it rewrites Agent to one whose
+	// declared key differs: the slot count is resolved from the final Agent's
+	// definition after the chain, and a key that does not match that declaration
+	// is ErrInvalidRequest rather than a silently dropped limit.
+	Semaphore *SemaphoreRequest
 
 	// OnCommit registers fn to be called exactly once with this TRANSITION's
 	// commit outcome: nil when the transition committed, non-nil when it did

@@ -222,6 +222,17 @@ claimable when it is `pending`, or `waiting` with a `WakeAt` in the past, or
 `running` with an expired lease. Every claim mints a fresh `LeaseToken` — the
 fence identity for that claim.
 
+**A semaphore adds a second gate to that predicate.** A row carrying one
+([ADR-0021](../adr/0021-key-scoped-concurrency-is-a-process-semaphore.md)) is a
+claim target only if its `(Key, Value)` pair can admit it, and the claim takes
+the slot in the same atomic write. This is why "waiting for a slot" needs no state
+of its own: such a row stays `pending` and is simply passed over, so nothing
+distinguishes it from any other pending row except what the predicate computes.
+The slot is given back by the row reaching a terminal status — the holder set is
+defined over non-terminal rows, so there is no release to write and nothing to
+leak if the worker dies. It is **not** given back by a suspend: occupancy is per
+Process, not per claim, so a Process parked in `waiting` still holds its pair.
+
 **Cross-instance wakeup is polling only.** A `LISTEN`/`NOTIFY`-style push is a
 store-specific optimization; putting it in the `Repository` contract would tax
 every implementation. It can be added later as an optional interface without

@@ -73,6 +73,48 @@ type SubjectRef struct {
 	ID   string `json:"id"`
 }
 
+// ProcessSemaphore is what a Process carries about the semaphore it runs under:
+// the Key its agent declared, the Value naming which instance of that key this
+// Process belongs to, and the Slots resolved from the agent definition at Spawn.
+//
+// Slots is denormalized onto the row on purpose: the limit is enforced by the
+// Repository, which cannot read the in-process Registry. Callers never supply
+// it — WithSemaphoreKey, a RegisterOption, does — so two Spawns cannot disagree.
+//
+// (Key, Value) is the unit that counts: at most Slots distinct process trees
+// (RootID) hold one (Key, Value) pair at a time; Slots == 1 is a mutex.
+//
+// The kernel assigns no MEANING to either string — what a key or a value stands
+// for is the caller's business (ADR-0011). It does interpret their EQUALITY and
+// the Slots figure, because that is what the claim predicate decides on.
+type ProcessSemaphore struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	Slots int    `json:"slots"`
+}
+
+// SemaphoreStatus is the occupancy of one (key, value) pair at the moment it was
+// read. Every field is a point-in-time figure, not a reservation: a slot
+// reported free may be taken before the caller acts on it, so this cannot stand
+// in for admission control.
+type SemaphoreStatus struct {
+	Key   string
+	Value string
+	// Held is the number of distinct process trees currently holding a slot.
+	Held int
+	// Slots is the effective limit — the smallest Slots among the holders — or 0
+	// when nothing holds the pair, in which case the limit is whatever the next
+	// claimant carries.
+	Slots int
+	// Waiting is the number of non-terminal rows naming this pair that hold no
+	// slot. It is the backlog a caller throttles on.
+	Waiting int
+	// OldestWaiting is the CreatedAt of the oldest such row, or nil when there is
+	// none. Together with Waiting it is what distinguishes a healthy queue from a
+	// pair wedged behind a holder that is not finishing.
+	OldestWaiting *time.Time
+}
+
 // Process is the complete persisted representation of an execution unit. It is
 // the aggregate the Repository stores.
 type Process struct {
@@ -112,6 +154,17 @@ type Process struct {
 	ParentID        *ProcessID
 	RootID          ProcessID // self if no parent.
 	Subject         *SubjectRef
+	// Semaphore is the counted concurrency limit this Process runs under, or nil
+	// when its agent declared none. Set once at Spawn — Key and Slots from the
+	// agent definition, Value from WithSemaphore — and never written again. The
+	// Repository refuses an Apply that changes it (see the Repository contract).
+	Semaphore *ProcessSemaphore
+	// SemaphoreHeld is true once a claim took a slot for this Process. It stays
+	// true for the rest of the row's life: the slot is released by the row
+	// reaching a terminal status, not by a write. Written only by
+	// ClaimNextProcess and by eager dispatch's claim; the worker never clears it,
+	// and the Repository refuses an Apply that turns it back to false.
+	SemaphoreHeld   bool
 	IdempotencyKey  string
 	CancelRequested bool
 	CancelReason    string
@@ -149,6 +202,10 @@ func (p *Process) clone() *Process {
 	if p.Subject != nil {
 		s := *p.Subject
 		cp.Subject = &s
+	}
+	if p.Semaphore != nil {
+		s := *p.Semaphore
+		cp.Semaphore = &s
 	}
 	if p.InheritedHistory != nil {
 		ih := *p.InheritedHistory

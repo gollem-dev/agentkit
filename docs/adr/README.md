@@ -33,6 +33,7 @@ change.
 | [0018](0018-durable-delivery-is-built-in-repository-apply.md) | Durable delivery is built inside `Repository.Apply` |
 | [0019](0019-events-are-addressable-and-reads-resume.md) | Events are addressable, and reads resume from an id |
 | [0020](0020-cancel-waits-for-a-closed-conversation.md) | A cancel waits for the conversation to close |
+| [0021](0021-key-scoped-concurrency-is-a-process-semaphore.md) | Key-scoped concurrency is a semaphore on the Process row |
 
 ## How to write one
 

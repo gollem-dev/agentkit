@@ -126,9 +126,23 @@ memory". It is the second explicit exception to that rule, after `Registry`.
   error" therefore does not mean "nothing was committed".
 - Callback ordering is now specified: dispatch precedes `OnCommit`/`OnFinish`, so
   a child can start before the parent's `OnCommit` fires.
+- **For a Process under a semaphore, `ErrConflict` from the eager claim also
+  means "the pair was full"** ([ADR-0021](0021-key-scoped-concurrency-is-a-process-semaphore.md)).
+  `claimSpecific` has only `GetProcess` and `Apply`, so it marks the slot taken
+  and lets the `Apply`'s own occupancy check decide; a refusal is indistinguishable
+  from losing the race to another worker, and needs no distinct handling — the row
+  stays `pending` and a poller claims it once a slot frees.
+- **Eager dispatch can overtake an older row waiting for a slot.** It claims a
+  named Process directly, so the reference implementation's `CreatedAt` ordering
+  applies only to the polling path. A freed slot may therefore go to a Process
+  spawned moments ago rather than to the one that waited longest. This is
+  consistent with this record — ordering was never a property eager dispatch
+  preserved — but it is the first case where the difference is observable to a
+  caller rather than being a pure latency win.
 
 ## History
 
 | Date | Change |
 |---|---|
 | 2026-07-22 | Initial record. |
+| 2026-08-21 | Two consequences added for the Process semaphore ([ADR-0021](0021-key-scoped-concurrency-is-a-process-semaphore.md)): the eager claim's `ErrConflict` now also means the slot was taken, and eager dispatch can overtake an older row waiting for a slot. The decision is unchanged — eager dispatch still reuses `runClaim` and is still recovered by polling — but slot ordering is the first place where its overtaking is visible to a caller rather than only faster. |

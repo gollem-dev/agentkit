@@ -30,6 +30,27 @@ type State struct {
 	// Derived indexes, rebuilt from procs whenever a next State is produced.
 	idem map[string]agentkit.ProcessID              // idempotency_key -> pid (non-empty keys only).
 	subj map[agentkit.SubjectRef]agentkit.ProcessID // subject -> pid (open processes only).
+	sem  map[semKey]*semHolders                     // (key, value) -> who holds it (held, non-terminal rows only).
+}
+
+// semKey is the unit a semaphore counts: one instance of one declared key. Slots
+// is deliberately NOT part of it — it is the limit ON this unit, not part of its
+// identity.
+type semKey struct {
+	key   string
+	value string
+}
+
+// semHolders is the derived index for one semKey: which trees hold it, the
+// smallest Slots any holder carries, and which row carried it. Rows sharing a
+// semKey normally agree, because Slots comes from the agent definition and
+// Register rejects two agents declaring one key with different slot counts —
+// they can differ only while two deployments overlap. The smallest then binds,
+// through both the claim predicate and the Apply check.
+type semHolders struct {
+	roots     map[agentkit.ProcessID]struct{}
+	minSlots  int
+	strictest agentkit.ProcessID // diagnostic: the row minSlots came from.
 }
 
 // NewState returns an empty State.
@@ -40,6 +61,7 @@ func NewState() *State {
 		events: map[agentkit.ProcessID][]*agentkit.Event{},
 		idem:   map[string]agentkit.ProcessID{},
 		subj:   map[agentkit.SubjectRef]agentkit.ProcessID{},
+		sem:    map[semKey]*semHolders{},
 	}
 }
 
@@ -183,8 +205,29 @@ func (s *State) checkPreconditions(cs agentkit.ChangeSet) error {
 			return goerr.Wrap(agentkit.ErrConflict, "process rev mismatch",
 				goerr.V("process_id", p.ID), goerr.V("row_rev", p.Rev), goerr.V("stored_rev", st.Rev))
 		}
+		// An existing row's Semaphore is fixed and its SemaphoreHeld is monotone.
+		// Every kernel path builds its update from a clone of the row, so this only
+		// fires on a write that reached in and changed one of them — which would
+		// hand a Process a free run outside the limit the store is maintaining.
+		if !sameSemaphore(st.Semaphore, p.Semaphore) {
+			return goerr.Wrap(agentkit.ErrConflict, "semaphore is immutable",
+				goerr.V("process_id", p.ID), goerr.V("stored", st.Semaphore), goerr.V("row", p.Semaphore))
+		}
+		if st.SemaphoreHeld && !p.SemaphoreHeld {
+			return goerr.Wrap(agentkit.ErrConflict, "semaphore_held cannot go back to false",
+				goerr.V("process_id", p.ID))
+		}
 	}
 	return nil
+}
+
+// sameSemaphore compares two Semaphore pointers by value, treating nil as a
+// value of its own so that "declared none" and "declared one" are distinguished.
+func sameSemaphore(a, b *agentkit.ProcessSemaphore) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // After validates cs against the current state and, on success, returns a fresh
@@ -229,6 +272,9 @@ func (s *State) After(cs agentkit.ChangeSet) (*State, error) {
 	if err := next.rebuildIndexes(); err != nil {
 		return nil, err
 	}
+	if err := s.semaphoreRegression(next); err != nil {
+		return nil, err
+	}
 	return next, nil
 }
 
@@ -241,6 +287,12 @@ func (s *State) ClaimNext(workerID string, leaseUntil, now time.Time) (*agentkit
 	for _, p := range s.procs {
 		k := claimKindOf(p, now)
 		if k == notClaimable {
+			continue
+		}
+		if !s.semaphoreAdmits(p) {
+			// The pair is full. Leave the row where it is — a pending row waiting for
+			// a slot needs no state of its own, and a later poll picks it up once a
+			// holder terminates.
 			continue
 		}
 		// kind is assigned with target, not per candidate: only the winner's
@@ -258,6 +310,9 @@ func (s *State) ClaimNext(workerID string, leaseUntil, now time.Time) (*agentkit
 	np.Status = agentkit.ProcessRunning
 	np.LeaseOwner = workerID
 	np.LeaseToken = uuid.Must(uuid.NewV7()).String() // fresh fence identity every claim.
+	if np.Semaphore != nil {
+		np.SemaphoreHeld = true // taking the slot is part of the atomic claim.
+	}
 	if kind == uncleanClaim {
 		np.UncleanReclaims++
 	}
@@ -324,6 +379,7 @@ func (s *State) shallowClone() *State {
 		events: make(map[agentkit.ProcessID][]*agentkit.Event, len(s.events)),
 		idem:   map[string]agentkit.ProcessID{},
 		subj:   map[agentkit.SubjectRef]agentkit.ProcessID{},
+		sem:    map[semKey]*semHolders{},
 	}
 	maps.Copy(n.procs, s.procs)
 	maps.Copy(n.awaits, s.awaits)
@@ -331,12 +387,34 @@ func (s *State) shallowClone() *State {
 	return n
 }
 
-// rebuildIndexes recomputes the idempotency and open-subject indexes from procs,
-// returning ErrConflict on a uniqueness violation.
+// rebuildIndexes recomputes the idempotency, open-subject and semaphore indexes
+// from procs, returning ErrConflict on a uniqueness violation.
+//
+// It does NOT check the semaphore slot count. Whether a resulting occupancy is
+// acceptable depends on the state it came from (see semaphoreRegression), which
+// this method does not have; it only builds the index.
 func (s *State) rebuildIndexes() error {
 	s.idem = make(map[string]agentkit.ProcessID, len(s.procs))
 	s.subj = make(map[agentkit.SubjectRef]agentkit.ProcessID, len(s.procs))
+	s.sem = make(map[semKey]*semHolders)
 	for id, p := range s.procs {
+		// Only held, non-terminal rows hold a slot. A terminal row dropping out of
+		// the set is what releases its slot without anyone writing a release.
+		if p.Semaphore != nil && p.SemaphoreHeld && !p.Status.Terminal() {
+			k := semKey{key: p.Semaphore.Key, value: p.Semaphore.Value}
+			h, ok := s.sem[k]
+			if !ok {
+				h = &semHolders{
+					roots:     map[agentkit.ProcessID]struct{}{},
+					minSlots:  p.Semaphore.Slots,
+					strictest: id,
+				}
+				s.sem[k] = h
+			} else if p.Semaphore.Slots < h.minSlots {
+				h.minSlots, h.strictest = p.Semaphore.Slots, id
+			}
+			h.roots[p.RootID] = struct{}{}
+		}
 		if p.IdempotencyKey != "" {
 			if other, ok := s.idem[p.IdempotencyKey]; ok && other != id {
 				return goerr.Wrap(agentkit.ErrConflict, "duplicate idempotency key",
@@ -353,6 +431,93 @@ func (s *State) rebuildIndexes() error {
 		}
 	}
 	return nil
+}
+
+// semaphoreAdmits reports whether p may be claimed under its semaphore. It is
+// evaluated against the CURRENT state, so it and the claim write are one atomic
+// step.
+//
+// It tests the PROSPECTIVE state — p added to the holder set — against the
+// PROSPECTIVE limit, which is the smallest Slots among the holders p would join,
+// p's own included. Both halves matter:
+//
+//   - p's own Slots must be in the min. A holder declaring 1 while p declares 2
+//     means the limit is 1; reading p's figure alone would admit a second holder.
+//   - "p's tree already holds it" is NOT sufficient on its own. With two trees
+//     holding under Slots 2, a child of one of them declaring Slots 1 would be
+//     waved through by an ancestor check, and the resulting state (2 holders,
+//     limit 1) is one the Apply check refuses — which would make ClaimNext itself
+//     fail on every poll.
+//
+// Only a row that ALREADY holds its slot short-circuits: it is in the index, so
+// claiming it again changes neither the set nor the min.
+func (s *State) semaphoreAdmits(p *agentkit.Process) bool {
+	if p.Semaphore == nil || p.SemaphoreHeld {
+		return true // no limit, or this row already holds its slot.
+	}
+	h, ok := s.sem[semKey{key: p.Semaphore.Key, value: p.Semaphore.Value}]
+	if !ok {
+		return true // nothing holds it; Slots >= 1 is enforced at Register.
+	}
+	roots := len(h.roots)
+	if _, held := h.roots[p.RootID]; !held {
+		roots++ // p's tree would be a new holder.
+	}
+	return roots <= min(h.minSlots, p.Semaphore.Slots)
+}
+
+// semaphoreRegression reports the first (key, value) whose occupancy next would
+// make worse than it is in s. "Worse" is: over its limit AND either more holders
+// than before, or the same holders under a smaller limit.
+//
+// This is a MONOTONICITY check, not an absolute one. An absolute "never over the
+// limit" rule cannot be satisfied by the very writes that would fix an
+// over-limit state — a terminal commit that drops one of three holders under a
+// limit of one still leaves two — so a single over-limit key would reject every
+// Apply on every Process, permanently, since a ChangeSet may touch several rows.
+func (s *State) semaphoreRegression(next *State) error {
+	for k, h := range next.sem {
+		if len(h.roots) <= h.minSlots {
+			continue // within the limit: nothing to object to.
+		}
+		before, existed := s.sem[k]
+		if existed && len(h.roots) <= len(before.roots) && h.minSlots >= before.minSlots {
+			continue // already over the limit and not made worse: let the write through.
+		}
+		return goerr.Wrap(agentkit.ErrConflict, "semaphore slots exceeded",
+			goerr.V("key", k.key), goerr.V("value", k.value), goerr.V("slots", h.minSlots),
+			goerr.V("holders", len(h.roots)), goerr.V("process_id", h.strictest))
+	}
+	return nil
+}
+
+// SemaphoreStatus reports the occupancy of one (key, value) pair. A pair nothing
+// references returns a zero-valued status rather than an error.
+//
+// Held and Slots come from the derived index; Waiting and OldestWaiting need a
+// scan of procs, because waiting rows are deliberately not indexed — they churn
+// on every claim, and rebuildIndexes runs on every Apply, which is too much
+// upkeep for one diagnostic read.
+func (s *State) SemaphoreStatus(key, value string) *agentkit.SemaphoreStatus {
+	out := &agentkit.SemaphoreStatus{Key: key, Value: value}
+	if h, ok := s.sem[semKey{key: key, value: value}]; ok {
+		out.Held = len(h.roots)
+		out.Slots = h.minSlots
+	}
+	for _, p := range s.procs {
+		if p.Semaphore == nil || p.SemaphoreHeld || p.Status.Terminal() {
+			continue
+		}
+		if p.Semaphore.Key != key || p.Semaphore.Value != value {
+			continue
+		}
+		out.Waiting++
+		if out.OldestWaiting == nil || p.CreatedAt.Before(*out.OldestWaiting) {
+			t := p.CreatedAt
+			out.OldestWaiting = &t
+		}
+	}
+	return out
 }
 
 // cloneProcess deep-copies a Process (mirrors the root package's clone).
@@ -377,6 +542,10 @@ func cloneProcess(p *agentkit.Process) *agentkit.Process {
 	if p.Subject != nil {
 		sub := *p.Subject
 		cp.Subject = &sub
+	}
+	if p.Semaphore != nil {
+		sem := *p.Semaphore
+		cp.Semaphore = &sem
 	}
 	if p.InheritedHistory != nil {
 		ih := *p.InheritedHistory

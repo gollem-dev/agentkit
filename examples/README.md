@@ -1,6 +1,6 @@
 # Examples
 
-Seven programs you can run. Each one is a complete `main` package, and each one
+Eight programs you can run. Each one is a complete `main` package, and each one
 is about a single thing agentkit does.
 
 > These live in their own Go module. Running them pulls in a Vertex AI client
@@ -15,6 +15,7 @@ is about a single thing agentkit does.
 | [`human-in-the-loop`](human-in-the-loop) | a strategy that suspends on a question and resumes from the answer |
 | [`durable-worker`](durable-worker) | submitting and executing in separate processes, and surviving a crash |
 | [`fanout`](fanout) | a planner that runs its tasks as parallel child processes |
+| [`semaphore`](semaphore) | limiting how many Processes run at once per key |
 | [`middleware`](middleware) | wrapping the five strategy and effect hooks with one registration each |
 | [`tracing`](tracing) | timing a claim, its transitions and its tool calls, and saving the result |
 
@@ -186,6 +187,58 @@ that only shows up once someone relies on the number.
 
 See [bundled-strategies.md](../docs/bundled-strategies.md) and
 [observability.md](../docs/observability.md).
+
+## semaphore
+
+Six Processes across two documents, one slot per document.
+
+```bash
+go run ./semaphore -docs 2 -per-doc 3
+```
+
+The slot count is declared once, at registration
+(`WithSemaphoreKey("document", 1)`); each spawn names only which document it
+belongs to (`WithSemaphore("document", "doc-a")`). That split is the point: there
+is no argument through which two spawns could disagree about what the limit is,
+and `Register` refuses two agents that declare one key with different counts.
+
+Three things worth noticing.
+
+- **A spawn against a full document succeeds.** It writes a pending Process that
+  waits for a slot. Nothing is refused and nothing blocks in the caller, so the
+  number of Processes waiting is unbounded — `Kernel.GetSemaphoreStatus` is how
+  you see that backlog, and it is what the output prints before and after the
+  run. It reports occupancy at the moment it was read; a slot it says is free may
+  be taken before you act on it, so it cannot stand in for the semaphore itself.
+- **A slot is held for the whole life of a Process, not for one claim.** A
+  suspend to `waiting` does not release it. Give this key to an agent that waits
+  on a person, as `human-in-the-loop` does, and the document stays taken until
+  the answer arrives — which is either exactly what you want or a queue that
+  stops moving, so it is worth deciding on purpose. Termination is what releases
+  a slot, and there is no release write: a terminal row simply stops counting.
+- **Slot acquisition order is not guaranteed**, so the output deliberately does
+  not print the order the documents were worked in. Eager dispatch claims a
+  specific Process directly and can overtake an older waiting one; the reference
+  implementation's `CreatedAt` ordering applies only to the polling path.
+
+Two knobs exist for the measurement rather than for the feature. `-work` gives
+each `Step` a duration, because the offline stub answers instantly and Steps that
+return immediately never overlap even when the runtime is willing to run them at
+once. And the worker is started with `WithPollConcurrency` equal to the document
+count, because one poll loop drives its claims one after another — a
+single-loop worker would serialize everything and prove nothing.
+
+Processes for one document therefore never exceed one concurrent `Step`, while
+two documents reach two:
+
+```
+peak concurrent Step per document
+  doc-a  1   (slots 1)
+  doc-b  1   (slots 1)
+peak concurrent Step overall  2
+```
+
+See [ADR-0021](../docs/adr/0021-key-scoped-concurrency-is-a-process-semaphore.md).
 
 ## middleware
 

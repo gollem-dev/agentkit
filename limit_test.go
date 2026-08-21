@@ -3,8 +3,11 @@ package agentkit_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/gollem-dev/agentkit"
+	"github.com/gollem-dev/agentkit/repository/memory"
+	"github.com/gollem-dev/gollem"
 	"github.com/m-mizutani/gt"
 )
 
@@ -81,4 +84,63 @@ func TestCallLimit(t *testing.T) {
 		// The panic value is carried as context, not parsed out of the message.
 		gt.S(t, err.Error()).Contains("strategy panic")
 	})
+}
+
+// TestLimitCannotWriteToTheRow pins the reason Limit is handed a copy of the
+// Process rather than the row: it is strategy-author code running on the
+// transition path, and the row carries kernel-maintained scheduling state.
+// Clearing SemaphoreHeld from there would commit a Process that runs outside its
+// own concurrency limit.
+func TestLimitCannotWriteToTheRow(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	var limitCalls int
+	strat := &scriptStrategy{
+		// One transition with one effect in it, which covers both call sites: the
+		// transition-boundary callLimit and the checkLimit that runs before and
+		// after the Generate.
+		step: func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			return st, agentkit.Done([]byte(`"ok"`)), nil
+		},
+		limit: func(_ context.Context, proc *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+			limitCalls++
+			// Reach for everything a Limiter could try to rewrite.
+			proc.SemaphoreHeld = false
+			proc.Semaphore = &agentkit.ProcessSemaphore{Key: "channel", Value: "elsewhere", Slots: 99}
+			if proc.Metadata != nil {
+				proc.Metadata["tenant"] = "rewritten"
+			}
+			return agentkit.LimitPass()
+		},
+	}
+	ag, err := agentkit.Register(reg, "a", 1, strat, agentkit.WithSemaphoreKey[[]byte]("channel", 1))
+	gt.NoError(t, err)
+
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "first"},
+		agentkit.WithSemaphore("channel", "C1"),
+		agentkit.WithMetadata(map[string]string{"tenant": "acme"}))
+	gt.NoError(t, err)
+
+	final := serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status.Terminal()
+	})
+	if final.Status != agentkit.ProcessSucceeded {
+		t.Fatalf("status=%s failure=%+v", final.Status, final.Failure)
+	}
+
+	// The verdict was consulted, so the writes really did happen — on a copy.
+	gt.Bool(t, limitCalls > 0).True()
+	gt.NotNil(t, final.Semaphore)
+	gt.Value(t, *final.Semaphore).Equal(agentkit.ProcessSemaphore{Key: "channel", Value: "C1", Slots: 1})
+	gt.Bool(t, final.SemaphoreHeld).True()
+	gt.Value(t, final.Metadata["tenant"]).Equal("acme")
 }

@@ -200,6 +200,21 @@ type spawnConfig struct {
 	// empty id", so the latter is reported as the misuse it is instead of being
 	// read as "no inheritance".
 	hasInheritFrom bool
+	semKey         string
+	semValue       string
+	// hasSemaphore separates "the caller named no instance" from "the caller named
+	// an empty one", for the same reason hasMetadata exists: an empty value is a
+	// legitimate instance name meaning "the whole key is one instance".
+	hasSemaphore bool
+}
+
+// semaphoreRequest turns the option's flat fields into the request value, or nil
+// when WithSemaphore was not used.
+func (c *spawnConfig) semaphoreRequest() *SemaphoreRequest {
+	if !c.hasSemaphore {
+		return nil
+	}
+	return &SemaphoreRequest{Key: c.semKey, Value: c.semValue}
 }
 
 // WithIdempotencyKey makes Spawn return the existing Process's ID if one already
@@ -213,6 +228,53 @@ func WithIdempotencyKey(key string) SpawnOption {
 // makes Spawn return ErrSubjectBusy.
 func WithSubject(ref SubjectRef) SpawnOption {
 	return func(c *spawnConfig) { c.subject = &ref }
+}
+
+// WithSemaphore names which instance of the agent's declared semaphore key this
+// Process belongs to — a channel id, a tenant id, a document id. Processes
+// sharing one (key, value) pair contend for that pair's slots; a different value
+// is a different limit. The slot count comes from the agent's WithSemaphoreKey,
+// never from here.
+//
+// key must be the key the agent declared, or Spawn returns ErrInvalidRequest:
+// naming an undeclared key is a typo, not a request to run unrestricted. An
+// agent that declared a semaphore and a Spawn that names no value is the same
+// error. An empty value is allowed and means "the whole key is one instance",
+// which is how an agent is serialized without a discriminator.
+//
+// A Spawn whose (key, value) is full still SUCCEEDS: the Process is written as
+// pending and is claimed once a slot frees. Nothing bounds how many wait —
+// Kernel.GetSemaphoreStatus is how a caller sees that backlog and throttles.
+func WithSemaphore(key, value string) SpawnOption {
+	return func(c *spawnConfig) { c.semKey, c.semValue, c.hasSemaphore = key, value, true }
+}
+
+// resolveSemaphore builds the row's ProcessSemaphore from the agent's
+// declaration and the Spawn's named (key, value), or returns nil when the agent
+// declared no semaphore and none was named.
+//
+// Every mismatch fails closed. A declared semaphore with nothing named would run
+// unrestricted; a named key the agent did not declare would silently do nothing.
+// req is the value AFTER any middleware chain and b is the binding of the agent
+// the chain settled on, so a middleware that rewrote Agent without rewriting the
+// key is caught here rather than producing a row under the wrong limit.
+func resolveSemaphore(b StrategyBinding, req *SemaphoreRequest) (*ProcessSemaphore, error) {
+	if b.semKey == "" {
+		if req != nil {
+			return nil, goerr.Wrap(ErrInvalidRequest, "semaphore key not declared by this agent",
+				goerr.V("key", req.Key))
+		}
+		return nil, nil
+	}
+	if req == nil {
+		return nil, goerr.Wrap(ErrInvalidRequest, "this agent declared a semaphore; spawn must name a value",
+			goerr.V("key", b.semKey))
+	}
+	if req.Key != b.semKey {
+		return nil, goerr.Wrap(ErrInvalidRequest, "semaphore key does not match the agent's declaration",
+			goerr.V("given", req.Key), goerr.V("declared", b.semKey))
+	}
+	return &ProcessSemaphore{Key: b.semKey, Value: req.Value, Slots: b.semSlots}, nil
 }
 
 // WithMetadata sets Process.Metadata (infrastructure-facing scope for ToolFactory;
@@ -408,7 +470,10 @@ func (s *syscalls) ec() EffectContext {
 // way it goes: a strategy that catches ErrLimitExceeded and carries on can then
 // read the reason off LimitStatus() instead of parsing the error's text.
 func (s *syscalls) checkLimit(ctx context.Context) error {
-	d := s.limiter(ctx, s.proc, s.Metrics())
+	// A copy, for the reason the transition-boundary call gives: s.proc is the row
+	// the commit is built from, and a Limit writing to Semaphore or SemaphoreHeld
+	// would persist a Process out from under its own concurrency limit.
+	d := s.limiter(ctx, s.proc.clone(), s.Metrics())
 	s.limit = d
 	if d.Kind() == LimitKindStop {
 		return goerr.Wrap(ErrLimitExceeded, d.Message())
@@ -517,12 +582,13 @@ func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts .
 		md = maps.Clone(s.proc.Metadata)
 	}
 	req := &SpawnRequest{
-		Effect:   s.ec(),
-		Agent:    agent,
-		Metadata: md,
-		Subject:  cfg.subject,
-		OnCommit: s.registerSpawnCommit,
-		input:    input,
+		Effect:    s.ec(),
+		Agent:     agent,
+		Metadata:  md,
+		Subject:   cfg.subject,
+		Semaphore: cfg.semaphoreRequest(),
+		OnCommit:  s.registerSpawnCommit,
+		input:     input,
 	}
 	h := chainSpawn(s.k.spawnMW, s.spawnBase)
 	if h == nil {
@@ -549,6 +615,15 @@ func (s *syscalls) spawnBase(ctx context.Context, req *SpawnRequest) (ProcessID,
 		return "", err
 	}
 	b, err := s.k.agents.binding(req.Agent)
+	if err != nil {
+		return "", err
+	}
+	// Resolved here rather than in spawn(): this is the only point that holds both
+	// the binding of the agent the chain settled on and the request the chain
+	// produced. A middleware may rewrite Agent, so a value resolved before the
+	// chain could belong to a different declaration. Before Init, so a request
+	// that cannot succeed does not run strategy code.
+	sem, err := resolveSemaphore(b, req.Semaphore)
 	if err != nil {
 		return "", err
 	}
@@ -582,6 +657,7 @@ func (s *syscalls) spawnBase(ctx context.Context, req *SpawnRequest) (ProcessID,
 		ParentID:     &s.proc.ID,
 		RootID:       s.proc.RootID,
 		Subject:      req.Subject,
+		Semaphore:    sem,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 		Rev:          0,

@@ -119,7 +119,15 @@ The cap bounds what the parent goes on to do, not what its subtree already did.
 continue", and has no way to wait. Do not block in it for a rate-limit token —
 it runs on the transition hot path while the claim holds its lease, so waiting
 there turns a throttle into a lease expiry and an unclean reclaim. Work that has
-to wait belongs behind a timer await.
+to wait belongs behind a timer await. Admission control — "only N of these at a
+time, the rest queue" — is what
+[`WithSemaphoreKey`](concepts.md#semaphore) is for.
+
+The `*Process` it receives is a **copy** of the row. Writing to it changes nothing
+that gets committed, which is deliberate: the row carries scheduling state the
+store maintains, and a `Limit` clearing it would produce a Process running outside
+its own concurrency limit
+([ADR-0011](adr/0011-kernel-has-no-tenancy.md)). Read it, do not write it.
 
 A panic in `Limit` does not take the worker down. At the transition boundary it
 becomes a transition error and goes down the ordinary retry path, ending as
@@ -212,6 +220,23 @@ verdict from *before* this call, and it does not change while the handler runs �
 calling `next` and reading it again returns the same value. That is the right
 reading for prompt injection anyway: "the budget looked like this going into this
 call".
+
+## Semaphore occupancy
+
+`Kernel.GetSemaphoreStatus(ctx, key, value)` reports one
+[semaphore](concepts.md#semaphore) pair: how many process trees hold it, the
+effective capacity, how many Processes are waiting for it, and how old the oldest
+of those is.
+
+It exists because a spawn against a full pair succeeds rather than failing, and
+nothing bounds how many wait. `Waiting` is the figure to throttle on, and
+`OldestWaiting` is what separates a queue that is moving from a pair stuck behind
+a holder that is not finishing — the usual cause being a Process suspended on a
+question nobody has answered.
+
+It reports the moment it was read. A slot it says is free may be taken before you
+act on the answer, so it cannot be used to pre-check for room; the semaphore
+itself is the only thing that admits work.
 
 ## Events
 
