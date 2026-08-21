@@ -83,6 +83,16 @@ func TestRegisterWithSemaphoreKey(t *testing.T) {
 		}
 	})
 
+	// The both-zero case is the one a caller reaches by wiring the option from
+	// unset configuration. Validating on the values alone would read it as "no
+	// semaphore" and register an unrestricted agent, so the misconfiguration would
+	// never surface — the Spawn would not ask for a value either.
+	t.Run("an empty key with zero slots is rejected, not read as no semaphore", func(t *testing.T) {
+		reg := agentkit.NewRegistry()
+		_, err := agentkit.Register(reg, "a", 1, strat, agentkit.WithSemaphoreKey[[]byte]("", 0))
+		gt.Error(t, err).Is(agentkit.ErrInvalidAgentDef)
+	})
+
 	t.Run("a rejected declaration leaves the agent unregistered", func(t *testing.T) {
 		reg := agentkit.NewRegistry()
 		_, err := agentkit.Register(reg, "a", 1, strat, agentkit.WithSemaphoreKey[[]byte]("k", 0))

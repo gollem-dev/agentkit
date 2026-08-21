@@ -91,8 +91,11 @@ Firestore, DynamoDB, an in-memory map.
    the writes that would fix an over-limit pair (a holder reaching a terminal
    status) still leave it over the limit, so an absolute rule would reject them
    forever, and with them every other row in the same `ChangeSet`.
-10. `GetSemaphoreStatus` reports one pair's occupancy. A pair nothing references
-   is a zero-valued status, **not** an error.
+10. `GetSemaphoreStatus` reports one pair's occupancy: its holders, its effective
+   limit, and the rows **queued behind it** — naming the pair and holding no slot,
+   excluding any whose `RootID` is already in the holder set, since those share a
+   slot rather than queue for one. A pair nothing references is a zero-valued
+   status, **not** an error.
 
 Reads deep-copy on the way out: a caller mutating a returned `*Process` must not
 be able to reach stored state.

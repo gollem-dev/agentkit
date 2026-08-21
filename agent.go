@@ -51,6 +51,11 @@ type registerConfig[O any] struct {
 	// empty means this agent declared no semaphore.
 	semKey   string
 	semSlots int
+	// semSet records that WithSemaphoreKey was used at all, which is what makes
+	// the both-zero case reachable by validation: keying off the values alone
+	// would read WithSemaphoreKey("", 0) as "no semaphore" and register an
+	// unrestricted agent instead of rejecting the misconfiguration.
+	semSet bool
 }
 
 // WithOnFinish wires a completion handler for this agent. The handler runs
@@ -91,7 +96,7 @@ func WithHistoryStore[O any](hs HistoryStore) RegisterOption[O] {
 // key with a different slots yields ErrInvalidAgentDef. Sharing a key between
 // agents is otherwise fine, and is how two agents serialize against each other.
 func WithSemaphoreKey[O any](key string, slots int) RegisterOption[O] {
-	return func(c *registerConfig[O]) { c.semKey, c.semSlots = key, slots }
+	return func(c *registerConfig[O]) { c.semKey, c.semSlots, c.semSet = key, slots, true }
 }
 
 // Register registers a typed strategy and returns a typed handle carrying the
@@ -119,7 +124,7 @@ func Register[S, I, O any](r *Registry, name AgentName, version int, s Strategy[
 	if _, dup := r.bindings[name]; dup {
 		return Agent[I]{}, goerr.Wrap(ErrInvalidAgentDef, "duplicate agent name", goerr.V("name", name))
 	}
-	if cfg.semKey != "" || cfg.semSlots != 0 {
+	if cfg.semSet {
 		if cfg.semKey == "" || cfg.semSlots < 1 {
 			return Agent[I]{}, goerr.Wrap(ErrInvalidAgentDef, "WithSemaphoreKey needs a key and slots >= 1",
 				goerr.V("name", name), goerr.V("key", cfg.semKey), goerr.V("slots", cfg.semSlots))

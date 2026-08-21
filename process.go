@@ -106,8 +106,14 @@ type SemaphoreStatus struct {
 	// when nothing holds the pair, in which case the limit is whatever the next
 	// claimant carries.
 	Slots int
-	// Waiting is the number of non-terminal rows naming this pair that hold no
-	// slot. It is the backlog a caller throttles on.
+	// Waiting is the number of non-terminal rows queued behind this pair: naming
+	// it and holding no slot. It is the backlog a caller throttles on.
+	//
+	// A row whose tree already holds the pair is NOT counted: it shares its
+	// holder's slot and runs alongside it, so it was never in the queue. Rows that
+	// are merely admissible because a slot happens to be free right now ARE
+	// counted — how much work is stacked up on the pair is the question, not how
+	// much of it could start this instant.
 	Waiting int
 	// OldestWaiting is the CreatedAt of the oldest such row, or nil when there is
 	// none. Together with Waiting it is what distinguishes a healthy queue from a

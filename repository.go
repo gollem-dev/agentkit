@@ -82,8 +82,9 @@ type Repository interface {
 	// FindOpenProcessBySubject finds an open (pending/running/waiting) Process holding subject. Absent -> ErrProcessNotFound.
 	FindOpenProcessBySubject(ctx context.Context, subject SubjectRef) (*Process, error)
 	// GetSemaphoreStatus reports the occupancy of one (key, value) pair: how many
-	// process trees hold it, the effective limit, how many rows are waiting for it,
-	// and how old the oldest of those is.
+	// process trees hold it, the effective limit, how many rows are queued behind
+	// it, and how old the oldest of those is. A row whose tree already holds the
+	// pair is not queued — it shares that slot — and is excluded from the count.
 	//
 	// A pair nothing references is NOT an error. It returns a zero-valued status
 	// with key and value echoed back, because "nothing is using it" is a

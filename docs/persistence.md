@@ -106,7 +106,9 @@ the contract against a shared store.
      and any write turning `semaphore_held` back to false.
    - **`GetSemaphoreStatus`** reports one pair's holders, effective limit, waiting
      count and oldest waiting time. A pair nothing references is a zero value, not
-     an error.
+     an error. "Waiting" means the rows queued behind the pair; exclude a row
+     whose `RootID` is already in the holder set, since it shares that slot rather
+     than queueing for one.
 
    Two mistakes here are worse than not implementing the feature. If the claim
    predicate admits what `Apply` refuses, `ClaimNextProcess` returns an error and

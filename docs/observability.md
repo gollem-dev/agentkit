@@ -234,6 +234,11 @@ nothing bounds how many wait. `Waiting` is the figure to throttle on, and
 a holder that is not finishing — the usual cause being a Process suspended on a
 question nobody has answered.
 
+`Waiting` counts the Processes queued behind the pair. A Process whose tree
+already holds it is not one of them — it shares that slot and runs alongside its
+holder, which the semaphore deliberately allows — so a parent running children
+under its own pair does not report a backlog that does not exist.
+
 It reports the moment it was read. A slot it says is free may be taken before you
 act on the answer, so it cannot be used to pre-check for room; the semaphore
 itself is the only thing that admits work.

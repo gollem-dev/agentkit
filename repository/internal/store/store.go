@@ -498,11 +498,25 @@ func (s *State) semaphoreRegression(next *State) error {
 // scan of procs, because waiting rows are deliberately not indexed — they churn
 // on every claim, and rebuildIndexes runs on every Apply, which is too much
 // upkeep for one diagnostic read.
+//
+// Waiting excludes rows whose tree ALREADY holds the pair. Those are not queued
+// behind the limit at all — they run alongside their holder, which is the shape
+// WithSemaphoreKey deliberately allows — so counting them would report a backlog
+// that does not exist and push OldestWaiting back, on both of the figures
+// docs/observability.md presents as the throttling signal.
+//
+// It does NOT exclude every row semaphoreAdmits would currently let through.
+// Whether a slot happens to be free at this instant says nothing about the
+// backlog: with five rows queued and one slot open, "blocked right now" is four,
+// and a moment later it is five again. What a caller throttles on is how much
+// work is stacked up on the pair, so the figure is the queue, minus the rows that
+// were never in it.
 func (s *State) SemaphoreStatus(key, value string) *agentkit.SemaphoreStatus {
 	out := &agentkit.SemaphoreStatus{Key: key, Value: value}
-	if h, ok := s.sem[semKey{key: key, value: value}]; ok {
-		out.Held = len(h.roots)
-		out.Slots = h.minSlots
+	holders := s.sem[semKey{key: key, value: value}]
+	if holders != nil {
+		out.Held = len(holders.roots)
+		out.Slots = holders.minSlots
 	}
 	for _, p := range s.procs {
 		if p.Semaphore == nil || p.SemaphoreHeld || p.Status.Terminal() {
@@ -510,6 +524,11 @@ func (s *State) SemaphoreStatus(key, value string) *agentkit.SemaphoreStatus {
 		}
 		if p.Semaphore.Key != key || p.Semaphore.Value != value {
 			continue
+		}
+		if holders != nil {
+			if _, sameTree := holders.roots[p.RootID]; sameTree {
+				continue // shares its holder's slot; never queued behind the limit.
+			}
 		}
 		out.Waiting++
 		if out.OldestWaiting == nil || p.CreatedAt.Before(*out.OldestWaiting) {

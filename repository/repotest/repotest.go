@@ -1259,6 +1259,28 @@ func runSemaphore(t *testing.T, ctx context.Context, factory func(t *testing.T) 
 		gt.Nil(t, st.OldestWaiting)
 	})
 
+	t.Run("SemaphoreStatusCountsOnlyBlockedRows", func(t *testing.T) {
+		repo := factory(t)
+		key, value := uniqueStr("sem"), uniqueStr("v")
+		holder := heldProc(key, value, 1)
+		// Same tree as the holder, so a slot is available to it — queued, not
+		// blocked. Counting it would inflate the backlog on the very shape the
+		// semaphore deliberately allows.
+		sameTree := semProc(key, value, 1)
+		sameTree.RootID = holder.RootID
+		sameTree.ParentID = &holder.ID
+		otherTree := semProc(key, value, 1)
+		gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{
+			Processes: []*agentkit.Process{holder, sameTree, otherTree},
+		}))
+
+		st, err := repo.GetSemaphoreStatus(ctx, key, value)
+		gt.NoError(t, err)
+		gt.Value(t, st.Held).Equal(1)
+		gt.Value(t, st.Waiting).Equal(1) // otherTree only.
+		gt.NotNil(t, st.OldestWaiting)
+	})
+
 	t.Run("SemaphoreStatusIgnoresOtherValues", func(t *testing.T) {
 		repo := factory(t)
 		key := uniqueStr("sem")

@@ -23,7 +23,7 @@ Three properties define the mechanism:
 - **Waiting has no state of its own.** A row that cannot take a slot stays
   `pending` and is simply not a claim target. No `ProcessStatus` was added.
 
-Enforcement lives in the `Repository` contract (ADR-0004 items 4, 6 and 7), not
+Enforcement lives in the `Repository` contract (ADR-0004 items 4, 8 and 9), not
 in the worker: it is a multiplicity invariant over persisted rows, which is the
 same shape as "one open Process per `Subject`" generalized from one to N.
 
@@ -164,6 +164,20 @@ the claim predicate decides on. That is the line: no vocabulary about what a key
 - **`ErrConflict` from `claimSpecific` now also means "the pair was full".** It
   needs no distinct handling — the row stays pending and a poller takes it when a
   slot frees — but a reader of that code path should know both meanings.
+- **A refused claim keeps the slot for the whole backoff.**
+  `ClaimNextProcess` takes the slot before the `Claim` middleware chain runs, and
+  a middleware that returns without calling `next` goes to `requeue`, which
+  preserves `SemaphoreHeld`. So a row that never executed occupies its pair until
+  the backoff elapses, and a middleware that keeps refusing keeps re-taking it.
+  Combined with `Slots == 1` that stalls the pair rather than throttling it, which
+  is worth knowing because ADR-0004's history names a refusing `ClaimMiddleware`
+  as a supported throttle.
+  This is consistent with the model — a claim happened, and occupancy is per
+  Process from its first claim — and releasing the slot on refusal was rejected:
+  the store cannot tell the kernel doing it from strategy code doing it, so it
+  would mean dropping the `SemaphoreHeld` monotonicity rule that stops a `Limit`
+  from handing itself a free run. Use one mechanism or the other on a given key,
+  not both.
 - **`Repository` is a breaking change**: one added method
   (`GetSemaphoreStatus`) and the contract items above. An implementation that
   ignores them keeps every existing guarantee and silently enforces no limit, and

@@ -434,7 +434,10 @@ func (s *syscalls) LimitStatus() LimitDecision { return s.limit }
 // chose to carry on.
 func (s *syscalls) meter(ctx context.Context, m Metrics) {
 	s.runMetrics = s.runMetrics.add(m)
-	s.limit = s.limiter(ctx, s.proc, s.Metrics())
+	// A copy, for the reason checkLimit gives. This is the third of the three
+	// Limiter call sites (boundary, pre-effect, post-metering) and all three must
+	// pass one, or the guarantee holds only on the paths that happen to.
+	s.limit = s.limiter(ctx, s.proc.clone(), s.Metrics())
 }
 
 // notifySpawnDone calls every buffered OnCommit callback exactly once
