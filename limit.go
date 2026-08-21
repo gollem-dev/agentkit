@@ -88,6 +88,12 @@ func (d LimitDecision) Message() string { return d.message }
 // whose shape this type is (ADR-0010). It is also the argument type the bundled
 // strategies take to build that method from a caller's closure.
 //
+// The Process it receives is a COPY of the row, so writing to it changes nothing
+// that gets committed. That is deliberate rather than incidental: the row carries
+// kernel-maintained scheduling state (Semaphore, SemaphoreHeld) whose invariants
+// strategy code must not be able to break. A ToolFactory and Kernel.GetProcess
+// still hand out the live row (ADR-0011).
+//
 // It runs at three points: at each transition boundary, before every Generate,
 // CallTool and SpawnChild, and again after each of those has been metered. The
 // first two refuse the work when the verdict says stop; the third cannot — the

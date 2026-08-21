@@ -39,6 +39,8 @@ import (
 //     new Rev (a claim finds nothing to claim; an Apply returns ErrConflict).
 //     This is what lets eager dispatch claim a specific pending row via Apply
 //     without a dedicated SPI method, racing a poller's ClaimNextProcess safely.
+//     A row carrying a Semaphore is additionally gated by the slot count, and a
+//     claim takes the slot in the same atomic step (see items 7 and 8).
 //  5. Uniqueness is maintained: idempotency_key / open Process subject /
 //     (process_id, await_key). An insert violation writes nothing and returns
 //     ErrConflict.
@@ -46,6 +48,32 @@ import (
 //     Event's kernel-assigned ID verbatim. An implementation never mints or
 //     rewrites one: the ID is what a caller holds as a cursor, so a value that
 //     changed between write and read would resume from the wrong place.
+//  7. Semaphore terms, used by item 4 and item 8 (ADR-0021):
+//     - the HOLDER SET of a (Key, Value) pair is the set of RootIDs of the rows
+//     carrying that pair with SemaphoreHeld true and a non-terminal status. A
+//     terminal row drops out of it, which is what releases its slot without
+//     anyone writing a release.
+//     - the EFFECTIVE LIMIT of that pair is the smallest Slots among those rows.
+//     Rows sharing a pair normally agree, because Slots comes from the agent
+//     definition; they can differ only while two deployments disagree, and the
+//     smallest then binds.
+//     A row with SemaphoreHeld false is a claim target only when adding its
+//     RootID to the holder set keeps the size within min(effective limit, its own
+//     Slots), and a claim sets SemaphoreHeld in the same atomic write.
+//  8. Apply never makes a pair's occupancy worse: it is refused when the result
+//     is over the effective limit AND worse than before — more holders, or the
+//     same holders under a smaller limit. An existing row's Semaphore never
+//     changes, and SemaphoreHeld never goes back to false. A violation writes
+//     nothing and returns ErrConflict.
+//     THE CLAIM PREDICATE (item 7) AND THIS ITEM MUST AGREE: an implementation
+//     that admits a claim this item then refuses makes ClaimNextProcess itself
+//     return an error, and the same row is re-picked on every poll, so the worker
+//     stops making progress.
+//     This is deliberately a MONOTONICITY rule rather than "the state is never
+//     over the limit": the writes that would fix an over-limit pair (a holder
+//     reaching a terminal status) still leave it over the limit, so an absolute
+//     rule would reject them forever — and with them every other row in the same
+//     ChangeSet.
 type Repository interface {
 	// GetProcess returns the Process. Absent -> ErrProcessNotFound.
 	GetProcess(ctx context.Context, pid ProcessID) (*Process, error)
@@ -53,6 +81,19 @@ type Repository interface {
 	FindProcessByIdempotencyKey(ctx context.Context, key string) (*Process, error)
 	// FindOpenProcessBySubject finds an open (pending/running/waiting) Process holding subject. Absent -> ErrProcessNotFound.
 	FindOpenProcessBySubject(ctx context.Context, subject SubjectRef) (*Process, error)
+	// GetSemaphoreStatus reports the occupancy of one (key, value) pair: how many
+	// process trees hold it, the effective limit, how many rows are queued behind
+	// it, and how old the oldest of those is. A row whose tree already holds the
+	// pair is not queued — it shares that slot — and is excluded from the count.
+	//
+	// A pair nothing references is NOT an error. It returns a zero-valued status
+	// with key and value echoed back, because "nothing is using it" is a
+	// legitimate answer to the question.
+	//
+	// This is the only way a caller can see the backlog behind a semaphore: Spawn
+	// always succeeds and the number of waiting rows is unbounded, so throttling
+	// is the caller's job and this is the figure to throttle on.
+	GetSemaphoreStatus(ctx context.Context, key, value string) (*SemaphoreStatus, error)
 
 	// ClaimNextProcess atomically claims one runnable Process. Targets:
 	// status=pending with wake_at unset or <=now, or status=waiting with

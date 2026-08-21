@@ -2491,3 +2491,166 @@ func (r *applyFailRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error 
 	}
 	return r.Repository.Apply(ctx, cs)
 }
+
+// --- SpawnChild semaphore ----------------------------------------------------
+
+// childRecorder wraps a SpawnMiddleware so a test can read back the child id the
+// chain produced. The Repository has no list-by-parent query, and these parents
+// finish in one transition rather than waiting on a children await, so this is
+// how the child row is located.
+type childRecorder struct {
+	mu sync.Mutex
+	id agentkit.ProcessID
+}
+
+func (r *childRecorder) wrap(inner agentkit.SpawnMiddleware) agentkit.SpawnMiddleware {
+	return func(next agentkit.SpawnHandler) agentkit.SpawnHandler {
+		h := inner(next)
+		return func(c context.Context, req *agentkit.SpawnRequest) (agentkit.ProcessID, error) {
+			id, err := h(c, req)
+			r.mu.Lock()
+			if err == nil {
+				r.id = id
+			}
+			r.mu.Unlock()
+			return id, err
+		}
+	}
+}
+
+func (r *childRecorder) child(t *testing.T, repo agentkit.Repository) *agentkit.Process {
+	t.Helper()
+	r.mu.Lock()
+	id := r.id
+	r.mu.Unlock()
+	gt.Value(t, id != "").Equal(true)
+	p, err := repo.GetProcess(context.Background(), id)
+	gt.NoError(t, err)
+	return p
+}
+
+// setupSemaphoreParentChild registers a parent that spawns one child under the
+// named semaphore value, plus a second child agent declaring a DIFFERENT key, so
+// a middleware can rewrite Agent to it.
+func setupSemaphoreParentChild(t *testing.T, mw agentkit.SpawnMiddleware) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput]) {
+	t.Helper()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: doneStep()},
+		agentkit.WithSemaphoreKey[[]byte]("doc", 1))
+	gt.NoError(t, err)
+	_, err = agentkit.Register(reg, "other", 1, &scriptStrategy{step: doneStep()},
+		agentkit.WithSemaphoreKey[[]byte]("other-key", 1))
+	gt.NoError(t, err)
+	_, err = agentkit.Register(reg, "plain", 1, &scriptStrategy{step: doneStep()})
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"},
+			agentkit.WithSemaphore("doc", "D1")); e != nil {
+			return st, agentkit.Decision[[]byte]{}, e
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	gt.NoError(t, err)
+
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg, agentkit.WithSpawnMiddleware(mw))
+	gt.NoError(t, err)
+	return k, repo, parent
+}
+
+func TestSpawnMiddlewareSeesSemaphore(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen *agentkit.SemaphoreRequest
+	rec := &childRecorder{}
+	mw := rec.wrap(func(next agentkit.SpawnHandler) agentkit.SpawnHandler {
+		return func(c context.Context, req *agentkit.SpawnRequest) (agentkit.ProcessID, error) {
+			mu.Lock()
+			seen = req.Semaphore
+			mu.Unlock()
+			req.Semaphore = &agentkit.SemaphoreRequest{Key: "doc", Value: "rewritten"}
+			return next(c, req)
+		}
+	})
+	k, repo, parent := setupSemaphoreParentChild(t, mw)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
+	gt.NoError(t, err)
+	serveUntil(t, k, repo, pid, 10*time.Second, isTerminal)
+
+	mu.Lock()
+	got := seen
+	mu.Unlock()
+	gt.NotNil(t, got)
+	gt.Value(t, *got).Equal(agentkit.SemaphoreRequest{Key: "doc", Value: "D1"})
+
+	// The rewritten value is what the child row carries; the slot count still
+	// comes from the child agent's own declaration.
+	child := rec.child(t, repo)
+	gt.NotNil(t, child.Semaphore)
+	gt.Value(t, *child.Semaphore).Equal(agentkit.ProcessSemaphore{Key: "doc", Value: "rewritten", Slots: 1})
+}
+
+// A middleware that redirects to another agent must bring the semaphore request
+// with it. The resolution runs after the chain, against the agent the chain
+// settled on, so a stale key is a rejected request rather than a Process quietly
+// running under the wrong limit — or under none.
+func TestSpawnMiddlewareRewritingAgentMustFixTheKey(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a key the new agent did not declare is rejected", func(t *testing.T) {
+		mw := func(next agentkit.SpawnHandler) agentkit.SpawnHandler {
+			return func(c context.Context, req *agentkit.SpawnRequest) (agentkit.ProcessID, error) {
+				req.Agent = "other" // declares "other-key", not "doc".
+				return next(c, req)
+			}
+		}
+		k, repo, parent := setupSemaphoreParentChild(t, mw)
+		pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
+		gt.NoError(t, err)
+		p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal, agentkit.WithMaxStepAttempts(1))
+		gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
+	})
+
+	t.Run("rewriting both agent and key succeeds", func(t *testing.T) {
+		rec := &childRecorder{}
+		mw := rec.wrap(func(next agentkit.SpawnHandler) agentkit.SpawnHandler {
+			return func(c context.Context, req *agentkit.SpawnRequest) (agentkit.ProcessID, error) {
+				req.Agent = "other"
+				req.Semaphore = &agentkit.SemaphoreRequest{Key: "other-key", Value: "O1"}
+				return next(c, req)
+			}
+		})
+		k, repo, parent := setupSemaphoreParentChild(t, mw)
+		pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
+		gt.NoError(t, err)
+		p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+		child := rec.child(t, repo)
+		gt.Value(t, *child.Semaphore).Equal(agentkit.ProcessSemaphore{Key: "other-key", Value: "O1", Slots: 1})
+	})
+
+	t.Run("redirecting to an agent with no semaphore requires clearing it", func(t *testing.T) {
+		rec := &childRecorder{}
+		mw := rec.wrap(func(next agentkit.SpawnHandler) agentkit.SpawnHandler {
+			return func(c context.Context, req *agentkit.SpawnRequest) (agentkit.ProcessID, error) {
+				req.Agent = "plain"
+				req.Semaphore = nil
+				return next(c, req)
+			}
+		})
+		k, repo, parent := setupSemaphoreParentChild(t, mw)
+		pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"})
+		gt.NoError(t, err)
+		p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+		child := rec.child(t, repo)
+		gt.Nil(t, child.Semaphore)
+	})
+}

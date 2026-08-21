@@ -48,6 +48,14 @@ func (r *Repository) FindOpenProcessBySubject(ctx context.Context, subject agent
 	return r.state.FindOpenBySubject(subject)
 }
 
+// GetSemaphoreStatus reports the occupancy of one (key, value) pair. A pair
+// nothing references is a zero-valued status, not an error.
+func (r *Repository) GetSemaphoreStatus(ctx context.Context, key, value string) (*agentkit.SemaphoreStatus, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state.SemaphoreStatus(key, value), nil
+}
+
 // ClaimNextProcess atomically claims one runnable Process, minting a fresh
 // LeaseToken. No target -> (nil, nil).
 func (r *Repository) ClaimNextProcess(ctx context.Context, workerID string, leaseUntil time.Time, now time.Time) (*agentkit.Process, error) {

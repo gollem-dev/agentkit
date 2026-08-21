@@ -81,6 +81,16 @@ agent, err := agentkit.Register(reg, "my-agent", 1, &myStrategy{},
 )
 ```
 
+Registration is also where you cap how many Processes of this agent run at once
+under a key of your choosing — the capacity belongs to the agent definition, and
+each `Spawn` names only which instance of the key it is for. See
+[Semaphore](concepts.md#semaphore):
+
+```go
+agent, err := agentkit.Register(reg, "my-agent", 1, &myStrategy{},
+    agentkit.WithSemaphoreKey[myOutput]("document", 1))
+```
+
 ## Five rules
 
 ### 1. `Step` runs from the top, every time

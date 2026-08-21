@@ -98,14 +98,18 @@ kind *is* the selector, and `ToolFactory(ctx, proc)` decides from `proc.Agent`.
   server-side from an already-validated principal *before* spawning — validate
   first, then establish scope, never the reverse. This warning belongs in every
   document that mentions `Metadata`.
-- **The two indirect paths clone; the ones holding a `*Process` do not.**
+- **Some paths clone; some hand out the live row.**
   `EffectContext.Metadata` and `Syscalls.Metadata()` hand out a copy, because a
   middleware is invited to rewrite the request it was given and must not reach
-  the Process through it. A `ToolFactory`, a `Limiter` and `Kernel.GetProcess`
-  all receive a live `*Process` instead — the `Repository` contract does not
-  promise a copy either. Those are read-only by convention, not by
-  construction: a `Limiter` writing to `proc.Metadata` is writing to the very
-  row the transition is about to commit.
+  the Process through it. `Strategy.Limit` is also given a **copy of the whole
+  Process**: it is strategy-author code on the transition path, and the row
+  carries scheduling state the store maintains — `Semaphore` and `SemaphoreHeld`
+  ([ADR-0021](0021-key-scoped-concurrency-is-a-process-semaphore.md)) — that
+  strategy code clearing would produce a Process running outside its own
+  concurrency limit. A `ToolFactory` and `Kernel.GetProcess` still receive a live
+  `*Process`; the `Repository` contract does not promise a copy either. Those two
+  are read-only by convention, not by construction, and writing to what they
+  return writes to the row a transition is about to commit.
 - Multi-tenant deployments do slightly more wiring, in exchange for agentkit not
   guessing their model.
 - `RootID` is available for tree-wide correlation without any tenancy concept
@@ -122,3 +126,4 @@ kind *is* the selector, and `ToolFactory(ctx, proc)` decides from `proc.Agent`.
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D4, D31, D42). |
 | 2026-07-26 | `Metadata` reaches middleware (`EffectContext.Metadata`) and strategies (`Syscalls.Metadata()`). Middleware is infrastructure but holds no `Repository`, so a cross-cutting concern had to read the Process back per effect or be wired in two stages; a strategy had no path to `Metadata` at all. Both read a clone. No new vocabulary: the map stays kernel-opaque and still is not a credential. |
 | 2026-07-26 | `SpawnChild` now copies the parent's `Metadata` when the caller names none (replacing, not merging, when one is named). Children previously started empty, so `planexec` — which spawns with no options — silently dropped the scope its own `ToolFactory` needed. |
+| 2026-08-21 | `Strategy.Limit` now receives a **copy** of the Process rather than the row the commit is built from. This record previously listed the `Limiter` alongside `ToolFactory` and `Kernel.GetProcess` as read-only by convention only, and named writing `proc.Metadata` from a `Limiter` as the hazard. That was acceptable while the row held only caller data: a rewritten `Metadata` breaks the caller's own scope. It stopped being acceptable when the row gained kernel-maintained scheduling state ([ADR-0021](0021-key-scoped-concurrency-is-a-process-semaphore.md)) — clearing `SemaphoreHeld` from strategy code would commit a Process running outside its own concurrency limit. The copy costs one clone per `Limit` call, which is `1 + 2×effects` per attempt (ADR-0010) and cannot be made conditional the way `StepRequest.Process`'s clone is, because `Limit` is a required method with no "not registered" state. The `Repository` enforces the same two invariants independently (ADR-0004 items 8–9), so a third-party implementation or a future write path cannot reopen the hole. Source-compatible; a `Limit` that wrote to its argument no longer has that write persisted. |

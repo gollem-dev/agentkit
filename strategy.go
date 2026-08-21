@@ -79,6 +79,11 @@ type StrategyBinding struct {
 	// historyStore is nil unless WithHistoryStore was given. It drives runtime
 	// History persistence for this agent (ADR-0017).
 	historyStore HistoryStore
+	// semKey / semSlots carry WithSemaphoreKey. semKey empty means this agent
+	// declared no semaphore. They are the ONLY source of the Slots figure a Spawn
+	// puts on the row, which is what keeps two Spawns from disagreeing.
+	semKey   string
+	semSlots int
 }
 
 // BindStrategy erases the type of a Strategy by folding Init/Step/EncodeState/
@@ -129,7 +134,9 @@ func BindStrategy[S, I, O any](s Strategy[S, I, O], opts ...RegisterOption[O]) S
 			}
 			return s.EncodeOutput(env.value)
 		},
-		decode: func(v int, raw []byte) (any, error) { return s.DecodeState(v, raw) },
+		decode:   func(v int, raw []byte) (any, error) { return s.DecodeState(v, raw) },
+		semKey:   cfg.semKey,
+		semSlots: cfg.semSlots,
 	}
 	if cfg.onFinish != nil {
 		b.finish = func(ctx context.Context, pid ProcessID, status ProcessStatus, typedOut any, f *Failure) error {

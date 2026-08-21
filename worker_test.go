@@ -34,6 +34,7 @@ type scriptStrategy struct {
 	version int
 	step    func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error)
 	limit   agentkit.Limiter // nil = unlimited.
+	onInit  func()           // nil = no-op. Lets a test assert Init did or did not run.
 }
 
 func (s *scriptStrategy) Limit(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
@@ -51,6 +52,9 @@ func (s *scriptStrategy) Version() int {
 }
 
 func (s *scriptStrategy) Init(in scriptInput) (scriptState, error) {
+	if s.onInit != nil {
+		s.onInit()
+	}
 	if in.Seed == "" {
 		return scriptState{}, gollemErr("seed required")
 	}
@@ -2730,4 +2734,282 @@ func TestCancelDeferralBoundIsClampedBelowTheClaim(t *testing.T) {
 			gt.Value(t, agentkit.MaxCancelDeferralsForTest(tc.opts...)).Equal(tc.want)
 		})
 	}
+}
+
+// --- semaphore ---------------------------------------------------------------
+
+// concurrencyPeak records the largest number of Steps observed running at once,
+// per semaphore value. It is the measured figure, not an inferred one: the count
+// goes up on the way into Step and down on the way out.
+type concurrencyPeak struct {
+	mu   sync.Mutex
+	live map[string]int
+	peak map[string]int
+}
+
+func newConcurrencyPeak() *concurrencyPeak {
+	return &concurrencyPeak{live: map[string]int{}, peak: map[string]int{}}
+}
+
+func (c *concurrencyPeak) middleware() agentkit.StepMiddleware {
+	return func(next agentkit.StepHandler) agentkit.StepHandler {
+		return func(ctx context.Context, req *agentkit.StepRequest) (*agentkit.StepResult, error) {
+			key := ""
+			if req.Process.Semaphore != nil {
+				key = req.Process.Semaphore.Value
+			}
+			c.enter(key)
+			defer c.exit(key)
+			return next(ctx, req)
+		}
+	}
+}
+
+func (c *concurrencyPeak) enter(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.live[key]++
+	if c.live[key] > c.peak[key] {
+		c.peak[key] = c.live[key]
+	}
+}
+
+func (c *concurrencyPeak) exit(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.live[key]--
+}
+
+func (c *concurrencyPeak) at(key string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.peak[key]
+}
+
+// TestSemaphoreSerializesUnderServe drives the whole machine — eager dispatch
+// included — rather than calling ClaimNextProcess by hand, because eager dispatch
+// is the path that claims through Apply rather than through the claim predicate.
+func TestSemaphoreSerializesUnderServe(t *testing.T) {
+	ctx := context.Background()
+	peak := newConcurrencyPeak()
+
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		// Long enough that a second Step would overlap if nothing held it back.
+		time.Sleep(20 * time.Millisecond)
+		return st, agentkit.Done([]byte(`"ok"`)), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step},
+		agentkit.WithSemaphoreKey[[]byte]("doc", 1))
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg, agentkit.WithStepMiddleware(peak.middleware()))
+	gt.NoError(t, err)
+
+	serveCtx, cancel := context.WithCancel(ctx)
+	served := make(chan struct{})
+	go func() {
+		_ = k.Serve(serveCtx, agentkit.WithPollInterval(2*time.Millisecond), agentkit.WithLease(5*time.Second))
+		close(served)
+	}()
+	defer func() { cancel(); <-served }()
+
+	var pids []agentkit.ProcessID
+	for _, value := range []string{"A", "A", "A", "B", "B", "B"} {
+		pid, serr := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("doc", value))
+		gt.NoError(t, serr)
+		pids = append(pids, pid)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for _, pid := range pids {
+		for {
+			p, gerr := repo.GetProcess(ctx, pid)
+			gt.NoError(t, gerr)
+			if p.Status.Terminal() {
+				gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("process %s stuck in %s", pid, p.Status)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	// One slot per value, so no value ever ran two Steps at once...
+	gt.Value(t, peak.at("A")).Equal(1)
+	gt.Value(t, peak.at("B")).Equal(1)
+
+	// ...and the slots are freed by termination, with nothing left holding them.
+	for _, value := range []string{"A", "B"} {
+		st, serr := k.GetSemaphoreStatus(ctx, "doc", value)
+		gt.NoError(t, serr)
+		gt.Value(t, st.Held).Equal(0)
+		gt.Value(t, st.Waiting).Equal(0)
+	}
+}
+
+// A suspended Process keeps its slot. This is the consequence of occupancy being
+// per Process rather than per claim, and it is what makes a semaphore on a
+// human-in-the-loop agent hold the pair until the answer arrives.
+func TestSemaphoreHeldAcrossSuspendAndResume(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.Question("ask", []byte(`"?"`))), nil
+		}
+		return st, agentkit.Done([]byte(`"ok"`)), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step},
+		agentkit.WithSemaphoreKey[[]byte]("doc", 1))
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	first, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("doc", "D1"))
+	gt.NoError(t, err)
+
+	// Drive the first one to waiting BEFORE spawning the second: claim order among
+	// equally eligible rows is not part of the contract, so a test that spawns both
+	// up front is asserting which one wins.
+	waiting := serveUntil(t, k, repo, first, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessWaiting
+	})
+	gt.Bool(t, waiting.SemaphoreHeld).True()
+
+	second, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("doc", "D1"))
+	gt.NoError(t, err)
+
+	// The other Process is still pending: a suspend released nothing.
+	other, err := repo.GetProcess(ctx, second)
+	gt.NoError(t, err)
+	gt.Value(t, other.Status).Equal(agentkit.ProcessPending)
+	gt.Bool(t, other.SemaphoreHeld).False()
+
+	gt.NoError(t, k.Respond(ctx, first, "ask", []byte(`"yes"`)))
+
+	// The answered Process resumes immediately — it never gave the slot up, so the
+	// claim predicate short-circuits on SemaphoreHeld rather than counting.
+	done := serveUntil(t, k, repo, first, 5*time.Second, isTerminal)
+	gt.Value(t, done.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Bool(t, done.SemaphoreHeld).True()
+
+	// And only now does the second one get to run — it reaches the same question,
+	// which is what proves it took the slot the first one gave up.
+	took := serveUntil(t, k, repo, second, 5*time.Second, func(p *agentkit.Process) bool {
+		return p.Status == agentkit.ProcessWaiting
+	})
+	gt.Bool(t, took.SemaphoreHeld).True()
+
+	gt.NoError(t, k.Respond(ctx, second, "ask", []byte(`"yes"`)))
+	after := serveUntil(t, k, repo, second, 5*time.Second, isTerminal)
+	gt.Value(t, after.Status).Equal(agentkit.ProcessSucceeded)
+}
+
+// A child in the same tree as a holder is admitted, so a parent may hold a slot
+// and wait on children that name the same pair. Getting this wrong deadlocks the
+// tree rather than failing loudly.
+func TestSemaphoreParentWaitingOnSameKeyChild(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: doneStep()},
+		agentkit.WithSemaphoreKey[[]byte]("doc", 1))
+	gt.NoError(t, err)
+
+	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			id, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"}, agentkit.WithSemaphore("doc", "D1"))
+			if e != nil {
+				return st, agentkit.Decision[[]byte]{}, e
+			}
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kids", id)), nil
+		}
+		return st, agentkit.Done([]byte(`"ok"`)), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep},
+		agentkit.WithSemaphoreKey[[]byte]("doc", 1))
+	gt.NoError(t, err)
+
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "p"}, agentkit.WithSemaphore("doc", "D1"))
+	gt.NoError(t, err)
+
+	p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+}
+
+// The fields survive every orderly exit from a claim. Each of these paths builds
+// its update from a clone of the row, and this is what pins that: a path that
+// rebuilt the row field by field would drop the slot and let a second Process in.
+func TestSemaphoreFieldsSurviveRequeueAndRelease(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("requeue after a failed transition", func(t *testing.T) {
+		repo := memory.New()
+		reg := agentkit.NewRegistry()
+		var attempts int
+		step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			attempts++
+			if attempts == 1 {
+				return st, agentkit.Decision[[]byte]{}, gollemErr("transient")
+			}
+			return st, agentkit.Done([]byte(`"ok"`)), nil
+		}
+		ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step},
+			agentkit.WithSemaphoreKey[[]byte]("doc", 1))
+		gt.NoError(t, err)
+		model, _ := mockLLM(textResponse("x"))
+		k, err := agentkit.New(repo, model, reg)
+		gt.NoError(t, err)
+
+		pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("doc", "D1"))
+		gt.NoError(t, err)
+
+		p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, attempts >= 2).Equal(true) // the requeue really happened.
+		gt.NotNil(t, p.Semaphore)
+		gt.Value(t, *p.Semaphore).Equal(agentkit.ProcessSemaphore{Key: "doc", Value: "D1", Slots: 1})
+		gt.Bool(t, p.SemaphoreHeld).True()
+	})
+
+	t.Run("release when the step budget is spent", func(t *testing.T) {
+		repo := memory.New()
+		reg := agentkit.NewRegistry()
+		step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if st.N >= 2 {
+				return st, agentkit.Done([]byte(`"ok"`)), nil
+			}
+			st.N++
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step},
+			agentkit.WithSemaphoreKey[[]byte]("doc", 1))
+		gt.NoError(t, err)
+		model, _ := mockLLM(textResponse("x"))
+		k, err := agentkit.New(repo, model, reg)
+		gt.NoError(t, err)
+
+		pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("doc", "D1"))
+		gt.NoError(t, err)
+
+		// One step per claim, so the run goes through release twice before finishing.
+		p := serveUntil(t, k, repo, pid, 10*time.Second, isTerminal, agentkit.WithMaxStepsPerClaim(1))
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+		gt.NotNil(t, p.Semaphore)
+		gt.Bool(t, p.SemaphoreHeld).True()
+	})
 }

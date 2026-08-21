@@ -47,6 +47,15 @@ type registerConfig[O any] struct {
 	// historyStore, when non-nil, opts this agent into runtime-managed History
 	// persistence. It is O-independent, so no type-erased closure is needed.
 	historyStore HistoryStore
+	// semKey / semSlots carry WithSemaphoreKey. Both are O-independent. semKey
+	// empty means this agent declared no semaphore.
+	semKey   string
+	semSlots int
+	// semSet records that WithSemaphoreKey was used at all, which is what makes
+	// the both-zero case reachable by validation: keying off the values alone
+	// would read WithSemaphoreKey("", 0) as "no semaphore" and register an
+	// unrestricted agent instead of rejecting the misconfiguration.
+	semSet bool
 }
 
 // WithOnFinish wires a completion handler for this agent. The handler runs
@@ -69,6 +78,25 @@ func WithOnFinish[O any](h FinishHandler[O]) RegisterOption[O] {
 // agent rather than on the Kernel.
 func WithHistoryStore[O any](hs HistoryStore) RegisterOption[O] {
 	return func(c *registerConfig[O]) { c.historyStore = hs }
+}
+
+// WithSemaphoreKey declares that every Process of this agent runs under the
+// semaphore named key, which admits at most slots process trees at a time
+// (slots == 1 is a mutex). Each Spawn then names WHICH instance of the key it
+// belongs to, with WithSemaphore.
+//
+// A Process holds its slot from its first claim until it reaches a terminal
+// status — a suspend to waiting does NOT release it, so a key given to an agent
+// that waits on a human stays taken until the answer arrives. Processes in one
+// tree (same RootID) share a single slot, so a child naming its ancestor's
+// (key, value) is admitted rather than deadlocked.
+//
+// The slot count lives here, not on Spawn, so two Spawns cannot disagree about
+// it. An empty key, slots < 1, or another registered agent declaring the same
+// key with a different slots yields ErrInvalidAgentDef. Sharing a key between
+// agents is otherwise fine, and is how two agents serialize against each other.
+func WithSemaphoreKey[O any](key string, slots int) RegisterOption[O] {
+	return func(c *registerConfig[O]) { c.semKey, c.semSlots, c.semSet = key, slots, true }
 }
 
 // Register registers a typed strategy and returns a typed handle carrying the
@@ -95,6 +123,23 @@ func Register[S, I, O any](r *Registry, name AgentName, version int, s Strategy[
 	defer r.mu.Unlock()
 	if _, dup := r.bindings[name]; dup {
 		return Agent[I]{}, goerr.Wrap(ErrInvalidAgentDef, "duplicate agent name", goerr.V("name", name))
+	}
+	if cfg.semSet {
+		if cfg.semKey == "" || cfg.semSlots < 1 {
+			return Agent[I]{}, goerr.Wrap(ErrInvalidAgentDef, "WithSemaphoreKey needs a key and slots >= 1",
+				goerr.V("name", name), goerr.V("key", cfg.semKey), goerr.V("slots", cfg.semSlots))
+		}
+		// One key, one slot count, process-wide. Two agents may share a key on
+		// purpose — that is how they serialize against each other — but disagreeing
+		// on how many slots it has is a bug, and the Registry is the only place that
+		// can see both declarations.
+		for other, b := range r.bindings {
+			if b.semKey == cfg.semKey && b.semSlots != cfg.semSlots {
+				return Agent[I]{}, goerr.Wrap(ErrInvalidAgentDef, "semaphore key declared with a different slot count",
+					goerr.V("name", name), goerr.V("key", cfg.semKey), goerr.V("slots", cfg.semSlots),
+					goerr.V("other_agent", other), goerr.V("other_slots", b.semSlots))
+			}
+		}
 	}
 	r.bindings[name] = BindStrategy(s, opts...)
 	return Agent[I]{name: name}, nil

@@ -3,7 +3,8 @@
 ## Summary
 
 Persistence is a single interface, `Repository`, whose write path is one method:
-`Apply(ctx, ChangeSet)`. A `ChangeSet` is a declarative bundle of process rows,
+`Apply(ctx, ChangeSet)`. Alongside the finders it also answers one scheduling
+question the kernel cannot accumulate for itself, `GetSemaphoreStatus`. A `ChangeSet` is a declarative bundle of process rows,
 await rows, event appends, and write-free `Guards`. The contract asks for data
 semantics only — atomic application of the whole set, and a per-row `Rev`
 compare-and-set — never for a transaction object.
@@ -25,7 +26,7 @@ Firestore, DynamoDB, an in-memory map.
 
 ## Decision
 
-`Repository` has three finder methods, one claim method, two list methods, and
+`Repository` has four read methods, one claim method, two list methods, and
 `Apply`. The full contract:
 
 1. `Apply` applies the whole `ChangeSet` atomically — all or nothing.
@@ -71,6 +72,30 @@ Firestore, DynamoDB, an in-memory map.
    one specific `pending` row through an ordinary `Apply`, instead of through
    `ClaimNextProcess`, and still race a poller safely — eager dispatch
    (ADR-0016) does exactly this, with no new SPI method.
+8. Semaphore terms, used by items 4 and 9 ([ADR-0021](0021-key-scoped-concurrency-is-a-process-semaphore.md)):
+   the **holder set** of a `(Key, Value)` pair is the `RootID`s of the rows
+   carrying that pair with `SemaphoreHeld` true and a non-terminal status, and its
+   **effective limit** is the smallest `Slots` among those rows. A row with
+   `SemaphoreHeld` false is a claim target only when adding its `RootID` to the
+   holder set keeps the size within `min(effective limit, its own Slots)`, and a
+   claim sets `SemaphoreHeld` in the same atomic write.
+9. `Apply` never makes a pair's occupancy worse: it is refused when the result is
+   over the effective limit **and** worse than before — more holders, or the same
+   holders under a smaller limit. An existing row's `Semaphore` never changes, and
+   `SemaphoreHeld` never returns to false. A violation writes nothing and returns
+   `ErrConflict`.
+   **The claim predicate (item 8) and this item must agree.** An implementation
+   that admits a claim this item then refuses makes `ClaimNextProcess` itself
+   return an error, and the same row is re-picked on every poll, so the worker
+   stops making progress. The rule is deliberately monotone rather than absolute:
+   the writes that would fix an over-limit pair (a holder reaching a terminal
+   status) still leave it over the limit, so an absolute rule would reject them
+   forever, and with them every other row in the same `ChangeSet`.
+10. `GetSemaphoreStatus` reports one pair's occupancy: its holders, its effective
+   limit, and the rows **queued behind it** — naming the pair and holding no slot,
+   excluding any whose `RootID` is already in the holder set, since those share a
+   slot rather than queue for one. A pair nothing references is a zero-valued
+   status, **not** an error.
 
 Reads deep-copy on the way out: a caller mutating a returned `*Process` must not
 be able to reach stored state.
@@ -127,3 +152,4 @@ conditional write, or a mutex around an immutable snapshot.
 | 2026-07-22 | Added contract item 7: `ClaimNextProcess` and `Apply` are mutually linearizable on the same `Process` row. It belongs here rather than only in ADR-0016 because it is a property of this SPI's `Rev` CAS itself, not of the eager-dispatch feature that first needed it stated explicitly — a third-party `Repository` could otherwise conform to items 1–6 and still let a claim and a racing `Apply` both succeed on one row. |
 | 2026-07-26 | Contract item 4 now gates a `pending` row on `wake_at` as well. The worker has always written a backoff there when requeueing a failed transition, but every implementation treated `pending` as unconditionally claimable — as the contract then said — so the backoff had no effect and a failing Process retried at poll speed. Recorded here because it is the claim predicate a third-party author implements. Source- and API-compatible, but a **behavioural** change to the contract: an implementation that does not follow it keeps its durability guarantees and behaves exactly as it did before, yet loses the retry backoff and the throttle a refusing `ClaimMiddleware` relies on, and no longer passes `repotest`. |
 | 2026-07-26 | `ListEvents` gained an `EventQuery` (exclusive `After` cursor, `Limit` cap), and contract item 6 now requires an implementation to round-trip `Event.ID` verbatim rather than assigning one (ADR-0019). Breaking for existing implementations: a new persisted column and a changed signature. Recorded here because this is the contract a third-party author implements against — an implementation that minted its own ids would satisfy every other item and still resume a caller at the wrong place. |
+| 2026-08-21 | Contract items 8, 9 and 10 added for the Process semaphore ([ADR-0021](0021-key-scoped-concurrency-is-a-process-semaphore.md)), along with `GetSemaphoreStatus`. Breaking for existing implementations twice over: a new method, and a claim predicate plus an `Apply` check they do not perform — an implementation that ignores them keeps every existing guarantee and silently enforces no limit. Recorded here rather than only in ADR-0021 because this is the contract a third-party author implements against. Two points are stated as obligations because getting either wrong is worse than not implementing the feature: the claim predicate must agree with item 9, or `ClaimNextProcess` returns an error and the worker re-picks the same row forever; and item 9 must be monotone rather than absolute, or one over-limit pair rejects every `Apply` on every Process, including the terminal commits that would clear it. |

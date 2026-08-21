@@ -65,3 +65,65 @@ func TestRegisterWithOnFinish(t *testing.T) {
 		gt.NoError(t, err)
 	})
 }
+
+func TestRegisterWithSemaphoreKey(t *testing.T) {
+	strat := &scriptStrategy{step: doneStep()}
+
+	t.Run("an empty key is rejected", func(t *testing.T) {
+		reg := agentkit.NewRegistry()
+		_, err := agentkit.Register(reg, "a", 1, strat, agentkit.WithSemaphoreKey[[]byte]("", 1))
+		gt.Error(t, err).Is(agentkit.ErrInvalidAgentDef)
+	})
+
+	t.Run("slots < 1 is rejected", func(t *testing.T) {
+		for _, slots := range []int{0, -1} {
+			reg := agentkit.NewRegistry()
+			_, err := agentkit.Register(reg, "a", 1, strat, agentkit.WithSemaphoreKey[[]byte]("k", slots))
+			gt.Error(t, err).Is(agentkit.ErrInvalidAgentDef)
+		}
+	})
+
+	// The both-zero case is the one a caller reaches by wiring the option from
+	// unset configuration. Validating on the values alone would read it as "no
+	// semaphore" and register an unrestricted agent, so the misconfiguration would
+	// never surface — the Spawn would not ask for a value either.
+	t.Run("an empty key with zero slots is rejected, not read as no semaphore", func(t *testing.T) {
+		reg := agentkit.NewRegistry()
+		_, err := agentkit.Register(reg, "a", 1, strat, agentkit.WithSemaphoreKey[[]byte]("", 0))
+		gt.Error(t, err).Is(agentkit.ErrInvalidAgentDef)
+	})
+
+	t.Run("a rejected declaration leaves the agent unregistered", func(t *testing.T) {
+		reg := agentkit.NewRegistry()
+		_, err := agentkit.Register(reg, "a", 1, strat, agentkit.WithSemaphoreKey[[]byte]("k", 0))
+		gt.Error(t, err).Is(agentkit.ErrInvalidAgentDef)
+
+		// Registering the same name again succeeds, which it could not if the
+		// rejected call had left a binding behind.
+		_, err = agentkit.Register(reg, "a", 1, strat)
+		gt.NoError(t, err)
+	})
+
+	t.Run("two agents may share a key at the same slot count", func(t *testing.T) {
+		reg := agentkit.NewRegistry()
+		_, err := agentkit.Register(reg, "a", 1, strat, agentkit.WithSemaphoreKey[[]byte]("shared", 2))
+		gt.NoError(t, err)
+		// Sharing a key is how two agents serialize against each other.
+		_, err = agentkit.Register(reg, "b", 1, strat, agentkit.WithSemaphoreKey[[]byte]("shared", 2))
+		gt.NoError(t, err)
+	})
+
+	t.Run("sharing a key at a different slot count is rejected", func(t *testing.T) {
+		reg := agentkit.NewRegistry()
+		_, err := agentkit.Register(reg, "a", 1, strat, agentkit.WithSemaphoreKey[[]byte]("shared", 2))
+		gt.NoError(t, err)
+		_, err = agentkit.Register(reg, "b", 1, strat, agentkit.WithSemaphoreKey[[]byte]("shared", 1))
+		gt.Error(t, err).Is(agentkit.ErrInvalidAgentDef)
+	})
+
+	t.Run("omitting the option still registers", func(t *testing.T) {
+		reg := agentkit.NewRegistry()
+		_, err := agentkit.Register(reg, "a", 1, strat)
+		gt.NoError(t, err)
+	})
+}

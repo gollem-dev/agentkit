@@ -98,6 +98,149 @@ func TestSpawnValidation(t *testing.T) {
 	})
 }
 
+func TestSpawnWithSemaphore(t *testing.T) {
+	ctx := context.Background()
+
+	// initCount counts Init calls so a test can assert that a rejected Spawn never
+	// reached strategy code.
+	newKernel := func(t *testing.T, declare bool, initCount *int) (agentkit.Agent[scriptInput], *agentkit.Kernel, *memory.Repository) {
+		t.Helper()
+		repo := memory.New()
+		reg := agentkit.NewRegistry()
+		strat := &scriptStrategy{step: doneStep(), onInit: func() {
+			if initCount != nil {
+				*initCount++
+			}
+		}}
+		var opts []agentkit.RegisterOption[[]byte]
+		if declare {
+			opts = append(opts, agentkit.WithSemaphoreKey[[]byte]("channel", 1))
+		}
+		ag, err := agentkit.Register(reg, "a", 1, strat, opts...)
+		gt.NoError(t, err)
+		model, _ := mockLLM(textResponse("x"))
+		k, err := agentkit.New(repo, model, reg)
+		gt.NoError(t, err)
+		return ag, k, repo
+	}
+
+	t.Run("a key the agent did not declare is rejected before Init", func(t *testing.T) {
+		initCount := 0
+		ag, k, _ := newKernel(t, false, &initCount)
+		_, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("channel", "C1"))
+		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
+		gt.Value(t, initCount).Equal(0)
+	})
+
+	t.Run("a declared semaphore with no value named is rejected before Init", func(t *testing.T) {
+		initCount := 0
+		ag, k, _ := newKernel(t, true, &initCount)
+		_, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
+		gt.Value(t, initCount).Equal(0)
+	})
+
+	t.Run("a key that does not match the declaration is rejected", func(t *testing.T) {
+		ag, k, _ := newKernel(t, true, nil)
+		_, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("chanel", "C1"))
+		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
+	})
+
+	t.Run("the row carries the key, the value and the declared slot count", func(t *testing.T) {
+		ag, k, _ := newKernel(t, true, nil)
+		pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("channel", "C1"))
+		gt.NoError(t, err)
+
+		p, err := k.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.NotNil(t, p.Semaphore)
+		gt.Value(t, *p.Semaphore).Equal(agentkit.ProcessSemaphore{Key: "channel", Value: "C1", Slots: 1})
+		gt.Bool(t, p.SemaphoreHeld).False() // no claim has run yet.
+	})
+
+	t.Run("an empty value is a legitimate instance name", func(t *testing.T) {
+		ag, k, _ := newKernel(t, true, nil)
+		pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("channel", ""))
+		gt.NoError(t, err)
+		p, err := k.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Value(t, p.Semaphore.Value).Equal("")
+	})
+
+	t.Run("a full pair still spawns, pending and unheld", func(t *testing.T) {
+		ag, k, repo := newKernel(t, true, nil)
+		first, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("channel", "C1"))
+		gt.NoError(t, err)
+
+		// Take the only slot, without running a worker.
+		now := time.Now()
+		claimed, err := repo.ClaimNextProcess(ctx, "w1", now.Add(time.Hour), now)
+		gt.NoError(t, err)
+		gt.NotNil(t, claimed)
+		gt.Value(t, claimed.ID).Equal(first)
+
+		second, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("channel", "C1"))
+		gt.NoError(t, err) // Spawn does NOT refuse; the Process waits instead.
+		p, err := k.GetProcess(ctx, second)
+		gt.NoError(t, err)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+		gt.Bool(t, p.SemaphoreHeld).False()
+
+		// And it is not claimable while the pair is full.
+		none, err := repo.ClaimNextProcess(ctx, "w1", now.Add(time.Hour), now)
+		gt.NoError(t, err)
+		gt.Nil(t, none)
+	})
+
+	t.Run("an agent that declared none spawns as before", func(t *testing.T) {
+		ag, k, _ := newKernel(t, false, nil)
+		pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+		gt.NoError(t, err)
+		p, err := k.GetProcess(ctx, pid)
+		gt.NoError(t, err)
+		gt.Nil(t, p.Semaphore)
+	})
+}
+
+func TestGetSemaphoreStatus(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "a", 1, &scriptStrategy{step: doneStep()},
+		agentkit.WithSemaphoreKey[[]byte]("channel", 1))
+	gt.NoError(t, err)
+	model, _ := mockLLM(textResponse("x"))
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+
+	t.Run("an unused pair reads as zero rather than an error", func(t *testing.T) {
+		st, err := k.GetSemaphoreStatus(ctx, "channel", "nobody")
+		gt.NoError(t, err)
+		gt.NotNil(t, st)
+		gt.Value(t, st.Held).Equal(0)
+		gt.Value(t, st.Waiting).Equal(0)
+		gt.Nil(t, st.OldestWaiting)
+	})
+
+	t.Run("it reports the backlog behind a taken slot", func(t *testing.T) {
+		for range 3 {
+			_, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"}, agentkit.WithSemaphore("channel", "C1"))
+			gt.NoError(t, err)
+		}
+		now := time.Now()
+		claimed, err := repo.ClaimNextProcess(ctx, "w1", now.Add(time.Hour), now)
+		gt.NoError(t, err)
+		gt.NotNil(t, claimed)
+
+		st, err := k.GetSemaphoreStatus(ctx, "channel", "C1")
+		gt.NoError(t, err)
+		gt.Value(t, st.Held).Equal(1)
+		gt.Value(t, st.Slots).Equal(1)
+		gt.Value(t, st.Waiting).Equal(2)
+		gt.NotNil(t, st.OldestWaiting)
+	})
+}
+
 // WithInheritedHistory resolves the version to inherit from the issuing
 // Process's record, so everything that can make that impossible is reported
 // synchronously — before Init runs and before any row is written. A Process

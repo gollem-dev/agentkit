@@ -167,6 +167,53 @@ kernel, err := agentkit.New(repo, defaultModel, registry,
 )
 ```
 
+## Semaphore
+
+A cap on how many Processes run at once under a key you choose. Declare the key
+and its capacity at registration; name the instance at spawn:
+
+```go
+// At most one Process per document, whatever else is queued.
+editor, err := agentkit.Register(reg, "editor", 1, editorStrategy{},
+    agentkit.WithSemaphoreKey[Output]("document", 1))
+
+pid, err := editor.Spawn(ctx, kernel, in,
+    agentkit.WithSemaphore("document", docID))
+```
+
+The split is deliberate: the capacity lives in one place in your code, so no two
+spawns can disagree about it, and `Register` rejects two agents declaring one key
+with different capacities. What counts is the `(key, value)` pair — a different
+document is a different limit — and it counts process **trees**, so a child naming
+its parent's pair runs rather than deadlocking behind it.
+
+Four things to know before using it:
+
+- **A spawn against a full pair succeeds.** The Process is written as pending and
+  waits for a slot. Nothing is refused and nothing blocks in the caller, so the
+  number waiting is unbounded — `Kernel.GetSemaphoreStatus(ctx, key, value)`
+  reports holders, capacity, waiting count and the oldest waiting time, and
+  throttling on it is your job. It is an observation, not a reservation: a slot it
+  reports free may be gone before you act on it.
+- **A slot is held for the whole life of the Process, not for one claim.**
+  Suspending to `waiting` does not release it. Put this key on an agent that waits
+  on a person and the pair stays taken until the answer arrives — decide that on
+  purpose. Termination releases it, and `Cancel` is how you release one early.
+- **Acquisition order is not guaranteed.** A freed slot can go to a Process
+  spawned a moment ago rather than to the one that waited longest.
+- **Waiting across two different keys is yours to get right.** A Process holding
+  one pair while waiting on a child that needs another can deadlock, and nothing
+  detects it.
+
+**Not the same as `Subject`.** `WithSubject` makes a *duplicate* `Spawn` fail
+immediately with `ErrSubjectBusy` — it suppresses a second turn on the same
+subject. A semaphore queues instead of refusing, and admits N rather than one.
+Reach for `Subject` when a second request is wrong, and for a semaphore when it
+is fine but must wait.
+
+See [ADR-0021](adr/0021-key-scoped-concurrency-is-a-process-semaphore.md), and
+[`examples/semaphore`](../examples/semaphore) for a program that runs it.
+
 ## ModelRole
 
 A named model slot. `DefineModelRole` returns an opaque value; a nil role means
