@@ -45,8 +45,8 @@ func WithSystemPrompt(p string) Option { return func(c *config) { c.systemPrompt
 // finalizes as Fail(strategy_error).
 func WithMaxIterations(n int) Option { return func(c *config) { c.maxIterations = n } }
 
-// WithLimiter sets this agent's execution budget, which Strategy.Limit answers
-// with. Default: none, i.e. LimitPass at every check.
+// WithLimiter sets this agent's execution budget, which Strategy.Limiter hands
+// to the kernel. Default: none — nil, so nothing is called at all.
 //
 // This is a different question from WithMaxIterations: that one bounds this
 // strategy's own loop and is counted in checkpointed state, while a limiter sees
@@ -105,12 +105,7 @@ type strategy struct {
 
 func (s *strategy) Version() int { return s.version }
 
-func (s *strategy) Limit(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
-	if s.limiter == nil {
-		return agentkit.LimitPass()
-	}
-	return s.limiter(ctx, proc, m)
-}
+func (s *strategy) Limiter() agentkit.Limiter { return s.limiter }
 
 func (s *strategy) Init(in Input) (state, error) {
 	if in.Prompt == "" {

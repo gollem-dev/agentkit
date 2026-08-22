@@ -76,8 +76,8 @@ func WithMaxRounds(n int) Option { return func(c *config) { c.maxRounds = n } }
 // Default: 5.
 func WithMaxParallelTasks(n int) Option { return func(c *config) { c.maxParallelTasks = n } }
 
-// WithLimiter sets this agent's execution budget, which Strategy.Limit answers
-// with. Default: none, i.e. LimitPass at every check.
+// WithLimiter sets this agent's execution budget, which Strategy.Limiter hands
+// to the kernel. Default: none — nil, so nothing is called at all.
 //
 // This is a different question from WithMaxRounds: that one is an algorithm
 // parameter the planner is even told about, while a limiter sees the kernel's
@@ -153,12 +153,7 @@ type strategy[T any] struct {
 
 func (s *strategy[T]) Version() int { return s.version }
 
-func (s *strategy[T]) Limit(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
-	if s.limiter == nil {
-		return agentkit.LimitPass()
-	}
-	return s.limiter(ctx, proc, m)
-}
+func (s *strategy[T]) Limiter() agentkit.Limiter { return s.limiter }
 
 func (s *strategy[T]) Init(in Input) (state, error) {
 	if in.Prompt == "" {

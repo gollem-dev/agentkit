@@ -1,4 +1,4 @@
-# ADR-0010: Execution limits are the strategy's Limit method
+# ADR-0010: Execution limits are the Limiter a strategy hands over
 
 ## Summary
 
@@ -7,19 +7,25 @@ eight `int64` counters, the fields of `Metrics`. Two of them are a prompt-cache
 breakdown: components of input tokens, not additions to it — `InputTokens`
 stays the true total, and `InputTokens - CacheReadInputTokens` is the input not
 served from cache (uncached input plus any cache write, not a single price
-tier). The decision is a required method on `Strategy`:
+tier). The decision is a `Limiter`, which a required method on `Strategy` hands
+over:
 
 ```go
-Limit(ctx context.Context, proc *Process, metrics Metrics) LimitDecision
+Limiter() Limiter
+// type Limiter func(ctx context.Context, proc *Process, metrics Metrics) LimitDecision
 ```
 
-The `Limiter` function type is that method's shape, and is what the bundled
-strategies take through their own `WithLimiter` option to build the method from a
-caller's closure. There is no Kernel-wide limiter.
+`BindStrategy` calls it **exactly once**, at registration, and stores the result
+on the binding. The three evaluation points call that stored function, never the
+strategy value, so the policy is fixed for the life of the registration. The
+bundled strategies supply one through their own `WithLimiter` option. There is no
+Kernel-wide limiter.
 
 A `LimitDecision` is one of three verdicts, built by `LimitPass`, `LimitNotice`
-or `LimitStop` and read back through `Kind()` and `Message()`. `LimitPass()` is
-how a strategy says "unlimited"; there is no way to skip answering.
+or `LimitStop` and read back through `Kind()` and `Message()`. Returning `nil`
+from `Limiter()` is how a strategy says "unlimited", and then nothing is called
+at any of the three points; there is no way to skip answering the question
+itself.
 
 - **`LimitStop(reason)`** refuses. Before an effect the reason reaches the
   strategy wrapped in `ErrLimitExceeded`; at a transition boundary it finalizes
@@ -31,7 +37,7 @@ how a strategy says "unlimited"; there is no way to skip answering.
   unless the caller asks.
 - **`LimitPass()`** continues with nothing to report.
 
-The method runs at each transition boundary, before every `Generate`,
+The stored function runs at each transition boundary, before every `Generate`,
 `CallTool` and `SpawnChild`, and again after each of those has been counted. The
 first two refuse the work when it says stop; the third cannot, because the work
 is done, and only updates what `LimitStatus()` reports. Being called that often
@@ -40,7 +46,9 @@ consults — an enquiry, never an acquisition — and it must not block.
 
 The boundary call happens before the state is decoded and outside the recover in
 `runTransition`, so it goes through `callLimit`, which converts a panic into a
-transition error rather than letting it reach the worker goroutine.
+transition error rather than letting it reach the worker goroutine. A panic in
+`Limiter()` itself is different: that runs inside `Register`, on the caller's own
+goroutine, and is deliberately left to propagate there.
 
 `Process.Metrics` counts a Process's own effects **plus every child that has
 terminated, once each**, so one closure expresses a subtree budget as well as a
@@ -68,20 +76,35 @@ open.
 Delete all of it. Ship the counters, and make answering the question part of
 being a `Strategy`.
 
-A static cap is a few lines in `Limit`. A rate limit consults the caller's own
-limiter from there. A budget that varies per tenant reads `proc.Metadata`. All
-through one method, and none of it in agentkit.
+A static cap is a few lines in the closure. A rate limit consults the caller's
+own limiter from there. A budget that varies per tenant reads `proc.Metadata`.
+All through one function, and none of it in agentkit.
 
 **The method is required, which is the whole point.** An optional slot — a
 `KernelOption`, a `RegisterOption` — can be left empty, and an empty budget slot
 reads as no budget. A method on the interface cannot be left out: a strategy that
-wants no limit writes `return LimitPass()` and has said so on the record.
+wants no limit writes `return nil` and has said so on the record.
+
+**The method returns the policy rather than being it.** Answering directly makes
+the decision a method call on the strategy value, so anything the policy needs —
+a threshold, a rate limiter, a table of per-tenant budgets — is reached through
+the receiver and re-derived on each of the `1 + 2×effects` calls. Handing over a
+closure moves that work to registration and leaves nothing per-call to consult.
+Calling `Limiter()` once is what makes it a policy rather than a hook: a strategy
+has no way to return a different function per claim, so the budget cannot quietly
+depend on when it was asked.
+
+`nil` is the accurate spelling of "no budget", and it is also the only one the
+kernel can act on. A function that always passes still has to be called to find
+that out; `nil` is checkable, so all three call sites skip the evaluation
+entirely. Nothing downstream needs a second case for it, because the zero
+`LimitDecision` already reads as `LimitKindPass`.
 
 **One limiter, at one scope.** Keeping a Kernel-wide one alongside would need a
 composition rule (which verdict wins, whose message lands in `Failure.Message`)
 and would double the call count, to deliver something the method already covers:
 `Process.Metrics` folds in every terminated child, so a whole-tree budget is the
-root's own `Limit` reading its own `metrics` argument. Two mechanisms for one
+root's own `Limiter` reading its own `metrics` argument. Two mechanisms for one
 question is the `Governor` mistake this record already rejected once.
 
 `metrics` is a live snapshot: committed cumulative (`proc.Metrics`) plus what the
@@ -105,12 +128,13 @@ answer now — to `Step`. The kernel carries the message and does nothing else w
 it: acting on it would mean the kernel owning vocabulary for talking to a model
 (ADR-0011).
 
-With `Limit` on the same interface, a strategy reads back a verdict it produced
-itself. That is not circular. `Limit` states a policy against counters the kernel
-owns and the strategy cannot see any other way; `Step` decides what to do about
-the answer. Splitting the two is what lets "nearly out" mean something different
-from "stop", and a strategy is free to make `Limit` a pure function of the budget
-and keep every reaction in `Step`.
+With the limiter coming from the same interface, a strategy reads back a verdict
+its own policy produced. That is not circular. The `Limiter` states a policy
+against counters the kernel owns and the strategy cannot see any other way;
+`Step` decides what to do about the answer. Splitting the two is what lets
+"nearly out" mean something different from "stop", and the split is now
+structural: the `Limiter` is a function of `(proc, metrics)` alone, so every
+reaction lives in `Step` by construction.
 
 Reading it is a pull, never a push. A strategy calls `LimitStatus()`, or a
 `GenerateMiddleware` reads `EffectContext.Limit` and appends to the system
@@ -140,12 +164,12 @@ also the one whose result the strategy could finish with, and hiding the refusal
 until the next effect would spend another one to learn it. Enforcement stays
 with the next pre-effect check and the next boundary.
 
-This means a stored `LimitKindStop` says "`Limit` is refusing", not "this
+This means a stored `LimitKindStop` says "the limiter is refusing", not "this
 Process has stopped". The same reading already applied after a pre-effect
 refusal that a strategy caught and chose to continue past, so there is one rule
 rather than two.
 
-**A whole-tree budget is the same method, because the counters roll up.** A
+**A whole-tree budget is the same function, because the counters roll up.** A
 child adds its own `Metrics` to its parent in its terminal transition
 (`reportToParent`, `worker.go`), and since it had already absorbed its own
 children the same way, a root ends up holding the tree. This originally required
@@ -190,11 +214,36 @@ statuses and puts the reason where every other failure reason already lives.
   would have nothing to rebuild the closure from. Per-agent works precisely
   because the `Registry` is in-process and every worker builds the same one. A
   per-spawn budget expressed as data is the `Limits` table again.
-- **Giving `Limit` the strategy state `S`.** The boundary evaluation runs before
-  `DecodeState`, so this would move decoding earlier and mix "the state would not
-  parse" into "the budget refused". A limit that needs the algorithm's own state
-  is a branch in `Step`; what `Limit` buys over that branch is only the ability to
-  refuse without entering `Step` at all.
+- **Giving the limiter the strategy state `S`.** The boundary evaluation runs
+  before `DecodeState`, so this would move decoding earlier and mix "the state
+  would not parse" into "the budget refused". A limit that needs the algorithm's
+  own state is a branch in `Step`; what a limiter buys over that branch is only
+  the ability to refuse without entering `Step` at all.
+- **A method that answers directly** — `Limit(ctx, proc, metrics) LimitDecision`,
+  which is what this used to be. The verdict is then a method call on the strategy
+  value, so everything the policy needs is reached through the receiver and
+  re-derived on each of the `1 + 2×effects` calls. It also leaves the receiver as
+  a place to keep budget state, which the read-only requirement below forbids in
+  words but the shape invited. Returning the function moves the derivation to
+  registration and removes the receiver from the decision entirely. The bundled
+  strategies showed the cost plainly: each carried a `limiter` field and a method
+  that only nil-checked and delegated to it.
+- **Calling `Limiter()` per claim** rather than once at registration. It would let
+  a strategy hand out a different policy per claim, which puts the state back in
+  the strategy value by another route — the budget would depend on when it was
+  asked. Once at registration makes "one policy per registration" checkable rather
+  than merely intended.
+- **Forbidding `nil` and requiring a function that always passes.** Then "no
+  budget" is only discoverable by calling, so the three call sites keep paying for
+  a verdict that never refuses. `nil` is both the accurate spelling and the
+  checkable one, and it needs no new reader logic because the zero
+  `LimitDecision` already reads as a pass.
+- **Recovering a panic from `Limiter()` inside `Register`** and returning
+  `ErrInvalidAgentDef`. `Register` runs synchronously on the caller's own
+  goroutine during its own initialization, so there is no worker to protect —
+  that is precisely what distinguishes it from the boundary call `callLimit`
+  guards. Converting it would hide a registration bug behind an error value
+  nobody has to read.
 - **Cost metrics in the kernel** (`cost_micro_usd` and friends). Pricing depends
   on model, date and contract — knowledge the kernel does not have and cannot
   acquire. Emitting a number it cannot compute correctly would be worse than
@@ -241,21 +290,30 @@ statuses and puts the reason where every other failure reason already lives.
 
 - Reading `Metrics` is meaningful; interpreting it is not the kernel's job. Cost,
   quota and fairness all live in strategy code.
-- **Every `Strategy` implementation owes a `Limit` method**, and a new one cannot
-  be registered without writing it. Most write `return LimitPass()`.
-- `Limit` must be cheap and non-blocking. It runs on the transition hot path,
-  **before and after every effect** — `1 + 2×effects` calls per attempt — so the
-  cost of a slow one is now paid roughly twice as often.
-- **`Limit` must not consume what it consults.** Drawing a rate-limit token
-  or charging a quota inside it over-charges every effect and refuses work that
-  has already happened. This was implicit while it ran once per effect and is
-  not implicit now; it is stated on the type.
-- **There is no "no limiter" fast path.** A run with no budget still pays a method
-  call at every check, because "unlimited" is now an answer rather than an absent
-  configuration.
-- **A panic in `Limit` at the transition boundary becomes a transition error**
-  (`callLimit`), retried and eventually `retry_exhausted` like any other strategy
-  failure. Inside an effect it is already covered by `runTransition`'s recover.
+- **Every `Strategy` implementation owes a `Limiter` method**, and a new one cannot
+  be registered without writing it. Most write `return nil`.
+- The returned function must be cheap and non-blocking. It runs on the transition
+  hot path, **before and after every effect** — `1 + 2×effects` calls per attempt.
+  What the policy needs in order to decide is derived once, when the closure is
+  built, so a slow lookup is paid at registration rather than on every call.
+- **The returned function must not consume what it consults.** Drawing a
+  rate-limit token or charging a quota inside it over-charges every effect and
+  refuses work that has already happened. This was implicit while it ran once per
+  effect and is not implicit now; it is stated on the type.
+- **A run with no budget calls nothing.** `nil` is checkable, so all three call
+  sites skip the evaluation rather than asking a function that always passes.
+  `LimitStatus()` and `EffectContext.Limit` then report the zero
+  `LimitDecision`, which reads as `LimitKindPass`.
+- **Metering is never skipped with the evaluation.** `meter` folds the effect's
+  usage into `runMetrics` before the `nil` check, so `Metrics()` is correct
+  whether or not anyone set a budget.
+- **A panic in the returned function at the transition boundary becomes a
+  transition error** (`callLimit`), retried and eventually `retry_exhausted` like
+  any other strategy failure. Inside an effect it is already covered by
+  `runTransition`'s recover.
+- **A panic in `Limiter()` itself propagates out of `Register`.** It runs on the
+  caller's own goroutine during registration, before any worker exists, so it is
+  left as a panic rather than converted into an error.
 - A refusal mid-transition surfaces as `ErrLimitExceeded` to the
   strategy, which may handle it (checkpoint what it has and `Suspend`) or
   propagate it. That is the strategy author's call. The verdict stays readable
@@ -264,7 +322,7 @@ statuses and puts the reason where every other failure reason already lives.
 - `LimitStatus()` and `EffectContext.Limit` are not deterministic across a
   replay: they depend on how far an attempt got, like `Now()` and `Metrics()`.
   Folding one into checkpointed state is a bug.
-- A `Limit` that only ever returns `LimitNotice` cannot end a run. That is the
+- A limiter that only ever returns `LimitNotice` cannot end a run. That is the
   point, but it means a misconfigured budget fails open rather than closed. What
   no longer fails open is forgetting to configure one at all.
 - Metrics from a failed attempt are still folded in on requeue and on
@@ -288,3 +346,4 @@ statuses and puts the reason where every other failure reason already lives.
 | 2026-07-26 | The `Limiter` returns a `LimitDecision` instead of an `error`, adding a third verdict: continue while telling the strategy the budget is running out. A two-valued return could only end a run at the cap, giving an agent no chance to wrap up on its own terms. The message is read through `Syscalls.LimitStatus()` or `EffectContext.Limit` and the kernel does nothing with it — injecting it would put model-facing vocabulary in the kernel. `LimitStop` takes a string because both call sites already discarded the error type. The verdict is re-evaluated after each effect is counted so it and `Metrics()` describe the same moment; a refusal there is stored but does not fail the effect, which is what lets a strategy finish with the result that crossed the cap. Being called twice per effect makes read-only-ness a stated requirement rather than an implicit one. `Metrics` became a struct: the counter set is closed by this record, so a map advertised keys that never existed. Its json tags reproduce the map's keys, so old snapshots read back without a migration — though all-zero metrics moved from `null` to `{}` and an unknown key is dropped. |
 | 2026-07-26 | The decision moved from a Kernel-wide injected closure (`WithLimiter`) to a required `Strategy.Limit` method, and the Kernel option was deleted rather than kept alongside. One limiter per Kernel forced a per-agent budget to be a `switch` on the `proc.Agent` string, where a missing case falls through to "no limit" — an optional slot cannot express that every agent has answered, and a required method can. Keeping both would have needed a composition rule and doubled the call count to deliver what the method already covers, since `Process.Metrics` folds in terminated children and a whole-tree budget is the root's own `Limit`. The method takes no `S`: the boundary evaluation runs before `DecodeState`. Per-spawn was rejected because a closure cannot be persisted on the Process row. The boundary call is wrapped by `callLimit` so a panic there becomes a transition error instead of killing the worker, and the bundled strategies gained their own `WithLimiter` option. |
 | 2026-08-06 | `Metrics` grew two counters, `CacheReadInputTokens` and `CacheCreationInputTokens`, so a caller can separate the input a Generate call served from the prompt cache from the input it did not. Both are components of `InputTokens`, not additions to it: `InputTokens` keeps meaning the true total gollem reports, so no existing `Limit` implementation changes what it sees. `InputTokens - CacheReadInputTokens` is the input not served from cache — uncached input plus any cache write — not a single price tier, since a cache write is commonly billed at a premium over uncached input and a cache read at a discount; agentkit carries the three counts and leaves pricing to the caller. Only Claude reports cache writes; the field is 0 for a provider that does not, indistinguishable from "no caching" and left uncorrected rather than teaching the kernel a provider-capability flag. The set is still closed at eight fields — a caller still cannot add a ninth. |
+| 2026-08-22 | The required method changed from `Limit(ctx, proc, metrics) LimitDecision` to `Limiter() Limiter`: it now hands over the policy instead of being it. Answering directly made the verdict a method call on the strategy value, so everything the policy needed was reached through the receiver and re-derived on each of the `1 + 2×effects` calls — and the receiver stayed a place to keep budget state, which the read-only requirement forbids in words but the shape invited. Both bundled strategies showed the cost: each carried a `limiter` field and a method that only nil-checked and delegated to it. `BindStrategy` now calls the method exactly once, at registration, and stores the result; calling it per claim was rejected because a strategy could then return a different policy per claim, putting the dependence on the strategy value back by another route. `nil` is the new spelling of "no budget", replacing "return `LimitPass()` from every call": it is checkable, so the transition boundary, `checkLimit` and `meter` skip the evaluation entirely rather than asking a function that never refuses — the "no fast path" consequence this record used to state is now the opposite. No reader changed, because the zero `LimitDecision` already read as `LimitKindPass`. `meter` folds usage into `runMetrics` before the `nil` check, so `Metrics()` is unaffected by whether a budget exists. A panic in `Limiter()` propagates out of `Register` rather than becoming an error: it runs on the caller's own goroutine before any worker exists, which is exactly what distinguishes it from the boundary call `callLimit` guards. Nothing persisted changed — no `Process` field, no strategy-state bytes, no `Metrics` json tag — and `Register`, `BindStrategy`, `Syscalls`, `Limiter`, `LimitDecision` and the bundled `WithLimiter` options all kept their signatures. |

@@ -36,12 +36,7 @@ type scriptStrategy struct {
 	limit   agentkit.Limiter // nil = unlimited.
 }
 
-func (s *scriptStrategy) Limit(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
-	if s.limit == nil {
-		return agentkit.LimitPass()
-	}
-	return s.limit(ctx, proc, m)
-}
+func (s *scriptStrategy) Limiter() agentkit.Limiter { return s.limit }
 
 func (s *scriptStrategy) Version() int {
 	if s.version == 0 {
@@ -411,23 +406,40 @@ func TestLimitNoticeReachesStrategyWithoutStopping(t *testing.T) {
 	gt.Value(t, seen[0]).Equal("notice:careful")
 }
 
-// Without a Limiter the verdict is the zero value, which has to read as a pass
-// rather than as an empty kind.
+// A strategy whose Limiter() returns nil has no budget, so nothing is called at
+// any of the three points. The verdict then stays the zero LimitDecision, which
+// has to read as a pass rather than as an empty kind -- before and after an
+// effect alike, since meter is the one that would otherwise refresh it.
+//
+// Metering is not skipped with it: Metrics() reports what the effect spent
+// whether or not anyone set a budget.
 func TestLimitStatusWithoutLimiterIsPass(t *testing.T) {
 	ctx := context.Background()
-	model, _ := mockLLM(textResponse("x"))
-	var kind agentkit.LimitKind
-	var msg string
-	step := func(_ context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		kind, msg = sys.LimitStatus().Kind(), sys.LimitStatus().Message()
+	model, generates := mockLLM(textResponse("x"))
+	var seen []string
+	var metricsAfter agentkit.Metrics
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		d := sys.LimitStatus()
+		seen = append(seen, string(d.Kind())+":"+d.Message())
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		d = sys.LimitStatus()
+		seen = append(seen, string(d.Kind())+":"+d.Message())
+		metricsAfter = sys.Metrics()
 		return st, agentkit.Done([]byte("ok")), nil
 	}
 	k, repo, ag := setupScript(t, step, model)
 	pid, _ := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
-	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 
-	gt.Value(t, kind).Equal(agentkit.LimitKindPass)
-	gt.Value(t, msg).Equal("")
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, *generates).Equal(1)
+	gt.Array(t, seen).Equal([]string{"pass:", "pass:"})
+	gt.Value(t, metricsAfter.LLMCalls).Equal(int64(1))
+	gt.Value(t, metricsAfter.InputTokens).Equal(int64(5))
+	gt.Value(t, metricsAfter.OutputTokens).Equal(int64(7))
+	gt.Value(t, p.Metrics.LLMCalls).Equal(int64(1))
 }
 
 // The verdict has to advance with Metrics(), not lag a call behind it: a
@@ -1031,12 +1043,7 @@ type finishStrategy struct {
 
 func (*finishStrategy) Version() int { return 1 }
 
-func (s *finishStrategy) Limit(ctx context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {
-	if s.limit == nil {
-		return agentkit.LimitPass()
-	}
-	return s.limit(ctx, proc, m)
-}
+func (s *finishStrategy) Limiter() agentkit.Limiter { return s.limit }
 
 func (*finishStrategy) Init(in scriptInput) (scriptState, error) {
 	if in.Seed == "" {

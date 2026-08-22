@@ -3,9 +3,13 @@ package agentkit_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/gollem-dev/agentkit"
+	"github.com/gollem-dev/agentkit/repository/memory"
+	"github.com/gollem-dev/gollem"
 	"github.com/m-mizutani/gt"
 )
 
@@ -28,9 +32,7 @@ func (bindStrat) Init(in bindInput) (bindState, error) {
 func (bindStrat) Step(_ context.Context, _ agentkit.Syscalls, st bindState) (bindState, agentkit.Decision[[]byte], error) {
 	return st, agentkit.Done([]byte("x")), nil
 }
-func (bindStrat) Limit(context.Context, *agentkit.Process, agentkit.Metrics) agentkit.LimitDecision {
-	return agentkit.LimitPass()
-}
+func (bindStrat) Limiter() agentkit.Limiter                { return nil }
 func (bindStrat) EncodeOutput(out []byte) ([]byte, error)  { return out, nil }
 func (bindStrat) EncodeState(st bindState) ([]byte, error) { return json.Marshal(st) }
 func (bindStrat) DecodeState(_ int, raw []byte) (bindState, error) {
@@ -88,9 +90,7 @@ func (s outStrat) Step(_ context.Context, _ agentkit.Syscalls, st bindState) (bi
 	d, err := s.step(st)
 	return st, d, err
 }
-func (outStrat) Limit(context.Context, *agentkit.Process, agentkit.Metrics) agentkit.LimitDecision {
-	return agentkit.LimitPass()
-}
+func (outStrat) Limiter() agentkit.Limiter { return nil }
 func (s outStrat) EncodeOutput(out bindOut) ([]byte, error) {
 	if s.encodeCalls != nil {
 		*s.encodeCalls++
@@ -114,9 +114,7 @@ func (s anyOutStrat) Step(_ context.Context, _ agentkit.Syscalls, st bindState) 
 	d, err := s.step(st)
 	return st, d, err
 }
-func (anyOutStrat) Limit(context.Context, *agentkit.Process, agentkit.Metrics) agentkit.LimitDecision {
-	return agentkit.LimitPass()
-}
+func (anyOutStrat) Limiter() agentkit.Limiter { return nil }
 func (s anyOutStrat) EncodeOutput(out any) ([]byte, error) {
 	if s.onEncode != nil {
 		s.onEncode(out)
@@ -322,4 +320,99 @@ func TestBindStrategyFinish(t *testing.T) {
 		})
 		gt.Error(t, b.FinishForTest(ctx, "p-5", agentkit.ProcessSucceeded, agentkit.WrapOutputForTest(bindOut{}), nil))
 	})
+}
+
+// --- Limiter is taken once, at registration ---
+
+// limiterOnceStrategy counts how often it is asked for its budget and runs an
+// effect on every transition, so a Limiter() called per claim or per effect
+// would show up in the count.
+type limiterOnceStrategy struct {
+	calls *int
+}
+
+func (limiterOnceStrategy) Version() int                         { return 1 }
+func (limiterOnceStrategy) Init(in bindInput) (bindState, error) { return bindState(in), nil }
+
+func (limiterOnceStrategy) Step(ctx context.Context, sys agentkit.Syscalls, st bindState) (bindState, agentkit.Decision[[]byte], error) {
+	if _, err := sys.Generate(ctx, []gollem.Input{gollem.Text("go")}); err != nil {
+		return st, agentkit.Decision[[]byte]{}, err
+	}
+	if st.V > 0 {
+		st.V--
+		return st, agentkit.Continue[[]byte](), nil
+	}
+	return st, agentkit.Done([]byte("ok")), nil
+}
+
+func (s limiterOnceStrategy) Limiter() agentkit.Limiter {
+	*s.calls++
+	return func(_ context.Context, _ *agentkit.Process, _ agentkit.Metrics) agentkit.LimitDecision {
+		return agentkit.LimitPass()
+	}
+}
+
+func (limiterOnceStrategy) EncodeOutput(out []byte) ([]byte, error)  { return out, nil }
+func (limiterOnceStrategy) EncodeState(st bindState) ([]byte, error) { return json.Marshal(st) }
+func (limiterOnceStrategy) DecodeState(_ int, raw []byte) (bindState, error) {
+	var st bindState
+	err := json.Unmarshal(raw, &st)
+	return st, err
+}
+
+// Taking the function once is the contract that keeps the decision independent
+// of the strategy value: a strategy that could hand out a different policy per
+// claim would be back to carrying the budget on its receiver.
+func TestLimiterIsTakenOnceAtRegistration(t *testing.T) {
+	ctx := context.Background()
+	model, generates := mockLLM(textResponse("x"))
+	calls := 0
+
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, limiterOnceStrategy{calls: &calls})
+	gt.NoError(t, err)
+	gt.Value(t, calls).Equal(1)
+
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+	pid, err := ag.Spawn(ctx, k, bindInput{V: 2})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	// Three transitions with one Generate each, so the stored function was
+	// evaluated many times over -- and Limiter() itself still exactly once.
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, *generates).Equal(3)
+	gt.Value(t, calls).Equal(1)
+}
+
+// panicLimiterStrategy panics while building its budget.
+type panicLimiterStrategy struct{}
+
+func (panicLimiterStrategy) Version() int                         { return 1 }
+func (panicLimiterStrategy) Init(in bindInput) (bindState, error) { return bindState(in), nil }
+func (panicLimiterStrategy) Step(context.Context, agentkit.Syscalls, bindState) (bindState, agentkit.Decision[[]byte], error) {
+	return bindState{}, agentkit.Done([]byte("ok")), nil
+}
+func (panicLimiterStrategy) Limiter() agentkit.Limiter               { panic("budget lookup exploded") }
+func (panicLimiterStrategy) EncodeOutput(out []byte) ([]byte, error) { return out, nil }
+func (panicLimiterStrategy) EncodeState(bindState) ([]byte, error)   { return []byte("{}"), nil }
+func (panicLimiterStrategy) DecodeState(int, []byte) (bindState, error) {
+	return bindState{}, nil
+}
+
+// Limiter runs inside Register, on the caller's own goroutine, so a panic there
+// is the caller's to see. Converting it into an error would be protection for a
+// worker that is not running yet, and would hide a registration bug behind a
+// value nobody has to check -- callLimit covers the boundary evaluation instead.
+func TestLimiterPanicPropagatesFromRegister(t *testing.T) {
+	recovered := func() (v any) {
+		defer func() { v = recover() }()
+		reg := agentkit.NewRegistry()
+		_, _ = agentkit.Register(reg, "a", 1, panicLimiterStrategy{})
+		return nil
+	}()
+	gt.NotNil(t, recovered)
+	gt.Value(t, fmt.Sprint(recovered)).Equal("budget lookup exploded")
 }
