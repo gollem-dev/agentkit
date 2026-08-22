@@ -190,17 +190,19 @@ or a conditional-write KV store ([ADR-0004](adr/0004-repository-changeset-rev-ca
 
 See [persistence.md](persistence.md).
 
-## Metrics, Limit, Event, Middleware
+## Metrics, Limiter, Event, Middleware
 
 - **`Metrics`** — counters the kernel maintains: input/output tokens, LLM calls,
   tool calls, steps, spawns. A child adds its counters to its parent's when it
   terminates, once each, so a root's are the tree's.
-- **`Strategy.Limit`** — the method deciding whether to continue, called at every
-  transition boundary and both before and after every effect. The kernel
+- **`Strategy.Limiter`** — hands over the function that decides whether to
+  continue. It is asked once, at registration; the function it returns is called
+  at every transition boundary and both before and after every effect. The kernel
   measures; the strategy decides. It is a veto, not a place to wait. Besides
   stopping a run it can return a notice: the run continues, and the strategy can
-  read the message and wrap up on its own terms. Every strategy must implement
-  it; `LimitPass()` is how one says it has no budget.
+  read the message and wrap up on its own terms. Every strategy must implement the
+  method; returning `nil` is how one says it has no budget, and then nothing is
+  called at all.
 - **`Event`** — an append-only record written durably inside the transition
   commit, carrying an `EventID`. Read per process with `ListEvents`, from the
   start or after an id you already have; delivering them anywhere is your job.

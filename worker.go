@@ -511,19 +511,27 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		// for this transition, which is how a strategy learns the budget is running
 		// out before anything refuses it.
 		//
-		// Limit is the strategy's own method and this call is outside the recover in
-		// runTransition, so a panic goes through failOrRequeue like any other failed
-		// transition. recoverClaim would catch it too, but as a claim panic —
-		// requeued as infrastructure, which does not spend StepAttempts, so a Limit
+		// The limiter is the strategy's own code and this call is outside the recover
+		// in runTransition, so a panic goes through failOrRequeue like any other
+		// failed transition. recoverClaim would catch it too, but as a claim panic —
+		// requeued as infrastructure, which does not spend StepAttempts, so a limiter
 		// that always panics would requeue forever. Charging it to the strategy
 		// bounds it at retry_exhausted. No effect has run yet, hence Metrics{}.
-		limit, lerr := callLimit(ctx, b.limit, proc, proc.Metrics)
-		if lerr != nil {
-			return k.failOrRequeue(ctx, cfg, proc, claimToken, lerr, Metrics{})
-		}
-		if limit.Kind() == LimitKindStop {
-			return k.finalizeClaimed(ctx, proc,
-				failWithMessage(FailureLimitExceeded, limit.Message()), claimToken, Metrics{})
+		//
+		// A nil limiter is the strategy's own "no budget", so nothing is called at
+		// all and the zero LimitDecision seeds LimitStatus() — which already reads as
+		// a pass, so no reader needs a second case for it.
+		var limit LimitDecision
+		if b.limit != nil {
+			d, lerr := callLimit(ctx, b.limit, proc, proc.Metrics)
+			if lerr != nil {
+				return k.failOrRequeue(ctx, cfg, proc, claimToken, lerr, Metrics{})
+			}
+			if d.Kind() == LimitKindStop {
+				return k.finalizeClaimed(ctx, proc,
+					failWithMessage(FailureLimitExceeded, d.Message()), claimToken, Metrics{})
+			}
+			limit = d
 		}
 
 		sys := newSyscalls(k, proc, toolList, hs, b.limit, limit)

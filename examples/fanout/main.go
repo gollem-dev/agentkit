@@ -107,7 +107,7 @@ func newFanout(ctx context.Context, w io.Writer, maxLLMCalls int) (*agentkit.Ker
 	// what turns it into ErrLimitExceeded or a Failure message, so a limiter
 	// never has to decide which error type to raise.
 	//
-	// The budget is registered per agent, because Limit is a Strategy method: the
+	// The budget is registered per agent, because Limiter is a Strategy method: the
 	// same closure goes to both agents here, but nothing forces that -- the
 	// planner and the task workers could each carry their own.
 	budget := func(_ context.Context, proc *agentkit.Process, m agentkit.Metrics) agentkit.LimitDecision {

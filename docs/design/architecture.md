@@ -16,7 +16,7 @@ graph TB
   subgraph ak["agentkit"]
     K["Kernel<br/>lifecycle API + Serve worker loop<br/>+ in-process eager dispatcher"]
     SC["Syscalls<br/>the only path to the world"]
-    SG["Strategy<br/>(strategy/simple, strategy/planexec, yours)<br/>Step + Limit"]
+    SG["Strategy<br/>(strategy/simple, strategy/planexec, yours)<br/>Step + Limiter"]
   end
   subgraph gollem["gollem"]
     LC["LLMClient / Session"]
@@ -27,7 +27,8 @@ graph TB
   RP -->|"New(repo, ...)"| K
   TF -->|WithToolFactory| K
   MW -->|"WithInitMiddleware / WithStepMiddleware /<br/>WithGenerateMiddleware / WithToolCallMiddleware /<br/>WithSpawnMiddleware"| K
-  K -->|"Step(ctx, sys, state)<br/>Limit(ctx, proc, metrics)"| SG
+  K -->|"Step(ctx, sys, state)"| SG
+  SG -->|"Limiter() — once, at Register;<br/>the kernel then calls what it returned"| K
   SG --> SC
   SC -->|NewSession / Generate| LC
   SC -->|Run| GT
@@ -49,9 +50,9 @@ transactions (ADR-0004), and cost (ADR-0010).
 | Middleware (`Init`/`Step`/`Generate`/`CallTool`/`Spawn`) | `next`-chain, repeatable | the application | no |
 
 `Repository` and `Strategy` are interfaces because both have several related
-operations that must move together — for `Strategy` that includes `Limit`, the
-budget decision, which belongs with the agent it bounds rather than in a Kernel
-slot someone can forget to fill (ADR-0010). `ToolFactory` is a function
+operations that must move together — for `Strategy` that includes `Limiter`, which
+hands over the budget decision, and so belongs with the agent it bounds rather
+than in a Kernel slot someone can forget to fill (ADR-0010). `ToolFactory` is a function
 type because it is a single decision best written as a closure — a stateful
 implementation passes a method value. Middleware is a third kind: unlike the
 other two it is chain-composable — each `WithXMiddleware` call is repeatable,
@@ -129,8 +130,9 @@ If the `Apply` does not happen, none of it happened. If it does, all of it did.
 
 A `Strategy` receives no `Repository`, no LLM client, and no tool list except
 through `Syscalls`. That single gateway is what makes metering universal: every
-`Generate`, `CallTool` and `SpawnChild` runs a `Limit` check before and
-accumulates `Metrics` after, with no path around it (ADR-0010).
+`Generate`, `CallTool` and `SpawnChild` runs a limit check before and
+accumulates `Metrics` after, with no path around it (ADR-0010). The check is
+skipped when the strategy handed over no limiter; the accumulation never is.
 
 `Syscalls` is assembled fresh per claim and holds the transition's buffers —
 pending children, pending events, accumulated metrics. Those buffers are what

@@ -27,7 +27,7 @@ const (
 // LimitDecision is a Limit verdict: one kind, plus the message that goes
 // with it. Build it with LimitPass, LimitNotice or LimitStop.
 //
-// It is both what Strategy.Limit returns and what a strategy observes through
+// It is both what a Limiter returns and what a strategy observes through
 // Syscalls.LimitStatus(), so a field added here reaches readers without
 // changing any signature. The message is one field rather than a separate
 // reason and notice because a decision is exactly one kind: "stopped, and also
@@ -84,9 +84,15 @@ func (d LimitDecision) Kind() LimitKind {
 func (d LimitDecision) Message() string { return d.message }
 
 // Limiter decides whether a Process may continue. Measurement (Metrics) is the
-// Kernel's job; the decision is the strategy's, expressed as Strategy.Limit,
-// whose shape this type is (ADR-0010). It is also the argument type the bundled
-// strategies take to build that method from a caller's closure.
+// Kernel's job; the decision is the strategy's, handed over as one of these by
+// Strategy.Limiter (ADR-0010). It is also the argument type the bundled
+// strategies take, through their own WithLimiter option, to supply that policy
+// without a strategy of one's own.
+//
+// The function is taken once, at registration, so everything the policy needs —
+// thresholds, a rate limiter, a table of per-tenant budgets — is captured when
+// the closure is built rather than re-derived on every call. A nil Limiter is how
+// a strategy says it has no budget, and then none of the call sites below run.
 //
 // It runs at three points: at each transition boundary, before every Generate,
 // CallTool and SpawnChild, and again after each of those has been metered. The
@@ -112,11 +118,15 @@ func (d LimitDecision) Message() string { return d.message }
 //     has to wait belongs behind a timer await.
 type Limiter func(ctx context.Context, proc *Process, metrics Metrics) LimitDecision
 
-// callLimit runs a strategy's Limit at the transition boundary, where
-// runTransition's recover is not yet in scope. Limit is strategy-author code, so
-// a panic there would otherwise take the worker goroutine down; it is converted
-// into a transition error carrying the same "strategy panic" message
+// callLimit runs a strategy's limiter at the transition boundary, where
+// runTransition's recover is not yet in scope. The limiter is strategy-author
+// code, so a panic there would otherwise take the worker goroutine down; it is
+// converted into a transition error carrying the same "strategy panic" message
 // runTransition produces, discriminated by the hook key.
+//
+// f is never nil: the caller skips this entirely when the strategy handed over no
+// budget, so "no verdict was reached" stays a panic rather than also meaning
+// "there was nothing to ask".
 //
 // The other two call sites (checkLimit and meter) run inside runTransition and
 // are already covered. Wrapping them here too would not add protection; it would

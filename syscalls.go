@@ -307,8 +307,10 @@ type syscalls struct {
 	// this run's share is folded on any successful Apply, D44).
 	runMetrics Metrics
 
-	// limiter is this Process's Strategy.Limit, handed over by the worker from the
-	// binding it already resolved. Always non-nil: Strategy requires the method.
+	// limiter is what this Process's Strategy.Limiter returned, handed over by the
+	// worker from the binding it already resolved. nil means the strategy said it
+	// has no budget, and then nothing here calls anything: limit keeps its zero
+	// value, which reads as a pass.
 	limiter Limiter
 
 	// limit is limiter's latest verdict: seeded with the transition boundary's,
@@ -370,8 +372,13 @@ func (s *syscalls) LimitStatus() LimitDecision { return s.limit }
 // A stored refusal therefore means "Limit is refusing", not "this Process
 // has stopped" — the same thing it means after checkLimit refused and a strategy
 // chose to carry on.
+// A nil limiter skips the re-evaluation but never the metering: Metrics() must
+// report what the effect spent whether or not anyone set a budget.
 func (s *syscalls) meter(ctx context.Context, m Metrics) {
 	s.runMetrics = s.runMetrics.add(m)
+	if s.limiter == nil {
+		return
+	}
 	s.limit = s.limiter(ctx, s.proc, s.Metrics())
 }
 
@@ -403,11 +410,16 @@ func (s *syscalls) ec() EffectContext {
 		StateSeq: s.seq, Attempt: s.Attempt(), Metadata: s.Metadata(), Limit: s.limit}
 }
 
-// checkLimit runs Limit with the live snapshot (committed + this run) and
+// checkLimit runs the limiter with the live snapshot (committed + this run) and
 // refuses the effect if it says so. Like meter, it stores the verdict whichever
 // way it goes: a strategy that catches ErrLimitExceeded and carries on can then
 // read the reason off LimitStatus() instead of parsing the error's text.
+//
+// A nil limiter never refuses, so there is nothing to call and nothing to store.
 func (s *syscalls) checkLimit(ctx context.Context) error {
+	if s.limiter == nil {
+		return nil
+	}
 	d := s.limiter(ctx, s.proc, s.Metrics())
 	s.limit = d
 	if d.Kind() == LimitKindStop {
