@@ -3,7 +3,7 @@ module github.com/gollem-dev/agentkit
 go 1.26.0
 
 require (
-	github.com/gollem-dev/gollem v0.28.2
+	github.com/gollem-dev/gollem v0.28.3
 	github.com/google/uuid v1.6.0
 	github.com/m-mizutani/goerr/v2 v2.0.1
 	github.com/m-mizutani/gt v0.2.1
