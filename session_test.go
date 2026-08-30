@@ -1940,3 +1940,29 @@ func TestConversationClosedWhenUnknowable(t *testing.T) {
 		gt.Bool(t, k.ConversationClosedForTest(ctx, store, "p1", ref)).True()
 	})
 }
+
+// --- the resolved model name -------------------------------------------------
+
+// The managed conversation hands back the GenerateResult it got from
+// Syscalls.Generate untouched, taking only History out of it, so the resolved
+// model name reaches a strategy that goes through Session() as well as one
+// calling Generate directly.
+func TestSessionGenerateCarriesResolvedModel(t *testing.T) {
+	hs := histmem.New()
+	model := namedClient{LLMClient: growingLLM(), name: "session-m"}
+
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		res, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte(res.Model)), nil
+	}
+
+	k, repo, ag := registerWithHistory(t, step, model, hs)
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("session-m")
+}

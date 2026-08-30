@@ -762,6 +762,94 @@ func TestGenerateMiddlewareUnknownRoleFallsBack(t *testing.T) {
 	gt.Value(t, *count).Equal(1)
 }
 
+// A middleware reads the model a call actually resolved to off the result of
+// next — including when the middleware itself is what chose the role, since
+// resolution happens inside generateBase, below every middleware.
+func TestGenerateMiddlewareSeesResolvedModel(t *testing.T) {
+	planner := agentkit.DefineModelRole("planner")
+	unregistered := agentkit.DefineModelRole("unregistered")
+
+	run := func(t *testing.T, rewrite agentkit.ModelRole) string {
+		t.Helper()
+		defaultModel, _ := namedLLM("default-m", textResponse("ok"))
+		roleModel, _ := namedLLM("role-m", textResponse("ok"))
+		rec := &recorder{}
+
+		mw := func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+			return func(c context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+				if rewrite != nil {
+					req.Role = rewrite
+				}
+				res, err := next(c, req)
+				if err == nil {
+					rec.add(res.Model)
+				}
+				return res, err
+			}
+		}
+		step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+			if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			return st, agentkit.Done([]byte("ok")), nil
+		}
+
+		k, repo, ag := setupScript(t, step, defaultModel,
+			agentkit.WithModelRole(planner, roleModel), agentkit.WithGenerateMiddleware(mw))
+		pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+		gt.NoError(t, err)
+		p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+		seen := rec.snapshot()
+		gt.Array(t, seen).Length(1)
+		return seen[0]
+	}
+
+	t.Run("no rewrite reports the default model", func(t *testing.T) {
+		gt.Value(t, run(t, nil)).Equal("default-m")
+	})
+	t.Run("a rewrite reports the role the middleware chose", func(t *testing.T) {
+		gt.Value(t, run(t, planner)).Equal("role-m")
+	})
+	// Same fallback as resolveModel itself: an unregistered role is the default
+	// model, and the reported name says so rather than naming the role.
+	t.Run("an unregistered role reports the default model", func(t *testing.T) {
+		gt.Value(t, run(t, unregistered)).Equal("default-m")
+	})
+}
+
+// The kernel neither inspects nor rewrites a result a middleware built itself,
+// so a middleware that answers without calling next reports the model name it
+// chose — no client was resolved at all.
+func TestGenerateMiddlewareResultModelIsNotOverwritten(t *testing.T) {
+	model, count := namedLLM("real-m", textResponse("ok"))
+	// History is left out only because setupScript registers the agent without a
+	// HistoryStore, so nothing reads it. A short-circuiting middleware on an agent
+	// using Session() has to echo req.History back, or the managed conversation
+	// commits an empty version (see observability.md).
+	mw := func(agentkit.GenerateHandler) agentkit.GenerateHandler {
+		return func(context.Context, *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+			return &agentkit.GenerateResult{Texts: []string{"stubbed"}, Model: "cache-m"}, nil
+		}
+	}
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		res, err := sys.Generate(c, []gollem.Input{gollem.Text("go")})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte(res.Model)), nil
+	}
+
+	k, repo, ag := setupScript(t, step, model, agentkit.WithGenerateMiddleware(mw))
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("cache-m")
+	gt.Value(t, *count).Equal(0)
+}
+
 // E4: calling next twice charges twice.
 func TestGenerateMiddlewareRetriesNext(t *testing.T) {
 	ctx := context.Background()

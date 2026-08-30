@@ -504,6 +504,51 @@ outcome — `nil` when the transition committed, non-nil otherwise. Its scope is
 the *transition*, not the child, and it runs after the commit, outside it, so a
 panic in it is recovered and logged rather than becoming a transition error.
 
+### Which model a generate ran against
+
+`GenerateRequest.Role` names the *role*, not the model — a `ModelRole` is a
+pointer identity whose `String()` is a display name, and the kernel resolves it
+to a client on every call. A middleware that meters or prices a run needs the
+other half, and cannot get it from the request.
+
+`GenerateResult.Model` carries it. The kernel fills it from the client the call
+actually resolved to, after every middleware has had its chance to rewrite
+`Role`, so it reports what ran rather than what was asked for:
+
+```go
+agentkit.WithGenerateMiddleware(func(next agentkit.GenerateHandler) agentkit.GenerateHandler {
+    return func(ctx context.Context, req *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
+        res, err := next(ctx, req)
+        if err == nil {
+            meter(res.Model, res.InputTokens, res.OutputTokens)
+        }
+        return res, err
+    }
+})
+```
+
+The value is the name the client was **configured** with, not a model id the
+provider's response may report: a price table is keyed by the configured name,
+and an alias resolving to a dated snapshot would turn a startup-time
+configuration check into a lookup failure in the middle of a run.
+
+It is **empty when the client reports no name**. `gollem.ModelNamer` is
+optional, and a client that does not implement it — a custom one, or gollem's
+own mock — reports nothing; agentkit substitutes nothing for it. Empty means
+"this client does not say", not "unknown model" in any stronger sense, so keep
+whatever fallback you already had rather than treating it as an error. A
+middleware that answers without calling `next` fills the field itself: the
+kernel does not touch a result it did not build.
+
+That last case owes the rest of the result too, and `History` is the field with
+teeth. On an agent using `Syscalls.Session()`, the managed conversation assigns
+`res.History` to its working copy and marks the transition dirty, so a result
+returned without one saves an empty version and the commit publishes it — the
+conversation is gone, and a `Session().CallTool` later in the same transition
+reports `ErrInvalidRequest`. A short-circuiting middleware that may run for such
+an agent should return `req.History` (what the request carried in) alongside
+whatever it synthesised.
+
 ## Choosing
 
 - **A durable audit record that must exist before an action happens** → inside
