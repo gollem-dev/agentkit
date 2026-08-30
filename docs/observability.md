@@ -540,6 +540,15 @@ whatever fallback you already had rather than treating it as an error. A
 middleware that answers without calling `next` fills the field itself: the
 kernel does not touch a result it did not build.
 
+That last case owes the rest of the result too, and `History` is the field with
+teeth. On an agent using `Syscalls.Session()`, the managed conversation assigns
+`res.History` to its working copy and marks the transition dirty, so a result
+returned without one saves an empty version and the commit publishes it — the
+conversation is gone, and a `Session().CallTool` later in the same transition
+reports `ErrInvalidRequest`. A short-circuiting middleware that may run for such
+an agent should return `req.History` (what the request carried in) alongside
+whatever it synthesised.
+
 ## Choosing
 
 - **A durable audit record that must exist before an action happens** → inside

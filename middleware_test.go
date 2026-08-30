@@ -824,6 +824,10 @@ func TestGenerateMiddlewareSeesResolvedModel(t *testing.T) {
 // chose — no client was resolved at all.
 func TestGenerateMiddlewareResultModelIsNotOverwritten(t *testing.T) {
 	model, count := namedLLM("real-m", textResponse("ok"))
+	// History is left out only because setupScript registers the agent without a
+	// HistoryStore, so nothing reads it. A short-circuiting middleware on an agent
+	// using Session() has to echo req.History back, or the managed conversation
+	// commits an empty version (see observability.md).
 	mw := func(agentkit.GenerateHandler) agentkit.GenerateHandler {
 		return func(context.Context, *agentkit.GenerateRequest) (*agentkit.GenerateResult, error) {
 			return &agentkit.GenerateResult{Texts: []string{"stubbed"}, Model: "cache-m"}, nil
