@@ -1,7 +1,7 @@
 # agentkit
 
 <p align="center">
-  <img src="docs/images/arch.png" alt="agentkit architecture" width="800">
+  <img src="docs/images/arch.png" alt="agentkit architecture" >
 </p>
 
 A general-purpose, crash-resilient runtime for LLM agents in Go.
