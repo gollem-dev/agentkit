@@ -106,7 +106,9 @@ metering and limiting have no path around them.
 
 `Generate` returns a `GenerateResult` rather than a raw gollem response, because
 it carries the conversation `History` in a form you can fold into your
-checkpointed state.
+checkpointed state. It also reports the model the call resolved to, empty when
+that client does not say —
+[which model a generate ran against](observability.md#which-model-a-generate-ran-against).
 
 `Now()` is the kernel's clock (injectable for tests via `WithClock`). It is
 **not** deterministic across a replay.

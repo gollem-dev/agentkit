@@ -3,6 +3,7 @@ package agentkit_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -567,5 +568,207 @@ func TestGenerateBasePropagatesCacheTokenBreakdown(t *testing.T) {
 	gt.Value(t, p.Metrics).Equal(agentkit.Metrics{
 		InputTokens: 11, OutputTokens: 13, CacheReadInputTokens: 19, CacheCreationInputTokens: 17,
 		LLMCalls: 1, Steps: 1,
+	})
+}
+
+// --- the resolved model name -------------------------------------------------
+
+// namedClient adds a Model() to an LLMClient so a test can exercise the
+// gollem.ModelNamer path. gollem's own mock.LLMClientMock deliberately does not
+// implement it, which is what keeps the "reports no name" path exercised
+// everywhere else in this suite.
+type namedClient struct {
+	gollem.LLMClient
+	name string
+}
+
+func (c namedClient) Model() string { return c.name }
+
+var _ gollem.ModelNamer = namedClient{}
+
+// namedLLM is mockLLM with a reported model name.
+func namedLLM(name string, responses ...*gollem.Response) (gollem.LLMClient, *int) {
+	client, count := mockLLM(responses...)
+	return namedClient{LLMClient: client, name: name}, count
+}
+
+// modelReport smuggles the GenerateResult.Model of every Generate a step ran out
+// through Process.Output, since the kernel persists the value nowhere itself.
+type modelReport struct {
+	Models []string `json:"models"`
+}
+
+// reportModels runs one Step that calls Generate once per entry in calls, with
+// that entry's options, and returns the Model each result carried.
+func reportModels(t *testing.T, model gollem.LLMClient, calls [][]agentkit.GenerateOption,
+	kopts ...agentkit.KernelOption) []string {
+	t.Helper()
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		rep := modelReport{Models: []string{}}
+		for _, opts := range calls {
+			res, err := sys.Generate(c, []gollem.Input{gollem.Text(st.Seed)}, opts...)
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			rep.Models = append(rep.Models, res.Model)
+		}
+		out, err := json.Marshal(rep)
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done(out), nil
+	}
+
+	k, repo, ag := setupScript(t, step, model, kopts...)
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "hello"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	var got modelReport
+	gt.NoError(t, json.Unmarshal(p.Output, &got))
+	return got.Models
+}
+
+func TestGenerateResultReportsTheResolvedModel(t *testing.T) {
+	one := [][]agentkit.GenerateOption{nil}
+
+	t.Run("a client that reports a name", func(t *testing.T) {
+		model, _ := namedLLM("claude-test-1", textResponse("ok"))
+		gt.Value(t, reportModels(t, model, one)).Equal([]string{"claude-test-1"})
+	})
+
+	// The whole point of the gollem interface being optional: a client that
+	// cannot report a name still generates, and the caller keeps its own fallback.
+	t.Run("a client that does not implement ModelNamer", func(t *testing.T) {
+		model, _ := mockLLM(textResponse("ok"))
+		gt.Value(t, reportModels(t, model, one)).Equal([]string{""})
+	})
+
+	// Not substituted with a placeholder: gollem reports an explicitly empty name
+	// verbatim, and the caller's branch is the same either way.
+	t.Run("a client that reports an empty name", func(t *testing.T) {
+		model, _ := namedLLM("", textResponse("ok"))
+		gt.Value(t, reportModels(t, model, one)).Equal([]string{""})
+	})
+}
+
+// Each Generate resolves its own role, so two calls in one transition report
+// whichever client each of them actually reached.
+func TestGenerateResultModelFollowsTheRolePerCall(t *testing.T) {
+	defaultModel, _ := namedLLM("default-m", textResponse("ok"))
+	roleModel, _ := namedLLM("role-m", textResponse("ok"))
+	planner := agentkit.DefineModelRole("planner")
+
+	got := reportModels(t, defaultModel,
+		[][]agentkit.GenerateOption{nil, {agentkit.WithRole(planner)}},
+		agentkit.WithModelRole(planner, roleModel))
+	gt.Value(t, got).Equal([]string{"default-m", "role-m"})
+}
+
+// The name is filled on the success path only: a Generate that fails returns no
+// result at all, rather than a half-built one carrying the model it was about to
+// call.
+func TestGenerateResultAbsentWhenGenerateFails(t *testing.T) {
+	model := namedClient{
+		LLMClient: &mock.LLMClientMock{
+			NewSessionFunc: func(context.Context, ...gollem.SessionOption) (gollem.Session, error) {
+				return nil, errors.New("no session")
+			},
+		},
+		name: "never-reported",
+	}
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		res, err := sys.Generate(c, []gollem.Input{gollem.Text(st.Seed)})
+		if err == nil {
+			return st, agentkit.Decision[[]byte]{}, errors.New("expected Generate to fail")
+		}
+		if res != nil {
+			return st, agentkit.Decision[[]byte]{}, errors.New("expected no result alongside the error")
+		}
+		return st, agentkit.Done([]byte("no result")), nil
+	}
+
+	k, repo, ag := setupScript(t, step, model)
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "hello"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("no result")
+}
+
+// modelAndTokens pins that inserting Model between the token counters and
+// History left every counter mapped to the field it was mapped to before.
+type modelAndTokens struct {
+	Model                    string `json:"model"`
+	InputTokens              int    `json:"input_tokens"`
+	OutputTokens             int    `json:"output_tokens"`
+	CacheReadInputTokens     int    `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int    `json:"cache_creation_input_tokens"`
+}
+
+func TestGenerateResultCarriesModelAlongsideTokenCounters(t *testing.T) {
+	model, _ := namedLLM("claude-test-1", &gollem.Response{
+		Texts:                   []string{"ok"},
+		InputToken:              11,
+		OutputToken:             13,
+		CacheCreationInputToken: 17,
+		CacheReadInputToken:     19,
+	})
+
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		res, err := sys.Generate(c, []gollem.Input{gollem.Text(st.Seed)})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		out, err := json.Marshal(modelAndTokens{
+			Model:                    res.Model,
+			InputTokens:              res.InputTokens,
+			OutputTokens:             res.OutputTokens,
+			CacheReadInputTokens:     res.CacheReadInputTokens,
+			CacheCreationInputTokens: res.CacheCreationInputTokens,
+		})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done(out), nil
+	}
+
+	k, repo, ag := setupScript(t, step, model)
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "hello"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	var got modelAndTokens
+	gt.NoError(t, json.Unmarshal(p.Output, &got))
+	gt.Value(t, got).Equal(modelAndTokens{
+		Model: "claude-test-1", InputTokens: 11, OutputTokens: 13,
+		CacheReadInputTokens: 19, CacheCreationInputTokens: 17,
+	})
+}
+
+// A strategy may fold a GenerateResult into its checkpointed state, so the new
+// field has to survive a round trip and stay out of the encoding when it is
+// empty — that is what keeps state written by an older build readable.
+func TestGenerateResultModelJSONRoundTrip(t *testing.T) {
+	t.Run("a name is carried under model", func(t *testing.T) {
+		b, err := json.Marshal(&agentkit.GenerateResult{Model: "claude-test-1"})
+		gt.NoError(t, err)
+		gt.String(t, string(b)).Contains(`"model":"claude-test-1"`)
+
+		var back agentkit.GenerateResult
+		gt.NoError(t, json.Unmarshal(b, &back))
+		gt.Value(t, back.Model).Equal("claude-test-1")
+	})
+
+	t.Run("an empty name is omitted", func(t *testing.T) {
+		b, err := json.Marshal(&agentkit.GenerateResult{})
+		gt.NoError(t, err)
+		gt.String(t, string(b)).NotContains(`"model"`)
+
+		var back agentkit.GenerateResult
+		gt.NoError(t, json.Unmarshal(b, &back))
+		gt.Value(t, back.Model).Equal("")
 	})
 }

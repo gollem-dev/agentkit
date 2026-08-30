@@ -101,7 +101,18 @@ type GenerateResult struct {
 	OutputTokens             int                    `json:"output_tokens"`
 	CacheReadInputTokens     int                    `json:"cache_read_input_tokens,omitempty"`
 	CacheCreationInputTokens int                    `json:"cache_creation_input_tokens,omitempty"`
-	History                  *gollem.History        `json:"history"` // session history after the call (save it, pass it next time).
+	// Model is what the client this generate's role resolved to reports itself
+	// as, empty when that client reports none — it does not implement
+	// gollem.ModelNamer, or it reports an empty name. It lets a middleware
+	// record what a generation ran against without mirroring the caller's own
+	// role-to-client configuration, which is invisible when it drifts.
+	//
+	// It is the name the client was CONFIGURED with, not a model id an API
+	// response may report: a caller pricing a call keys its table by the name it
+	// configured, and an alias resolving to a dated snapshot would turn a
+	// startup-time check into a mid-run lookup failure.
+	Model   string          `json:"model,omitempty"`
+	History *gollem.History `json:"history"` // session history after the call (save it, pass it next time).
 }
 
 // GenerateOption configures a Generate. Only input is required (D26). The
@@ -436,6 +447,13 @@ func (s *syscalls) generateBase(ctx context.Context, req *GenerateRequest) (*Gen
 		return nil, err
 	}
 	client := s.k.resolveModel(req.Role)
+	// Optional in gollem: a client that does not implement it — a custom one, or
+	// gollem's own mock — reports no name, and a caller keeps whatever fallback
+	// it already had rather than being handed an invented one.
+	var model string
+	if n, ok := client.(gollem.ModelNamer); ok {
+		model = n.Model()
+	}
 	session, err := client.NewSession(ctx, req.sessionOptions()...)
 	if err != nil {
 		return nil, goerr.Wrap(err, "new session")
@@ -456,6 +474,7 @@ func (s *syscalls) generateBase(ctx context.Context, req *GenerateRequest) (*Gen
 		OutputTokens:             resp.OutputToken,
 		CacheReadInputTokens:     resp.CacheReadInputToken,
 		CacheCreationInputTokens: resp.CacheCreationInputToken,
+		Model:                    model,
 		History:                  hist,
 	}
 	s.meter(ctx, Metrics{
