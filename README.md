@@ -1,217 +1,276 @@
 # agentkit
 
-<p align="center">
-  <img src="docs/images/arch.png" alt="agentkit architecture" >
-</p>
-
-A general-purpose, crash-resilient runtime for LLM agents in Go.
+A durable runtime for long-running LLM agents in Go.
 
 An agent loop is easy to write and hard to *operate*. The usual one keeps the
 whole run — conversation, tool results, "waiting for the user to click approve" —
 in the memory of one process, so a deploy, a crash, or a scale-in ends it. There
 is nothing to resume, because nothing was ever written down.
 
-`agentkit` runs that same loop as a **durable state machine**. Every transition
-is checkpointed into your store before the next one starts, and any worker in
-any process can pick a run up from its last checkpoint. It is built on
-[gollem](https://github.com/gollem-dev/gollem) for the LLM client and tool
-abstractions, and stays deliberately small: the kernel is a state machine, a
-lease, and a wait queue — nothing more.
+`agentkit` stores each run as a durable `Process`. A worker claims it and
+executes transitions one at a time, committing each before starting the next,
+then releases the run; any worker can continue from the last committed
+transition — after a crash, a deploy, or a wait that lasted a day. It is built on [gollem](https://github.com/gollem-dev/gollem) for
+the LLM client and tool abstractions, and stays deliberately small: the kernel is
+a state machine, a lease, and a wait queue — nothing more.
 
-## Features
+## Is agentkit for you?
 
-- **Checkpointed execution** — a run is a `Process` whose state is committed to
-  the store after every transition, and resumed from there by any worker.
-- **Durable waits** — `Suspend` parks a run on an await: a question for a human,
-  a timer, or a set of child processes. Nothing is held open while it waits.
-- **Multi-worker execution** — `Serve` claims runs with a lease and commits with
-  a `Rev` CAS, so any number of workers on any number of hosts is safe.
+Use it when:
+
+- a run must survive a deploy, a crash, or a scale-in;
+- a run may wait minutes or days for a human, a timer, or a child process;
+- several worker processes, on several hosts, execute from the same store;
+- token and tool usage must be measured and bounded per run.
+
+You probably do not need it when the agent finishes inside one request and losing
+an in-progress run is acceptable. An in-memory loop is less machinery, and it is
+the right answer until a run outlives the process holding it.
+
+## Try it
+
+The bundled quickstart needs no credentials: with no model configured, the LLM is
+a stub replaying a script.
+
+```bash
+git clone https://github.com/gollem-dev/agentkit
+cd agentkit/examples
+go run ./quickstart
+```
+
+```
+model:   scripted stub (set GEMINI_PROJECT_ID and GEMINI_LOCATION to run against Vertex AI)
+spawned: 01a050c2-c09b-7918-bca4-1e468f5c1fdf
+status:  succeeded
+answer:  A durable agent runtime checkpoints an agent after every step, so a crash resumes the work instead of restarting it. The state lives in a store rather than in one process's memory, so any worker can pick it up.
+metrics: llm_calls=1 input_tokens=64 output_tokens=16
+```
+
+It registers an agent, writes a `Process`, runs a worker until that `Process`
+finishes, and prints the persisted result with its usage. Six more programs in
+[examples/](./examples/) cover tools, human input, crash recovery, parallel
+children, middleware and tracing.
+
+## What it provides
+
+- **Crash recovery** — every transition is committed to your store before the
+  next one starts, and any worker resumes from the last checkpoint.
+- **Durable waits** — a run parks on a question, a timer, or a set of children
+  without holding a goroutine, a connection, or a worker.
+- **Multi-worker execution** — workers claim persisted runs under a lease, and a
+  worker that lost its lease cannot commit, so any number of workers on any
+  number of hosts can share one store.
 - **Child processes** — a strategy spawns children and waits for their results;
   the children and the parent's new state commit in one atomic write.
-- **Usage metering and limits** — token and tool usage accumulates on the
-  `Process`, and each strategy's `Limit` decides when a run has had enough — or tells the
-  agent the budget is nearly gone and lets it finish on its own terms.
-- **Idempotent spawning** — an idempotency key or a `subject` prevents a retried
-  request from starting a second run.
-- **Middleware** — a `next`-chain around `Init`, `Step`, `Generate`, `CallTool`
-  and `SpawnChild`, registered once on the `Kernel`: audit, tracing, redaction,
-  retry, tool policy. A middleware can also refuse a call by not calling `next`.
-- **Pluggable persistence** — `Repository` is a small SPI you implement over your
-  own store; `repository/repotest` is its contract as a runnable test suite.
-- **Typed API** — `Register` returns an `Agent[I]`, so inputs are checked at
-  compile time and `any` never appears in the public API.
-- **Strategies included** — `strategy/simple` (LLM loop) and `strategy/planexec`
-  (plan → parallel children → replan → finalize).
+- **Usage metering and limits** — token, tool, step and spawn usage accumulates
+  on the `Process`, and a strategy's `Limit` decides when a run has had enough —
+  or tells the agent the budget is nearly gone and lets it finish on its own terms.
+- **Middleware** — one registration wraps every agent's transitions and effects:
+  audit, tracing, redaction, retry, tool policy.
 
-### Why not an in-memory loop?
+## How it works
 
-An in-memory loop is fine until a run outlives the process holding it: a deploy,
-a ten-minute LLM step, a human who answers tomorrow. Then you need the run
-written down, resumable, and safe for several workers to share — which is what
-this is. If your agent finishes inside one request and losing it is acceptable,
-you do not need any of that.
+<p align="center">
+  <img src="docs/images/arch.png" alt="agentkit architecture" >
+</p>
 
-## Quick start
+The shape of a run, not every edge of it: retries, cancellation from `pending`
+and the rest of the lifecycle are in [docs/concepts.md](./docs/concepts.md).
 
-Agents fit awkwardly into request/response because they are slower than a
-request. So keep the HTTP tier stateless: it only *starts* runs and *reads*
-them, while workers do the work elsewhere.
+| Term | What it is |
+|---|---|
+| **Process** | one agent run — its state, status, metrics and lease, all in the store |
+| **Strategy** | your code: what one transition does |
+| **Kernel** | creates and reads Processes, and runs the workers that execute them |
+| **Repository** | the storage behind all of it: state, awaits, events, leases |
+
+A worker does the same five things on every transition:
+
+1. **Claim** a `pending` Process — or a `waiting` one whose timer is due.
+2. **Decode** the state the previous transition committed.
+3. **Run one `Step`.** It reaches the model, the tools and its children through
+   `Syscalls` (`Generate`, `CallTool`, `SpawnChild`, `Await`, `Emit`, `Metrics`,
+   `Now`), which is where metering and limits are applied.
+4. **Commit** the new state, the decision, emitted events, declared awaits and
+   spawned children in a single atomic write.
+5. **Continue, suspend, succeed or fail.** A `Continue` runs the next transition
+   under the same claim, up to `WithMaxStepsPerClaim` of them (16 by default);
+   then the run goes back to `pending` for any worker to pick up.
+
+A `Strategy[S, I, O]` names the three types that cross that boundary:
+
+- `S` — the state persisted after each transition;
+- `I` — the typed input `Spawn` accepts;
+- `O` — the output persisted when the run succeeds.
+
+Because a `Step` is the unit that gets checkpointed, "how much work per `Step`"
+is the main design decision you make. Serialization stays yours: the kernel
+stores the bytes your `EncodeState` and `EncodeOutput` produce, and never looks
+inside them. Concepts in full: [docs/concepts.md](./docs/concepts.md). Writing
+your own strategy: [docs/writing-strategies.md](./docs/writing-strategies.md).
+
+## Execution guarantees
+
+Durability is not exactly-once. An LLM is non-deterministic, so `agentkit`
+refuses to pretend replay is.
+
+**Guaranteed**
+
+- a committed transition is never lost;
+- one transition commits atomically — state, awaits, events, spawned children
+  and metrics land in a single write, all of it or none.
+
+That is the whole list.
+
+**At-least-once, with a non-deterministic replay**
+
+- a transition that crashes before committing is re-run from the last committed
+  state;
+- the LLM and tool calls it already made may run again (an LLM re-charge is
+  accepted), and the re-run may take a different path;
+- once a lease expires, the run can be claimed again while the original worker
+  is still alive, so two workers may execute the same transition. Only one of
+  them can commit: a fresh `LeaseToken` per claim and a `Rev` compare-and-set
+  fence out the worker that lost its lease.
+
+**Your responsibility**
+
+- a side-effecting tool must be **idempotent**;
+- authorization is enforced inside the tool, never by asking a human first;
+- a `Repository` you implement must satisfy the contract the kernel relies on.
+
+There is no effect journal, no operation label, and no deterministic clock — a
+worker just re-executes `Step` from the checkpoint. For exactly-once effects,
+commit the decision to state first and execute it in the next transition. Read
+[docs/execution-model.md](./docs/execution-model.md) before writing a tool that
+touches the outside world; it is short, and it is the part people get wrong.
+
+## Minimal integration
+
+Every agentkit application has the same four parts: **register → construct →
+spawn → serve.**
+
+```bash
+go get github.com/gollem-dev/agentkit
+```
 
 ```go
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
-	"net/http"
+	"fmt"
+	"log"
+	"os"
+	"time"
 
 	"github.com/gollem-dev/agentkit"
 	"github.com/gollem-dev/agentkit/repository/memory"
 	"github.com/gollem-dev/agentkit/strategy/simple"
+	"github.com/gollem-dev/gollem/llm/claude"
 )
 
-func newAPI(kernel *agentkit.Kernel, assistant agentkit.Agent[simple.Input]) http.Handler {
-	mux := http.NewServeMux()
-
-	// Start a run. Returns in milliseconds: Spawn only writes a pending Process.
-	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Prompt string `json:"prompt"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-
-		// A retried POST must not start a second run.
-		var opts []agentkit.SpawnOption
-		if key := r.Header.Get("Idempotency-Key"); key != "" {
-			opts = append(opts, agentkit.WithIdempotencyKey(key))
-		}
-
-		pid, err := assistant.Spawn(r.Context(), kernel, simple.Input{Prompt: req.Prompt}, opts...)
-		if err != nil {
-			http.Error(w, "spawn failed", http.StatusInternalServerError)
-			return
-		}
-		writeJSON(w, map[string]string{"id": string(pid)})
-	})
-
-	// Read a run. Any replica can answer this — the state is in the Repository,
-	// not in the replica that happened to accept the POST.
-	mux.HandleFunc("GET /jobs/{id}", func(w http.ResponseWriter, r *http.Request) {
-		proc, err := kernel.GetProcess(r.Context(), agentkit.ProcessID(r.PathValue("id")))
-		if errors.Is(err, agentkit.ErrProcessNotFound) {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		} else if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-
-		res := map[string]any{"status": string(proc.Status)}
-		if proc.Status == agentkit.ProcessSucceeded {
-			var out simple.Output // the strategy owns this format; the kernel stored bytes
-			if err := json.Unmarshal(proc.Output, &out); err != nil {
-				http.Error(w, "internal error", http.StatusInternalServerError)
-				return
-			}
-			res["texts"] = out.Texts
-		}
-		writeJSON(w, res)
-	})
-
-	return mux
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
-}
-```
-
-Wiring it up — here the API and one worker share a binary, which is fine for
-development. In production they are separate deployments pointing at the same
-`Repository`; nothing else changes.
-
-```go
 func main() {
 	ctx := context.Background()
-	client, err := claude.New(ctx, "...api key...") // any gollem LLM client
+
+	client, err := claude.New(ctx, os.Getenv("ANTHROPIC_API_KEY")) // any gollem LLM client
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
+	// 1. Register. The typed handle it returns is the only way to spawn this
+	//    agent, so the input type is checked at compile time.
 	reg := agentkit.NewRegistry()
-	assistant, err := simple.Register(reg, "assistant", 1) // -> agentkit.Agent[simple.Input]
+	assistant, err := simple.Register(reg, "assistant", 1)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	// memory.New() is for development. Swap in your own Repository (or
-	// repository/filesystem for a single local process) and the workers below
-	// can live on other hosts.
+	// 2. Construct the kernel: repository, default model, registry. memory.New()
+	//    keeps runs in this process — see "Persistence" below for the rest.
 	kernel, err := agentkit.New(memory.New(), client, reg)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
+	// 3. Spawn. This writes a pending Process and returns its id; nothing has
+	//    executed yet.
+	pid, err := assistant.Spawn(ctx, kernel, simple.Input{Prompt: "Summarize the news"})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 4. Serve. A deployment runs this in its own process, and in as many of them
+	//    as it likes. Here it runs in the background just long enough to finish
+	//    this one Process.
+	serveCtx, stop := context.WithCancel(ctx)
+	defer stop()
 	go func() {
-		// The worker loop: claim a runnable Process, run one transition, commit.
-		// Run it in as many processes as you like.
-		if err := kernel.Serve(ctx, agentkit.WithPollConcurrency(4)); err != nil {
-			panic(err)
+		if err := kernel.Serve(serveCtx); err != nil {
+			log.Print(err)
 		}
 	}()
 
-	_ = http.ListenAndServe(":8080", newAPI(kernel, assistant))
+	for {
+		proc, err := kernel.GetProcess(ctx, pid)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !proc.Status.Terminal() {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if proc.Status != agentkit.ProcessSucceeded {
+			log.Fatalf("run %s: %+v", proc.Status, proc.Failure)
+		}
+
+		var out simple.Output // the strategy owns this format; the kernel stored bytes
+		if err := json.Unmarshal(proc.Output, &out); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(out.Texts)
+		return
+	}
 }
 ```
 
-More in [docs/getting-started.md](./docs/getting-started.md).
+```bash
+ANTHROPIC_API_KEY=... go run .
+```
 
-## How it fits together
+This program prints the answer and exits. A real deployment keeps the same four
+parts but stops running them in one process: `Serve` moves into its own worker
+deployment, and the polling loop becomes whatever your application already uses
+to report on a job.
 
-The whole runtime is five moving parts, in the order you meet them:
+## Running behind an HTTP API
 
-1. **You write a `Strategy[S, I, O]`** — the agent's logic, cut into
-   transitions, over the state you checkpoint, the input that launches a run and
-   the output it produces. `Init` builds the initial state purely; each `Step`
-   makes *one* move and returns a `Decision[O]` (`Continue` / `Suspend` / `Done`
-   / `Fail`). Because a `Step` is the unit that gets checkpointed, "how much work
-   per `Step`" is the main design decision you make. `EncodeState`/`DecodeState`
-   and `EncodeOutput` are yours; the kernel only stores the resulting bytes and
-   never looks inside them.
-2. **`Register` hands back a typed `Agent[I]`** — the only way to spawn that
-   agent, so the input type is checked at compile time and `any` never reaches
-   the public API. `WithOnFinish` there wires a handler that receives the typed
-   `O` once a run's terminal state is committed; delivery is best-effort, so
-   anything that must not be lost belongs in a parent process instead
-   ([ADR-0014](docs/adr/0014-completion-handlers-are-best-effort.md)).
-3. **`Spawn` creates a `Process`** — one run, with its state, status, metrics and
-   lease living in the `Repository`. It is asynchronous: the row is written, the
-   id comes back, and nothing has executed yet.
-4. **`Serve` workers move Processes forward** — claim one, run a `Step`, commit
-   state + emitted events + declared waits + spawned children in a single atomic
-   write, repeat. A `Step` reaches the outside world only through **`Syscalls`**
-   (`Generate`, `CallTool`, `SpawnChild`, `Await`, `Emit`, `Metrics`, `Now`),
-   which is where metering and limits are applied.
-5. **`Suspend` parks the run on an `Await`** — a question for a human, a timer, or
-   a set of child processes. The `Process` leaves memory entirely and comes back
-   when the await is satisfied.
+Agents are slower than a request, so keep the HTTP tier stateless. It only
+creates and reads persisted Processes; workers execute them separately, through
+the same `Repository`.
 
-Around all of that, **middleware** wraps six points (`Claim`, `Init`, `Step`,
-`Generate`, `CallTool`, `SpawnChild`) — that is where a concern that spans every
-agent goes. `Claim` is the outermost: it brackets a worker's whole run on one
-`Process`, which is where a trace span or a per-claim resource belongs.
+```
+HTTP API (stateless)                    Worker (separate deployment)
+  POST /jobs      -> Agent.Spawn          Kernel.Serve
+  GET  /jobs/{id} -> Kernel.GetProcess
+```
 
-Concepts in full: [docs/concepts.md](./docs/concepts.md). Writing your own
-strategy: [docs/writing-strategies.md](./docs/writing-strategies.md).
+`Spawn` runs the strategy's `Init` and writes a `pending` row, then returns its
+id: no request is held open while the agent runs, and nothing has executed yet.
+`GetProcess` can be answered by any replica, because the state is in the
+`Repository` rather than in the replica that accepted the `POST`. Pass
+`agentkit.WithIdempotencyKey(...)` on `Spawn` so a retried `POST` does not start
+a second run.
+
+Working code: [examples/durable-worker](./examples/durable-worker) submits and
+executes in separate processes, and resumes a run whose worker was killed
+mid-transition.
 
 ## Waiting for a human
 
-This is the case a plain loop handles worst, so it is worth seeing end to end.
-The strategy suspends on a question instead of blocking:
+This is the case a plain loop handles worst. The strategy suspends on a question
+instead of blocking:
 
 ```go
 if !st.Confirmed {
@@ -220,133 +279,49 @@ if !st.Confirmed {
 ```
 
 The `Process` is now `waiting` and consumes nothing — no goroutine, no
-connection, no worker. Your application shows the pending question and delivers
-the answer whenever it arrives:
+connection, no worker. Any instance of your application can deliver the answer,
+whenever it arrives:
 
 ```go
 awaits, _ := kernel.ListAwaits(ctx, pid)          // what is this run waiting for?
 err := kernel.Respond(ctx, pid, "confirm", []byte("yes"), agentkit.WithRespondedBy("alice"))
 ```
 
-`Respond` commits the answer and makes the `Process` runnable again; the next
+`Respond` commits the answer and returns the `Process` to `pending`; the next
 worker to claim it re-enters `Step` with `Confirmed` set. The human may take an
 hour, and the process that asked may be long gone.
 
-> **This is confirmation, not enforcement.** A strategy that is buggy — or
-> steered by a prompt injection — can call `CallTool` without ever asking. If you
-> need a hard allow/deny gate, put it *inside the tool*: wrap what your
-> `ToolFactory` returns so an unauthorized call is refused in `Run`. The kernel
-> deliberately has no authorization concept
-> ([ADR-0008](docs/adr/0008-three-await-kinds-confirmation-is-a-question.md)).
-> A `ToolCall` middleware is the other chokepoint — see below.
-
-## Middleware
-
-Six points are wrapped by a `next`-chain, registered on the `Kernel`: `Claim`
-(one worker's whole run on a Process), `Init` and `Step` (the strategy boundary)
-and `Generate`, `CallTool` and `SpawnChild` (the effects). One registration
-covers every agent, which makes this the place for audit, tracing, redaction,
-retry and tool policy.
-
-`Claim` is the outermost, and the only one that brackets a stretch of real time
-on one worker rather than a single call into your code — so a trace span or a
-resource that must be released belongs there. See
-[examples/tracing](examples/tracing).
-
-An effect middleware is the outermost layer of its syscall — it wraps the
-`Limit` check, tool resolution and argument validation — so a refused call is
-visible to it too, and returning without calling `next` stops the call before
-any of them:
-
-```go
-kernel, _ := agentkit.New(repo, client, reg,
-	agentkit.WithToolCallMiddleware(func(next agentkit.ToolCallHandler) agentkit.ToolCallHandler {
-		return func(ctx context.Context, req *agentkit.ToolCallRequest) (map[string]any, error) {
-			if !allowed[req.Call.Name] {
-				audit(req.Effect, req.Call, "denied")
-				return nil, errDenied // next is never called: the tool does not run.
-			}
-			out, err := next(ctx, req)
-			audit(req.Effect, req.Call, err) // ErrLimitExceeded reaches here too.
-			return out, err
-		}
-	}),
-)
-```
-
-Effects run at least once, so a middleware fires on every execution including
-re-runs. Nothing it records is persisted by the framework; for an audit that
-must be durable *before* the action, record it inside the tool's `Run`.
-
-> Refusing a call is not an authorization gate. A middleware is a real
-> chokepoint for calls made through `Syscalls.CallTool`, but a strategy holding
-> a `gollem.Tool` value can call `Run` on it directly. Enforcement belongs
-> inside `Run`.
-
-`SpawnChild` is buffered into the transition commit, so its middleware gets
-`req.OnCommit(fn)` to learn whether the child was actually persisted.
-
-**A kernel middleware runs across all agents, so it does not know any
-strategy's input, state or output type.** The type-erased payloads are read with
-`InitInput[I]` / `StepState[S]` / `SpawnInput[I]` / `ResultState[S]` and
-replaced by deriving a new request (`NewInitRequest` and friends); `ok == false`
-just means "another agent's Process — pass it through". Passing `any` as the
-type argument always succeeds and is the intended form for generic logging.
-Nothing here is checked by the compiler: a wrong type surfaces as
-`ErrInvalidRequest` at run time. That is the nature of a cross-cutting layer, and
-it is why typed manipulation of a payload is better placed in the strategy's own
-`Init`.
-
-A `Decision` is the one payload with no `any` shortcut. It is boxed with a type
-witness so that a nil interface output is not lost across the boundary, which
-means `ResultDecision[O]` needs the agent's exact `O`; use `DecisionKindOf` to
-branch on continue/suspend/done/fail without naming it.
-
-See [ADR-0012](docs/adr/0012-kernel-hooks-are-composable-middleware.md) for why
-this replaced the observation-only `Observer` hooks, and
-[docs/observability.md](./docs/observability.md) for the audit and tracing
-recipes.
+> **This is confirmation, not enforcement.** A strategy that is buggy — or steered
+> by a prompt injection — can call a tool without ever asking. A hard allow/deny
+> gate belongs *inside the tool*: see [docs/tools.md](./docs/tools.md) and
+> [ADR-0008](docs/adr/0008-three-await-kinds-confirmation-is-a-question.md).
 
 ## Bundled strategies
 
-- **strategy/simple** — the LLM loop: generate, run tool calls, feed results
-  back, repeat until the model answers. One `Generate` per transition.
-- **strategy/planexec** — plan → run tasks as child processes in parallel →
-  replan → finalize. Generic over the task agent's input type:
-  `Register[T](reg, name, ver, taskAgent, makeInput, ...)`.
+- **[`strategy/simple`](./strategy/simple)** — an ordinary tool-calling loop:
+  generate, run the tool calls it asked for, feed the results back, repeat until
+  the model answers. One `Generate` per transition. Start here unless a run has
+  to divide its work into independent parts.
+- **[`strategy/planexec`](./strategy/planexec)** — plan, run the tasks as parallel
+  child processes, wait for them, replan, finalize. Use it when one run must
+  decompose the work and outlive the wait for its parts.
 
 Details in [docs/bundled-strategies.md](./docs/bundled-strategies.md).
 
-## Persistence (the `Repository` SPI)
+## Persistence
 
-`Repository` is the contract you implement to run agentkit on your store; the
-application never calls it directly. It needs no transaction mechanism — only
-atomic application of a `ChangeSet` and conditional writes:
+| Repository | Intended use |
+|---|---|
+| [`repository/memory`](./repository/memory) | tests, development, one-shot runs |
+| [`repository/filesystem`](./repository/filesystem) | one local process that must survive a restart |
 
-1. `Apply(cs)` is all-or-nothing.
-2. Each `cs.Processes` row is a `Rev` CAS (stored Rev must equal the row's Rev);
-   on success Rev is incremented. This fences stale-worker commits.
-3. `cs.Guards` are write-free `Rev` preconditions (used for the children
-   check-then-act).
-4. Uniqueness is maintained: `idempotency_key`, an open Process's `subject`, and
-   `(process_id, await_key)`. A violation writes nothing and returns
-   `ErrConflict`.
-5. `ClaimNextProcess` atomically claims one runnable Process, mints a fresh
-   `LeaseToken` on every claim (the fence identity), and never double-claims.
-6. `ListEvents` preserves append order.
+Neither runs on more than one host. A deployment with several workers supplies
+its own `Repository`: a small SPI over your store, which the application itself
+never calls. It needs no transaction mechanism — only an atomic `Apply` and
+conditional writes.
 
-An instance running `Serve` also dispatches a newly-runnable Process eagerly,
-in-process, instead of waiting for the next poll — a latency optimization only;
-polling remains the ground truth and the fallback
-([ADR-0016](docs/adr/0016-eager-dispatch-is-a-scheduling-optimization.md)).
-
-Two reference implementations are bundled:
-
-- **repository/memory** — in-process, for tests, development, and one-shot runs.
-- **repository/filesystem** — a single local process, one atomic `state.json`
-  snapshot (single-process only; not for multi-host workers).
-
-Verify your own against the contract with **repository/repotest**:
+Verify that implementation with **repository/repotest**, which is the contract as
+a runnable test suite:
 
 ```go
 func TestMyRepo(t *testing.T) {
@@ -354,39 +329,42 @@ func TestMyRepo(t *testing.T) {
 }
 ```
 
-More in [docs/persistence.md](./docs/persistence.md).
+What it checks — atomic apply, `Rev` compare-and-set, read-only guards,
+uniqueness, claiming and lease tokens, event order, deep copies, field
+round-trips — is spelled out in [docs/persistence.md](./docs/persistence.md).
 
-## What is *not* guaranteed
+## Middleware
 
-Durability is not exactly-once. An LLM is non-deterministic, so `agentkit`
-refuses to pretend replay is:
+One registration on the `Kernel` wraps every agent at six points (`Claim`,
+`Init`, `Step`, `Generate`, `CallTool`, `SpawnChild`). That makes it the place
+for a concern that spans every agent: tracing and metrics, audit logging,
+redaction, retry, tool policy. A middleware can also refuse a call by returning
+without calling `next`.
 
-- **Guaranteed:** a committed transition is never lost, and one transition
-  commits atomically.
-- **At-least-once, non-deterministic replay:** a transition that crashes before
-  committing is re-run from the last committed state. LLM and tool calls may run
-  again (an LLM re-charge is accepted), and the re-run may take a different path.
-- **Your responsibility:** a side-effecting tool must be **idempotent**. For
-  exactly-once effects, commit the decision to state first and execute it in the
-  next transition.
+Two things to know before relying on it. A middleware runs again whenever a
+transition is replayed, and agentkit persists nothing it records — an audit that
+must be durable *before* the action belongs inside the tool's `Run`. And refusing
+a call is not an authorization gate: it is a chokepoint for calls made through
+`Syscalls.CallTool`, while a strategy holding a `gollem.Tool` value can call
+`Run` on it directly.
 
-There is no effect journal, no operation label, and no deterministic clock — a
-worker just re-executes `Step` from the checkpoint. Read
-[docs/execution-model.md](./docs/execution-model.md) before you write a tool that
-touches the outside world; it is short and it is the part people get wrong.
+Middleware points, typed access to a request's payload, and tracing recipes:
+[docs/observability.md](./docs/observability.md). Why this replaced the
+observation-only hooks:
+[ADR-0012](docs/adr/0012-kernel-hooks-are-composable-middleware.md).
 
-## Documentation
+## Where to go next
 
-- [examples/](./examples/) — seven runnable programs, one per idea. They are a
-  separate module, so the LLM SDK they need stays out of this one's dependency
-  graph, and they work offline: `cd examples && go run ./quickstart` needs no
-  credentials.
-- [docs/](./docs/) — guides: execution model, getting started, concepts, writing
-  strategies, tools, persistence, observability.
-- [docs/design/](./docs/design/) — architecture, process lifecycle, consistency
-  model, responsibility boundaries.
-- [docs/adr/](./docs/adr/) — the decisions behind the design, and what was
-  rejected.
+- **Run your first agent** — [docs/getting-started.md](./docs/getting-started.md)
+- **Understand Process, Strategy, Kernel and Await** — [docs/concepts.md](./docs/concepts.md)
+- **Write your own strategy** — [docs/writing-strategies.md](./docs/writing-strategies.md)
+- **Give an agent tools that survive a replay** — [docs/tools.md](./docs/tools.md)
+- **Keep runs in your own store** — [docs/persistence.md](./docs/persistence.md)
+- **Add tracing, audit and limits** — [docs/observability.md](./docs/observability.md)
+- **Know exactly what replay does and does not promise** — [docs/execution-model.md](./docs/execution-model.md)
+- **See it running** — [examples/](./examples/), seven programs, one per idea
+- **Ask why it is built this way** — [docs/adr/](./docs/adr/), and
+  [docs/design/](./docs/design/) for how the pieces fit
 
 ## Requirements
 
