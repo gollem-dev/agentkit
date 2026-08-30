@@ -27,30 +27,6 @@ You probably do not need it when the agent finishes inside one request and losin
 an in-progress run is acceptable. An in-memory loop is less machinery, and it is
 the right answer until a run outlives the process holding it.
 
-## Try it
-
-The bundled quickstart needs no credentials: with no model configured, the LLM is
-a stub replaying a script.
-
-```bash
-git clone https://github.com/gollem-dev/agentkit
-cd agentkit/examples
-go run ./quickstart
-```
-
-```
-model:   scripted stub (set GEMINI_PROJECT_ID and GEMINI_LOCATION to run against Vertex AI)
-spawned: 01a050c2-c09b-7918-bca4-1e468f5c1fdf
-status:  succeeded
-answer:  A durable agent runtime checkpoints an agent after every step, so a crash resumes the work instead of restarting it. The state lives in a store rather than in one process's memory, so any worker can pick it up.
-metrics: llm_calls=1 input_tokens=64 output_tokens=16
-```
-
-It registers an agent, writes a `Process`, runs a worker until that `Process`
-finishes, and prints the persisted result with its usage. Six more programs in
-[examples/](./examples/) cover tools, human input, crash recovery, parallel
-children, middleware and tracing.
-
 ## What it provides
 
 - **Crash recovery** — every transition is committed to your store before the
@@ -144,6 +120,30 @@ worker just re-executes `Step` from the checkpoint. For exactly-once effects,
 commit the decision to state first and execute it in the next transition. Read
 [docs/execution-model.md](./docs/execution-model.md) before writing a tool that
 touches the outside world; it is short, and it is the part people get wrong.
+
+## Try it
+
+The bundled quickstart needs no credentials: with no model configured, the LLM is
+a stub replaying a script.
+
+```bash
+git clone https://github.com/gollem-dev/agentkit
+cd agentkit/examples
+go run ./quickstart
+```
+
+```
+model:   scripted stub (set GEMINI_PROJECT_ID and GEMINI_LOCATION to run against Vertex AI)
+spawned: 01a050c2-c09b-7918-bca4-1e468f5c1fdf
+status:  succeeded
+answer:  A durable agent runtime checkpoints an agent after every step, so a crash resumes the work instead of restarting it. The state lives in a store rather than in one process's memory, so any worker can pick it up.
+metrics: llm_calls=1 input_tokens=64 output_tokens=16
+```
+
+It registers an agent, writes a `Process`, runs a worker until that `Process`
+finishes, and prints the persisted result with its usage. Six more programs in
+[examples/](./examples/) cover tools, human input, crash recovery, parallel
+children, middleware and tracing.
 
 ## Minimal integration
 
