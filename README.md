@@ -1,5 +1,9 @@
 # agentkit
 
+<p align="center">
+  <img src="docs/images/arch.png" alt="agentkit architecture" >
+</p>
+
 A general-purpose, crash-resilient runtime for LLM agents in Go.
 
 An agent loop is easy to write and hard to *operate*. The usual one keeps the
