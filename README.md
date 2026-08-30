@@ -74,6 +74,9 @@ children, middleware and tracing.
   <img src="docs/images/arch.png" alt="agentkit architecture" >
 </p>
 
+The shape of a run, not every edge of it: retries, cancellation from `pending`
+and the rest of the lifecycle are in [docs/concepts.md](./docs/concepts.md).
+
 | Term | What it is |
 |---|---|
 | **Process** | one agent run — its state, status, metrics and lease, all in the store |
