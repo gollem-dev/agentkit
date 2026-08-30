@@ -16,7 +16,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"os"
+	"time"
 
 	"github.com/gollem-dev/agentkit"
 	"github.com/gollem-dev/agentkit/repository/memory"
@@ -27,42 +31,83 @@ import (
 func main() {
 	ctx := context.Background()
 
-	client, err := claude.New(ctx, "...api key...")
+	client, err := claude.New(ctx, os.Getenv("ANTHROPIC_API_KEY")) // any gollem LLM client
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// 1. Register the agents. Register returns a typed handle.
+	// 1. Register. The typed handle it returns is the only way to spawn this
+	//    agent, so the input type is checked at compile time.
 	reg := agentkit.NewRegistry()
 	assistant, err := simple.Register(reg, "assistant", 1)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// 2. Build the kernel: repository, default model, registry.
+	// 2. Construct the kernel: repository, default model, registry. memory.New()
+	//    keeps runs in this process — see "Choosing storage" below for the rest.
 	kernel, err := agentkit.New(memory.New(), client, reg)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// 3. Spawn. This writes a pending Process and returns immediately.
+	// 3. Spawn. This writes a pending Process and returns its id; nothing has
+	//    executed yet.
 	pid, err := assistant.Spawn(ctx, kernel, simple.Input{Prompt: "Summarize the news"})
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("spawned", pid)
 
-	// 4. Serve. Run this in as many processes as you like.
-	if err := kernel.Serve(ctx); err != nil {
-		log.Fatal(err)
+	// 4. Serve. A deployment runs this in its own process, and in as many of them
+	//    as it likes. Here it runs in the background just long enough to finish
+	//    this one Process.
+	serveCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() {
+		if err := kernel.Serve(serveCtx); err != nil {
+			log.Print(err)
+		}
+	}()
+
+	for {
+		proc, err := kernel.GetProcess(ctx, pid)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !proc.Status.Terminal() {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if proc.Status != agentkit.ProcessSucceeded {
+			log.Fatalf("run %s: %+v", proc.Status, proc.Failure)
+		}
+
+		var out simple.Output // the strategy owns this format; the kernel stored bytes
+		if err := json.Unmarshal(proc.Output, &out); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(out.Texts)
+		return
 	}
 }
+```
+
+```bash
+ANTHROPIC_API_KEY=... go run .
 ```
 
 Four steps, always in this order: **register → construct → spawn → serve.**
 
 `Register` must complete before any `Spawn` or `Serve`; afterwards the
 `Registry` is read-only.
+
+This program prints the answer and exits, so the polling loop at the end is there
+to keep one file self-contained. A real deployment does not poll in the caller:
+`Serve` runs in its own worker deployment, and the application learns that a run
+finished by reading the `Process` when it needs to (see [Reading
+results](#reading-results)) or by wiring a handler at registration (see [Being
+told when a run finishes](#being-told-when-a-run-finishes)). `Serve` on its own
+blocks until the context is cancelled.
 
 ## Spawning is asynchronous
 
