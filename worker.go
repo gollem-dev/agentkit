@@ -156,31 +156,34 @@ func WithSettleTimeout(d time.Duration) ServeOption {
 // is a single row update.
 const defaultSettleTimeout = 5 * time.Second
 
-// settleMark tags a context produced by settleCtx, so deriving a second one
-// from it is recognised as the same settle rather than a new budget.
+// settleMark tags a context produced by withSettleCtx, so a nested call is
+// recognised as the same settle rather than a new budget.
 type settleMark struct{}
 
-// settleCtx is the context every read and write that moves a row OUT of running
-// runs under. It keeps the parent's values (tracing and logging scope) and drops
-// its cancellation.
+// withSettleCtx runs fn on the context every read and write that moves a row OUT
+// of running uses. That context keeps the parent's values (tracing and logging
+// scope) and drops its cancellation.
 //
 // The detach is unconditional rather than conditional on parent.Err() != nil: a
 // check would leave the cancel free to arrive between the test and the write,
 // which is the same failure with a smaller window.
 //
 // A settle that reads before it writes reaches this twice — once to decide from
-// the row, once inside the requeue or finalize that acts on it. Deriving from a
-// context that is already a settle context returns it unchanged, so the timeout
-// bounds the settle as a whole and not each of its store calls.
-func settleCtx(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+// the row, once inside the requeue or finalize that acts on it. A parent that is
+// already a settle context is passed through, so the timeout bounds the settle
+// as a whole rather than each of its store calls.
+//
+// It takes fn rather than returning the context and its cancel so the cancel
+// cannot be dropped: releasing the timer is the caller's obligation on every
+// path, and there is only one path here.
+func withSettleCtx[T any](parent context.Context, d time.Duration, fn func(context.Context) T) T {
 	if parent.Value(settleMark{}) != nil {
-		// Already inside a settle. The context is returned as it is, with a cancel
-		// that does nothing: releasing it here would end the outer settle mid-way.
-		return parent, func() {}
+		return fn(parent)
 	}
 	detached := context.WithValue(context.WithoutCancel(parent), settleMark{}, struct{}{})
 	ctx, cancel := context.WithTimeout(detached, d)
-	return ctx, cancel
+	defer cancel()
+	return fn(ctx)
 }
 
 // WithMaxConcurrent sets the hard limit: the maximum number of claims this Serve
@@ -486,13 +489,13 @@ func (k *Kernel) recoverClaim(fn func() error) (err error) {
 // under a lease nobody renews.
 func (k *Kernel) finalizeClaimed(ctx context.Context, cfg serveConfig, proc *Process, mut terminalMutator,
 	claimToken string, foldMetrics Metrics) ClaimOutcome {
-	sctx, cancel := settleCtx(ctx, cfg.settleTimeout)
-	defer cancel()
-	if err := k.finalize(sctx, proc, mut, claimToken, foldMetrics); err != nil {
-		k.logger.Error("finalize failed", "process", proc.ID, "error", err)
-		return ClaimAbandoned
-	}
-	return ClaimFinished
+	return withSettleCtx(ctx, cfg.settleTimeout, func(sctx context.Context) ClaimOutcome {
+		if err := k.finalize(sctx, proc, mut, claimToken, foldMetrics); err != nil {
+			k.logger.Error("finalize failed", "process", proc.ID, "error", err)
+			return ClaimAbandoned
+		}
+		return ClaimFinished
+	})
 }
 
 // failOrRequeue finalizes the Process when its error budget is spent, and puts
@@ -570,38 +573,38 @@ func cancelledByClaim(ctx context.Context, cause error) bool {
 func (k *Kernel) settleAfterTransitionCommit(ctx context.Context, cfg serveConfig, proc *Process,
 	claimToken string, cause error, foldMetrics Metrics) ClaimOutcome {
 	shutdown := cancelledByClaim(ctx, cause)
-	sctx, cancel := settleCtx(ctx, cfg.settleTimeout)
-	defer cancel()
-	fresh, err := k.repo.GetProcess(sctx, proc.ID)
-	if err != nil || fresh == nil {
-		k.logger.Error("transition commit re-read failed",
-			"process", proc.ID, "cause", cause, "error", err)
-		return ClaimAbandoned
-	}
-	if fresh.LeaseToken != claimToken {
-		return ClaimAbandoned // another owner has it.
-	}
-	switch {
-	case fresh.Status == ProcessWaiting:
-		return ClaimSuspended // the suspend commit landed; the row is settled.
-	case fresh.Status.Terminal():
-		return ClaimFinished // another path finalized it; nothing is owed.
-	case fresh.Status != ProcessRunning:
-		return ClaimAbandoned // already off running by some other path.
-	}
-	if fresh.StateSeq == proc.StateSeq {
-		return k.failOrRequeueOn(sctx, shutdown, cfg, fresh, claimToken, cause, foldMetrics)
-	}
-	// The commit landed: its own Apply already folded this run's metrics and reset
-	// the attempt counter, so nothing is charged here and foldMetrics must not be
-	// added again. requeueInfra rather than release, because release reports
-	// ClaimReleased, which eager dispatch re-submits immediately (ADR-0016): a
-	// store failing this way on every commit would then re-run paid work in a
-	// tight loop. The retry backoff is what keeps that bounded.
-	if rerr := k.requeueInfra(sctx, cfg, fresh, claimToken, cause); rerr != nil {
-		return ClaimAbandoned
-	}
-	return ClaimRequeued
+	return withSettleCtx(ctx, cfg.settleTimeout, func(sctx context.Context) ClaimOutcome {
+		fresh, err := k.repo.GetProcess(sctx, proc.ID)
+		if err != nil || fresh == nil {
+			k.logger.Error("transition commit re-read failed",
+				"process", proc.ID, "cause", cause, "error", err)
+			return ClaimAbandoned
+		}
+		if fresh.LeaseToken != claimToken {
+			return ClaimAbandoned // another owner has it.
+		}
+		switch {
+		case fresh.Status == ProcessWaiting:
+			return ClaimSuspended // the suspend commit landed; the row is settled.
+		case fresh.Status.Terminal():
+			return ClaimFinished // another path finalized it; nothing is owed.
+		case fresh.Status != ProcessRunning:
+			return ClaimAbandoned // already off running by some other path.
+		}
+		if fresh.StateSeq == proc.StateSeq {
+			return k.failOrRequeueOn(sctx, shutdown, cfg, fresh, claimToken, cause, foldMetrics)
+		}
+		// The commit landed: its own Apply already folded this run's metrics and
+		// reset the attempt counter, so nothing is charged here and foldMetrics must
+		// not be added again. requeueInfra rather than release, because release
+		// reports ClaimReleased, which eager dispatch re-submits immediately
+		// (ADR-0016): a store failing this way on every commit would then re-run
+		// paid work in a tight loop. The retry backoff is what keeps that bounded.
+		if rerr := k.requeueInfra(sctx, cfg, fresh, claimToken, cause); rerr != nil {
+			return ClaimAbandoned
+		}
+		return ClaimRequeued
+	})
 }
 
 // settleAfterTerminalCommit decides what a failed terminal commit left behind,
@@ -615,25 +618,25 @@ func (k *Kernel) settleAfterTransitionCommit(ctx context.Context, cfg serveConfi
 func (k *Kernel) settleAfterTerminalCommit(ctx context.Context, cfg serveConfig, proc *Process,
 	claimToken string, cause error, foldMetrics Metrics) ClaimOutcome {
 	shutdown := cancelledByClaim(ctx, cause)
-	sctx, cancel := settleCtx(ctx, cfg.settleTimeout)
-	defer cancel()
-	fresh, err := k.repo.GetProcess(sctx, proc.ID)
-	if err != nil || fresh == nil {
-		k.logger.Error("terminal commit re-read failed",
-			"process", proc.ID, "cause", cause, "error", err)
-		return ClaimAbandoned
-	}
-	// The lease is tested before the status: a Process another owner took over and
-	// finished is terminal too, and reporting ClaimFinished for it would credit
-	// this claim with work it did not do. A terminal commit leaves the token in
-	// place, so this claim's own landed commit still reads as its own.
-	if fresh.LeaseToken != claimToken {
-		return ClaimAbandoned // another owner has it.
-	}
-	if fresh.Status.Terminal() {
-		return ClaimFinished
-	}
-	return k.failOrRequeueOn(sctx, shutdown, cfg, fresh, claimToken, cause, foldMetrics)
+	return withSettleCtx(ctx, cfg.settleTimeout, func(sctx context.Context) ClaimOutcome {
+		fresh, err := k.repo.GetProcess(sctx, proc.ID)
+		if err != nil || fresh == nil {
+			k.logger.Error("terminal commit re-read failed",
+				"process", proc.ID, "cause", cause, "error", err)
+			return ClaimAbandoned
+		}
+		// The lease is tested before the status: a Process another owner took over
+		// and finished is terminal too, and reporting ClaimFinished for it would
+		// credit this claim with work it did not do. A terminal commit leaves the
+		// token in place, so this claim's own landed commit still reads as its own.
+		if fresh.LeaseToken != claimToken {
+			return ClaimAbandoned // another owner has it.
+		}
+		if fresh.Status.Terminal() {
+			return ClaimFinished
+		}
+		return k.failOrRequeueOn(sctx, shutdown, cfg, fresh, claimToken, cause, foldMetrics)
+	})
 }
 
 // driveClaim drives one claimed Process for up to maxStepsPerClaim transitions.
@@ -1469,50 +1472,50 @@ func (k *Kernel) requeueInfra(ctx context.Context, cfg serveConfig, proc *Proces
 // reason a claim has to be requeued is that its own context was cancelled, and a
 // write inheriting that cancellation can never reach the store.
 func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, fenceToken string, cause error, foldMetrics Metrics, consumeAttempt bool) error {
-	sctx, cancel := settleCtx(ctx, cfg.settleTimeout)
-	defer cancel()
-	for {
-		now := k.clock()
-		p := proc.clone()
-		p.Status = ProcessPending
-		if consumeAttempt {
-			p.StepAttempts = proc.StepAttempts + 1
-		}
-		// The wake time is what holds the Process back: a pending row is not a
-		// claim target until it passes (see the Repository contract). A caller's
-		// curve is not trusted to be non-negative, which would put the wake time in
-		// the past and make the backoff a no-op.
-		backoff := max(0, cfg.retryBackoff(p.StepAttempts))
-		wake := now.Add(backoff)
-		p.WakeAt = &wake
-		p.LeaseUntil = nil
-		p.UpdatedAt = now
-		p.Metrics = p.Metrics.add(foldMetrics)
-		err := k.repo.Apply(sctx, ChangeSet{Processes: []*Process{p}})
-		if errors.Is(err, ErrConflict) {
-			fresh, gerr := k.repo.GetProcess(sctx, proc.ID)
-			if gerr != nil || fresh == nil {
-				k.logger.Error("requeue re-read failed", "process", proc.ID, "cause", cause, "error", gerr)
-				return goerr.Wrap(gerr, "requeue re-read", goerr.V("process", proc.ID))
+	return withSettleCtx(ctx, cfg.settleTimeout, func(sctx context.Context) error {
+		for {
+			now := k.clock()
+			p := proc.clone()
+			p.Status = ProcessPending
+			if consumeAttempt {
+				p.StepAttempts = proc.StepAttempts + 1
 			}
-			if fresh.Status.Terminal() {
-				// Another path finalized it. Nothing is owed, and the row is settled.
-				return nil
+			// The wake time is what holds the Process back: a pending row is not a
+			// claim target until it passes (see the Repository contract). A caller's
+			// curve is not trusted to be non-negative, which would put the wake time
+			// in the past and make the backoff a no-op.
+			backoff := max(0, cfg.retryBackoff(p.StepAttempts))
+			wake := now.Add(backoff)
+			p.WakeAt = &wake
+			p.LeaseUntil = nil
+			p.UpdatedAt = now
+			p.Metrics = p.Metrics.add(foldMetrics)
+			err := k.repo.Apply(sctx, ChangeSet{Processes: []*Process{p}})
+			if errors.Is(err, ErrConflict) {
+				fresh, gerr := k.repo.GetProcess(sctx, proc.ID)
+				if gerr != nil || fresh == nil {
+					k.logger.Error("requeue re-read failed", "process", proc.ID, "cause", cause, "error", gerr)
+					return goerr.Wrap(gerr, "requeue re-read", goerr.V("process", proc.ID))
+				}
+				if fresh.Status.Terminal() {
+					// Another path finalized it. Nothing is owed, and the row is settled.
+					return nil
+				}
+				if fresh.LeaseToken != fenceToken {
+					return goerr.Wrap(ErrConflict, "lost the lease before requeue",
+						goerr.V("process", proc.ID)) // never rebase, D50.
+				}
+				// The metrics were not folded, so they are still owed to the retry.
+				proc = fresh
+				continue
 			}
-			if fresh.LeaseToken != fenceToken {
-				return goerr.Wrap(ErrConflict, "lost the lease before requeue",
-					goerr.V("process", proc.ID)) // never rebase, D50.
+			if err != nil {
+				k.logger.Error("requeue failed", "process", proc.ID, "cause", cause, "error", err)
+				return goerr.Wrap(err, "requeue", goerr.V("process", proc.ID))
 			}
-			// The metrics were not folded, so they are still owed to the retry.
-			proc = fresh
-			continue
+			return nil
 		}
-		if err != nil {
-			k.logger.Error("requeue failed", "process", proc.ID, "cause", cause, "error", err)
-			return goerr.Wrap(err, "requeue", goerr.V("process", proc.ID))
-		}
-		return nil
-	}
+	})
 }
 
 // release yields the Process (MaxStepsPerClaim consumed) back to pending. It
@@ -1531,37 +1534,37 @@ func (k *Kernel) requeue(ctx context.Context, cfg serveConfig, proc *Process, fe
 // budget ran out at the same moment the worker was asked to stop still has to
 // put its row back.
 func (k *Kernel) release(ctx context.Context, cfg serveConfig, proc *Process, fenceToken string) error {
-	sctx, cancel := settleCtx(ctx, cfg.settleTimeout)
-	defer cancel()
-	for {
-		fresh, err := k.repo.GetProcess(sctx, proc.ID)
-		if err != nil || fresh == nil {
-			return goerr.Wrap(err, "release re-read", goerr.V("process", proc.ID))
+	return withSettleCtx(ctx, cfg.settleTimeout, func(sctx context.Context) error {
+		for {
+			fresh, err := k.repo.GetProcess(sctx, proc.ID)
+			if err != nil || fresh == nil {
+				return goerr.Wrap(err, "release re-read", goerr.V("process", proc.ID))
+			}
+			if fresh.LeaseToken != fenceToken || fresh.Status != ProcessRunning {
+				// Lease lost, or already moved off running by another path. Either way
+				// this worker did not put it back.
+				return goerr.Wrap(ErrConflict, "no longer this claim's row to release",
+					goerr.V("process", proc.ID), goerr.V("status", fresh.Status))
+			}
+			p := fresh.clone()
+			p.Status = ProcessPending
+			// A released Process is runnable now, so it carries no wake time. The
+			// Continue commit already cleared it; setting it here states the
+			// post-condition rather than relying on that.
+			p.WakeAt = nil
+			p.LeaseUntil = nil
+			p.UpdatedAt = k.clock()
+			err = k.repo.Apply(sctx, ChangeSet{Processes: []*Process{p}})
+			if errors.Is(err, ErrConflict) {
+				continue // someone moved the row; re-read and decide again.
+			}
+			if err != nil {
+				k.logger.Error("release failed", "process", proc.ID, "error", err)
+				return goerr.Wrap(err, "release", goerr.V("process", proc.ID))
+			}
+			return nil
 		}
-		if fresh.LeaseToken != fenceToken || fresh.Status != ProcessRunning {
-			// Lease lost, or already moved off running by another path. Either way
-			// this worker did not put it back.
-			return goerr.Wrap(ErrConflict, "no longer this claim's row to release",
-				goerr.V("process", proc.ID), goerr.V("status", fresh.Status))
-		}
-		p := fresh.clone()
-		p.Status = ProcessPending
-		// A released Process is runnable now, so it carries no wake time. The
-		// Continue commit already cleared it; setting it here states the
-		// post-condition rather than relying on that.
-		p.WakeAt = nil
-		p.LeaseUntil = nil
-		p.UpdatedAt = k.clock()
-		err = k.repo.Apply(sctx, ChangeSet{Processes: []*Process{p}})
-		if errors.Is(err, ErrConflict) {
-			continue // someone moved the row; re-read and decide again.
-		}
-		if err != nil {
-			k.logger.Error("release failed", "process", proc.ID, "error", err)
-			return goerr.Wrap(err, "release", goerr.V("process", proc.ID))
-		}
-		return nil
-	}
+	})
 }
 
 // expireDueAwaits handles awaits past their deadline at claim time: timer ->
