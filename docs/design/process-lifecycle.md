@@ -265,12 +265,35 @@ process off `running`; only an abandon leaves it to lapse:
 | `Suspend` | `suspended` | `waiting`, lease cleared |
 | `Done` / `Fail`, or the kernel finalizing it | `finished` | terminal, lease cleared |
 | step budget spent | `released` | `release` returns it to `pending`, lease cleared |
-| an error, or a refused claim | `requeued` | `requeue` to `pending` with a backoff, lease cleared |
-| lease lost, or a `Repository` failure | `abandoned` | nothing written; a later claim recovers the row |
+| an error, a refused claim, or a settle after an unknown commit | `requeued` | `requeue` to `pending` with a backoff, lease cleared |
+| the row names another `LeaseToken`, or the settle itself failed | `abandoned` | nothing written; a later claim recovers the row |
 
 That table is why a `running` row with a lapsed lease means something specific:
 no orderly ending leaves one behind, so encountering one means the previous
 claim vanished mid-transition.
+
+Keeping that true is an obligation on the worker, not a property it gets for
+free, and it is stated as one invariant: **a claim never ends while its row is
+`running` under that claim's own `LeaseToken`, unless the row itself names a
+different one.** So `abandoned` means "another owner has it", and the two things
+that used to break the invariant are handled explicitly:
+
+- **A cancelled context.** Cancelling the `Serve` context is how a host asks a
+  worker to stop, and it is therefore the most frequent reason a row needs
+  settling — a settle that inherited it could never reach the store. Every read
+  and write that moves a row out of `running` runs on a context derived with
+  `context.WithoutCancel` and bounded by `WithSettleTimeout` (5s by default).
+  Nothing else is detached: `Step`, the `ToolFactory`, `Limit` and the History
+  reads keep the claim's context and still stop promptly.
+- **A commit whose outcome is unknown.** A non-conflict `Apply` failure does not
+  prove the write missed the store. The worker re-reads the row on the settle
+  context and decides from it — the pre-commit `StateSeq` for a transition
+  commit, the status for a terminal one — rather than guessing from the error.
+
+A shutdown is also not the strategy's failure: a transition that failed with the
+claim context's own error requeues without consuming a `StepAttempts` attempt, so
+repeated restarts cannot exhaust a Process's retry budget
+([ADR-0015](../adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
 
 ## The lease is not a timeout
 
@@ -305,6 +328,7 @@ be used to fence.
 
 ```
 re-read the process
+  ├─ read failed?          → requeue (no attempt: nothing was tried this round)
   ├─ lease token changed?  → abandon, another worker owns it now
   └─ cancel requested?     → conversation mid-round and deferrals left?
                              ├─ yes → run one more transition, ask again
@@ -317,8 +341,20 @@ EncodeState(state)
 build the ChangeSet
 Apply
   ├─ ok        → next transition, or suspend, or return
-  └─ conflict  → still hold the lease? rebuild and retry : abandon
+  ├─ conflict  → nothing committed; re-read the row
+  │              ├─ same token   → rebuild and retry
+  │              ├─ another token → abandon
+  │              └─ read failed  → requeue (the read proves nothing about the lease)
+  └─ other     → outcome unknown; re-read the row
+                 ├─ another token     → abandon
+                 ├─ waiting/terminal  → the commit landed → suspended / finished
+                 ├─ StateSeq unchanged → nothing committed → requeue and retry
+                 └─ StateSeq advanced  → the commit landed → requeue, charging nothing
 ```
+
+`StateSeq` and not `Rev`: a concurrent `Cancel` advances the `Rev` of a running
+row without committing anything, whereas `StateSeq` is written only by this
+worker's own commits.
 
 The re-read at the top of every iteration is what makes `Cancel` responsive
 mid-run and what detects a lost lease before wasting an LLM call.

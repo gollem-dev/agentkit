@@ -368,6 +368,12 @@ time nobody spent.
 such as a `ToolFactory` failure or a lost lease. The kernel reports what the
 claim really did; a middleware cannot substitute a different value.
 
+`abandoned` is the one worth alerting on, and it is narrow: it means the row
+proved this claim no longer holds the lease, or the settle that would have put
+the row back could not reach the store. A worker shut down mid-transition
+reports `requeued`, not `abandoned`
+([ADR-0015](adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
+
 A claim is also the only scope with a teardown, so it is where a per-claim
 resource belongs. `ToolFactory` runs once per claim and has no closing hook of
 its own; if it opens an MCP connection or a sandbox, close it in a `defer` here.

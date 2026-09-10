@@ -430,21 +430,21 @@ func TestSession_TerminalApplyErrorReleasesNothing(t *testing.T) {
 
 	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
-	// The abandoned claim leaves a running row; reclaiming it counts as unclean,
-	// and a budget of 0 turns that into a terminal failure instead of a retry, so
-	// the state right after the broken Apply is what the test observes.
+	// The claim re-reads the row, finds nothing committed, and puts it back, so
+	// the retry reaches the same Done. A zero backoff keeps that inside the budget.
 	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal,
-		agentkit.WithLease(80*time.Millisecond), agentkit.WithMaxUncleanReclaims(0))
-	gt.Value(t, p.Status).Equal(agentkit.ProcessFailed)
-	gt.Value(t, p.Failure.Code).Equal(agentkit.FailureUncleanReclaim)
+		agentkit.WithRetryBackoff(func(int) time.Duration { return 0 }))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 
 	saved := store.saved()
-	gt.Array(t, saved).Length(2) // the Continue transition, then the terminal attempt.
-	// The record still names the first version, and neither it nor the terminal
-	// attempt's version was released.
-	gt.Value(t, p.HistoryRef).Equal(saved[0])
-	gt.Array(t, store.discarded()).Length(0)
-	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(1)
+	// The Continue transition, the terminal attempt whose Apply broke, then the
+	// terminal retry.
+	gt.Array(t, saved).Length(3)
+	gt.Value(t, p.HistoryRef).Equal(saved[2])
+	// The retry's commit released the version it superseded. The one saved by the
+	// attempt whose outcome was unknown is never released: it could have been the
+	// version the record ended up naming.
+	gt.Array(t, store.discarded()).Equal([]agentkit.HistoryRef{saved[0]})
 }
 
 // An empty ref is the record's way of saying "nothing committed yet", so a store

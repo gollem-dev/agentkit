@@ -245,6 +245,12 @@ err := kernel.Serve(ctx,
 you like — claims are exclusive, and a worker that dies has its processes picked
 up once the lease expires.
 
+Cancelling the context is also how you shut a worker down. It puts the rows it
+was driving back to `pending` before returning, so another instance takes them
+straight away rather than waiting out the lease; `WithSettleTimeout` bounds how
+long those writes may take, and has to fit inside your host's grace period. See
+[execution-model.md](execution-model.md).
+
 An application that only submits work simply never calls `Serve`.
 
 ### Sizing the lease
