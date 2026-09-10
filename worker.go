@@ -174,9 +174,13 @@ type settleMark struct{}
 // bounds the settle as a whole and not each of its store calls.
 func settleCtx(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	if parent.Value(settleMark{}) != nil {
+		// Already inside a settle. The context is returned as it is, with a cancel
+		// that does nothing: releasing it here would end the outer settle mid-way.
 		return parent, func() {}
 	}
-	return context.WithTimeout(context.WithValue(context.WithoutCancel(parent), settleMark{}, struct{}{}), d)
+	detached := context.WithValue(context.WithoutCancel(parent), settleMark{}, struct{}{})
+	ctx, cancel := context.WithTimeout(detached, d)
+	return ctx, cancel
 }
 
 // WithMaxConcurrent sets the hard limit: the maximum number of claims this Serve
