@@ -2731,3 +2731,942 @@ func TestCancelDeferralBoundIsClampedBelowTheClaim(t *testing.T) {
 		})
 	}
 }
+
+// --- settling a claimed row when the worker is asked to stop ---
+
+// ctxRepo refuses every call whose context is already done, the way a store
+// reached over a cancelled connection does. The bundled memory Repository
+// ignores its context, so without this a write made on a cancelled context
+// still lands and the settle path looks correct when it is not.
+type ctxRepo struct {
+	agentkit.Repository
+	refusedApplies atomic.Int64
+}
+
+func (r *ctxRepo) GetProcess(ctx context.Context, pid agentkit.ProcessID) (*agentkit.Process, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return r.Repository.GetProcess(ctx, pid)
+}
+
+func (r *ctxRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	if err := ctx.Err(); err != nil {
+		r.refusedApplies.Add(1)
+		return err
+	}
+	return r.Repository.Apply(ctx, cs)
+}
+
+func (r *ctxRepo) ClaimNextProcess(ctx context.Context, workerID string, leaseUntil, now time.Time) (*agentkit.Process, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return r.Repository.ClaimNextProcess(ctx, workerID, leaseUntil, now)
+}
+
+// blockThenDone is a Step that parks the first transition until the claim
+// context is cancelled and fails with that context's own error — what a
+// transition does when the worker is asked to stop. Every later call finishes.
+func blockThenDone(entered chan<- struct{}) stepFn {
+	var calls atomic.Int64
+	return func(ctx context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if calls.Add(1) == 1 {
+			entered <- struct{}{}
+			<-ctx.Done()
+			return st, agentkit.Decision[[]byte]{}, ctx.Err()
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+}
+
+// serveThenCancel runs Serve, waits for the strategy to enter Step, cancels the
+// Serve context and returns once Serve has returned — the shutdown sequence.
+func serveThenCancel(t *testing.T, k *agentkit.Kernel, entered <-chan struct{}, opts ...agentkit.ServeOption) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		_ = k.Serve(ctx, append([]agentkit.ServeOption{
+			agentkit.WithPollInterval(2 * time.Millisecond),
+		}, opts...)...)
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the strategy never entered Step")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after its context was cancelled")
+	}
+}
+
+// runClaimCancelled drives one claim and cancels its context once the strategy
+// has entered Step.
+func runClaimCancelled(t *testing.T, k *agentkit.Kernel, proc *agentkit.Process,
+	entered <-chan struct{}, opts ...agentkit.ServeOption) agentkit.ClaimOutcome {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	res := make(chan agentkit.ClaimOutcome, 1)
+	go func() { res <- k.RunClaimForTest(ctx, proc, opts...) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the strategy never entered Step")
+	}
+	cancel()
+	select {
+	case o := <-res:
+		return o
+	case <-time.After(5 * time.Second):
+		t.Fatal("the claim did not settle after its context was cancelled")
+		return ""
+	}
+}
+
+func mustGet(t *testing.T, repo agentkit.Repository, pid agentkit.ProcessID) *agentkit.Process {
+	t.Helper()
+	p, err := repo.GetProcess(context.Background(), pid)
+	gt.NoError(t, err)
+	return p
+}
+
+func mustClaim(t *testing.T, k *agentkit.Kernel, pid agentkit.ProcessID) *agentkit.Process {
+	t.Helper()
+	proc, ok := k.ClaimSpecificForTest(context.Background(), pid)
+	gt.Bool(t, ok).True()
+	return proc
+}
+
+func decodeScriptState(t *testing.T, p *agentkit.Process) scriptState {
+	t.Helper()
+	var st scriptState
+	gt.NoError(t, json.Unmarshal(p.State, &st))
+	return st
+}
+
+// noBackoff keeps a requeued row claimable straight away, so a test observes
+// what the settle wrote rather than how long it waits.
+func noBackoff() agentkit.ServeOption {
+	return agentkit.WithRetryBackoff(func(int) time.Duration { return 0 })
+}
+
+// (1) A cancelled Serve context must leave the row claimable, not running under
+// a lease nobody renews. The long lease is what makes the difference visible: a
+// row left running would be unreachable for 30s, well past the recovery budget.
+func TestServeCancelMidTransitionLeavesTheRowClaimable(t *testing.T) {
+	ctx := context.Background()
+	entered := make(chan struct{}, 4)
+	repo := &ctxRepo{Repository: memory.New()}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: blockThenDone(entered)})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	serveThenCancel(t, k, entered, agentkit.WithLease(30*time.Second), noBackoff())
+
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Nil(t, p.LeaseUntil)
+	gt.Value(t, p.UncleanReclaims).Equal(0)
+
+	// Recovery is immediate, not lease-expiry driven.
+	done := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal, agentkit.WithLease(30*time.Second))
+	gt.Value(t, done.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, done.UncleanReclaims).Equal(0)
+}
+
+// (2) The regression test for the reported failure: the store rejects every
+// write made on a cancelled context, so a settle that inherited the claim's
+// cancellation could not land. The settle must not even be attempted there.
+func TestSettleWriteDoesNotRideTheCancelledContext(t *testing.T) {
+	ctx := context.Background()
+	entered := make(chan struct{}, 4)
+	repo := &ctxRepo{Repository: memory.New()}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: blockThenDone(entered)})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	serveThenCancel(t, k, entered, agentkit.WithLease(30*time.Second), noBackoff())
+
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Value(t, repo.refusedApplies.Load()).Equal(int64(0))
+}
+
+// oneShotGetRepo fails the first GetProcess made while armed.
+type oneShotGetRepo struct {
+	agentkit.Repository
+	armed atomic.Bool
+	fired atomic.Bool
+	err   error
+}
+
+func (r *oneShotGetRepo) GetProcess(ctx context.Context, pid agentkit.ProcessID) (*agentkit.Process, error) {
+	if r.armed.Load() && r.fired.CompareAndSwap(false, true) {
+		return nil, r.err
+	}
+	return r.Repository.GetProcess(ctx, pid)
+}
+
+// (3) A read that fails at the claim loop head is not evidence the lease was
+// lost, and no transition was attempted, so the row goes back with its attempt
+// counter untouched.
+func TestLoopHeadReadFailureRequeuesWithoutChargingAnAttempt(t *testing.T) {
+	ctx := context.Background()
+	var steps atomic.Int64
+	repo := &oneShotGetRepo{Repository: memory.New(), err: gollemErr("read boom")}
+	reg := agentkit.NewRegistry()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.Add(1)
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, noBackoff())).Equal(agentkit.ClaimRequeued)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Value(t, p.StepAttempts).Equal(0)
+	gt.Nil(t, p.LeaseUntil)
+	gt.Value(t, steps.Load()).Equal(int64(0)) // no transition was attempted.
+}
+
+// oneShotApplyRepo fails the first Apply made while armed, without reaching the
+// store — a commit that provably did not land.
+type oneShotApplyRepo struct {
+	agentkit.Repository
+	armed atomic.Bool
+	fired atomic.Bool
+	err   error
+}
+
+func (r *oneShotApplyRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	if r.armed.Load() && r.fired.CompareAndSwap(false, true) {
+		return r.err
+	}
+	return r.Repository.Apply(ctx, cs)
+}
+
+// lostAckRepo lets the first Apply made while armed reach the store and then
+// reports an error — a commit that landed and lost its response.
+type lostAckRepo struct {
+	agentkit.Repository
+	armed atomic.Bool
+	fired atomic.Bool
+	err   error
+}
+
+func (r *lostAckRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	if r.armed.Load() && r.fired.CompareAndSwap(false, true) {
+		if err := r.Repository.Apply(ctx, cs); err != nil {
+			return err
+		}
+		return r.err
+	}
+	return r.Repository.Apply(ctx, cs)
+}
+
+// advanceThenDone advances the state once and then finishes, recording how many
+// times Step ran so a test can tell a re-run from a doubled commit.
+func advanceThenDone(calls *atomic.Int64) stepFn {
+	return func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		calls.Add(1)
+		if st.N == 0 {
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+}
+
+// (4) A non-conflict Apply error with nothing committed puts the row back, and
+// the retry applies the transition once rather than twice.
+func TestTransitionApplyFailureWithNothingCommittedRequeues(t *testing.T) {
+	ctx := context.Background()
+	var steps atomic.Int64
+	repo := &oneShotApplyRepo{Repository: memory.New(), err: gollemErr("disk gone at commit")}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: advanceThenDone(&steps)})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, agentkit.WithMaxStepsPerClaim(1), noBackoff())).
+		Equal(agentkit.ClaimRequeued)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Value(t, p.StepAttempts).Equal(1)
+	gt.Nil(t, p.LeaseUntil)
+	gt.Value(t, p.StateSeq).Equal(0) // nothing committed.
+
+	// The retry re-runs Step and commits it once.
+	proc = mustClaim(t, k, pid)
+	gt.Value(t, k.RunClaimForTest(ctx, proc, agentkit.WithMaxStepsPerClaim(1), noBackoff())).
+		Equal(agentkit.ClaimReleased)
+	p = mustGet(t, repo, pid)
+	gt.Value(t, steps.Load()).Equal(int64(2)) // Step ran twice...
+	gt.Value(t, p.StateSeq).Equal(1)          // ...and committed once.
+	gt.Value(t, decodeScriptState(t, p).N).Equal(1)
+	gt.Value(t, p.StepAttempts).Equal(0)
+}
+
+// (5) The same error after the commit landed. The committed values must survive
+// the settle, and the run must not be charged for a transition that succeeded.
+func TestTransitionApplyFailureAfterTheCommitLandedKeepsTheCommit(t *testing.T) {
+	ctx := context.Background()
+	var steps atomic.Int64
+	repo := &lostAckRepo{Repository: memory.New(), err: gollemErr("response lost at commit")}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: advanceThenDone(&steps)})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, agentkit.WithMaxStepsPerClaim(1), noBackoff())).
+		Equal(agentkit.ClaimRequeued)
+	p := mustGet(t, repo, pid)
+	// The row is claimable again and the commit the store accepted is intact.
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Nil(t, p.LeaseUntil)
+	gt.Value(t, p.StateSeq).Equal(1)
+	gt.Value(t, decodeScriptState(t, p).N).Equal(1)
+	// A commit that landed is not the strategy's failure.
+	gt.Value(t, p.StepAttempts).Equal(0)
+	gt.Value(t, steps.Load()).Equal(int64(1))
+}
+
+// (6) A terminal commit that landed and lost only its response is reported as
+// what it is. The row must not be rewritten.
+func TestTerminalCommitFailureAfterTheCommitLandedReportsFinished(t *testing.T) {
+	ctx := context.Background()
+	repo := &lostAckRepo{Repository: memory.New(), err: gollemErr("response lost at terminal commit")}
+	reg := agentkit.NewRegistry()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, noBackoff())).Equal(agentkit.ClaimFinished)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, string(p.Output)).Equal("done")
+	gt.Value(t, p.Rev).Equal(proc.Rev + 1) // the terminal Apply, and nothing after it.
+}
+
+// (7) A terminal commit that did not land leaves a row that must not stay
+// running, and the retry reaches the same terminal state exactly once.
+func TestTerminalCommitFailureWithNothingCommittedRequeues(t *testing.T) {
+	ctx := context.Background()
+	repo := &oneShotApplyRepo{Repository: memory.New(), err: gollemErr("disk gone at terminal commit")}
+	reg := agentkit.NewRegistry()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, noBackoff())).Equal(agentkit.ClaimRequeued)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Nil(t, p.LeaseUntil)
+
+	proc = mustClaim(t, k, pid)
+	gt.Value(t, k.RunClaimForTest(ctx, proc, noBackoff())).Equal(agentkit.ClaimFinished)
+	p = mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	evs, err := repo.ListEvents(ctx, pid, agentkit.EventQuery{})
+	gt.NoError(t, err)
+	finished := 0
+	for _, e := range evs {
+		if e.Type == agentkit.EventProcessFinished {
+			finished++
+		}
+	}
+	gt.Value(t, finished).Equal(1)
+}
+
+// (8) A transition the worker interrupted produced no decision, so the next run
+// is a first attempt and must not present itself as a replay.
+func TestCancelledTransitionIsNotReportedAsAReplay(t *testing.T) {
+	ctx := context.Background()
+	entered := make(chan struct{}, 4)
+	var mu sync.Mutex
+	var replays []bool
+	var calls atomic.Int64
+	repo := &ctxRepo{Repository: memory.New()}
+	reg := agentkit.NewRegistry()
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		mu.Lock()
+		replays = append(replays, sys.Attempt().IsReplay())
+		mu.Unlock()
+		if calls.Add(1) == 1 {
+			entered <- struct{}{}
+			<-c.Done()
+			return st, agentkit.Decision[[]byte]{}, c.Err()
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	serveThenCancel(t, k, entered, noBackoff())
+
+	gt.Value(t, mustGet(t, repo, pid).StepAttempts).Equal(0)
+	serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Array(t, replays).Length(2)
+	gt.Bool(t, replays[1]).False() // the run after the cancellation.
+}
+
+// (9) A Process one attempt short of its budget must survive repeated shutdowns:
+// a cancellation is not the strategy's failure and must not exhaust the budget.
+func TestCancellationsDoNotExhaustTheRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	entered := make(chan struct{}, 8)
+	mode := make(chan string, 8)
+	repo := &ctxRepo{Repository: memory.New()}
+	reg := agentkit.NewRegistry()
+	step := func(c context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		switch <-mode {
+		case "error":
+			return st, agentkit.Decision[[]byte]{}, gollemErr("a real transition failure")
+		case "cancel":
+			entered <- struct{}{}
+			<-c.Done()
+			return st, agentkit.Decision[[]byte]{}, c.Err()
+		default:
+			return st, agentkit.Done([]byte("done")), nil
+		}
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+
+	// One real failure puts the Process at the last attempt its budget allows.
+	mode <- "error"
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, pid),
+		agentkit.WithMaxStepAttempts(1), noBackoff())).Equal(agentkit.ClaimRequeued)
+	gt.Value(t, mustGet(t, repo, pid).StepAttempts).Equal(1)
+
+	for i := 0; i < 3; i++ {
+		mode <- "cancel"
+		gt.Value(t, runClaimCancelled(t, k, mustClaim(t, k, pid), entered,
+			agentkit.WithMaxStepAttempts(1), noBackoff())).Equal(agentkit.ClaimRequeued)
+		p := mustGet(t, repo, pid)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+		gt.Value(t, p.StepAttempts).Equal(1)
+	}
+
+	mode <- "done"
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, pid),
+		agentkit.WithMaxStepAttempts(1), noBackoff())).Equal(agentkit.ClaimFinished)
+	gt.Value(t, mustGet(t, repo, pid).Status).Equal(agentkit.ProcessSucceeded)
+}
+
+// (10) The exemption is for the claim context only. A deadline the strategy set
+// on its own work is a real transition failure and keeps costing an attempt.
+func TestStrategyOwnDeadlineStillConsumesAnAttempt(t *testing.T) {
+	ctx := context.Background()
+	repo := &ctxRepo{Repository: memory.New()}
+	reg := agentkit.NewRegistry()
+	step := func(c context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		own, cancel := context.WithTimeout(c, time.Millisecond)
+		defer cancel()
+		<-own.Done()
+		return st, agentkit.Decision[[]byte]{}, own.Err()
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, pid), noBackoff())).Equal(agentkit.ClaimRequeued)
+
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Value(t, p.StepAttempts).Equal(1)
+}
+
+// (11) The invariant's one exception: a row naming another lease token is the
+// only proof this claim no longer owns it, and it is walked away from untouched.
+func TestAnotherLeaseTokenIsAbandonedWithoutAWrite(t *testing.T) {
+	ctx := context.Background()
+	var steps atomic.Int64
+	repo := memory.New()
+	reg := agentkit.NewRegistry()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.Add(1)
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+
+	// Another worker takes the lease.
+	stolen := agentkit.CloneProcess(mustGet(t, repo, pid))
+	stolen.LeaseToken = "another-worker"
+	gt.NoError(t, repo.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{stolen}}))
+	before := mustGet(t, repo, pid)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, noBackoff())).Equal(agentkit.ClaimAbandoned)
+	after := mustGet(t, repo, pid)
+	gt.Value(t, after.Rev).Equal(before.Rev)
+	gt.Value(t, after.LeaseToken).Equal("another-worker")
+	gt.Value(t, after.Status).Equal(agentkit.ProcessRunning)
+	gt.Value(t, steps.Load()).Equal(int64(0))
+}
+
+// blockingApplyRepo parks every Apply made while armed until its own context is
+// done — a store that stopped answering. It records whether any of those calls
+// arrived on a context that was already done, which is what would happen if a
+// settle rode the claim's cancellation instead of its own context.
+type blockingApplyRepo struct {
+	agentkit.Repository
+	armed      atomic.Bool
+	sawDoneCtx atomic.Bool
+}
+
+func (r *blockingApplyRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	if r.armed.Load() {
+		if ctx.Err() != nil {
+			r.sawDoneCtx.Store(true)
+			return ctx.Err()
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return r.Repository.Apply(ctx, cs)
+}
+
+// (12) The settle runs on a context the caller cannot cancel, so the timeout is
+// the only thing that can stop it. A store that never answers must not hold the
+// worker open past it.
+func TestSettleTimeoutBoundsAStoreThatNeverAnswers(t *testing.T) {
+	ctx := context.Background()
+	entered := make(chan struct{}, 4)
+	repo := &blockingApplyRepo{Repository: memory.New()}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: blockThenDone(entered)})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	repo.armed.Store(true)
+
+	const settle = 80 * time.Millisecond
+	start := time.Now()
+	outcome := runClaimCancelled(t, k, proc, entered, agentkit.WithSettleTimeout(settle), noBackoff())
+	elapsed := time.Since(start)
+
+	gt.Value(t, outcome).Equal(agentkit.ClaimAbandoned)
+	// The settle reached the store on a live context and was stopped by its own
+	// timeout, not by the cancellation that triggered it.
+	gt.Bool(t, repo.sawDoneCtx.Load()).False()
+	gt.Bool(t, elapsed >= settle).True()
+	gt.Bool(t, elapsed < 2*time.Second).True()
+}
+
+// deadlineRepo records the deadline every store call arrives with, for calls
+// that have one — which is exactly the settle's.
+type deadlineRepo struct {
+	agentkit.Repository
+	armed     atomic.Bool
+	failApply atomic.Bool
+	err       error
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (r *deadlineRepo) record(ctx context.Context) {
+	if d, ok := ctx.Deadline(); ok && r.armed.Load() {
+		r.mu.Lock()
+		r.deadlines = append(r.deadlines, d)
+		r.mu.Unlock()
+	}
+}
+
+func (r *deadlineRepo) seen() []time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]time.Time(nil), r.deadlines...)
+}
+
+func (r *deadlineRepo) GetProcess(ctx context.Context, pid agentkit.ProcessID) (*agentkit.Process, error) {
+	r.record(ctx)
+	return r.Repository.GetProcess(ctx, pid)
+}
+
+func (r *deadlineRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	if r.failApply.CompareAndSwap(true, false) {
+		return r.err
+	}
+	r.record(ctx)
+	return r.Repository.Apply(ctx, cs)
+}
+
+// WithSettleTimeout bounds one settle, not each store call inside it. A settle
+// that reads the row and then writes it must run both under the same deadline,
+// or the documented bound is twice what it says.
+func TestSettleTimeoutBoundsTheWholeSettleOnce(t *testing.T) {
+	ctx := context.Background()
+	var steps atomic.Int64
+	repo := &deadlineRepo{Repository: memory.New(), err: gollemErr("disk gone at commit")}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: advanceThenDone(&steps)})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	repo.armed.Store(true)
+	repo.failApply.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, agentkit.WithMaxStepsPerClaim(1), noBackoff())).
+		Equal(agentkit.ClaimRequeued)
+
+	// The settle's re-read and its requeue write, and nothing else.
+	seen := repo.seen()
+	gt.Array(t, seen).Length(2)
+	gt.Value(t, seen[1]).Equal(seen[0])
+}
+
+// A concurrent Cancel advances the Rev of a running row without committing
+// anything, so the settle must not read a Rev bump as its own commit landing.
+// Getting this wrong loses the run's metrics and its retry attempt.
+func TestConcurrentCancelIsNotMistakenForACommittedTransition(t *testing.T) {
+	ctx := context.Background()
+	var steps atomic.Int64
+	repo := &hookedApplyRepo{Repository: memory.New(), err: gollemErr("disk gone at commit")}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: advanceThenDone(&steps)})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	// The commit fails without writing, and a Cancel lands before the settle
+	// re-reads: the row's Rev has moved on, but this transition did not commit.
+	repo.onApply = func(agentkit.Repository) { gt.NoError(t, k.Cancel(ctx, pid, "user stopped")) }
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, agentkit.WithMaxStepsPerClaim(1), noBackoff())).
+		Equal(agentkit.ClaimRequeued)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Value(t, p.StateSeq).Equal(0)     // nothing committed...
+	gt.Value(t, p.StepAttempts).Equal(1) // ...so the transition is owed a retry.
+	gt.Bool(t, p.CancelRequested).True() // and the other writer's field survived.
+}
+
+// A suspend commit that landed and lost only its response leaves a waiting row.
+// Reporting that as abandoned would tell a ClaimMiddleware the claim failed.
+func TestSuspendCommitFailureAfterTheCommitLandedReportsSuspended(t *testing.T) {
+	ctx := context.Background()
+	repo := &lostAckRepo{Repository: memory.New(), err: gollemErr("response lost at commit")}
+	reg := agentkit.NewRegistry()
+	step := func(_ context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Suspend[[]byte](agentkit.Timer("t:1", sys.Now().Add(time.Hour))), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, noBackoff())).Equal(agentkit.ClaimSuspended)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessWaiting)
+	gt.Nil(t, p.LeaseUntil)
+}
+
+// A commit conflict is retried from a fresh read, but that read can fail because
+// the worker was asked to stop between the two. The row still has to go back.
+func TestCommitConflictThenCancellationStillSettles(t *testing.T) {
+	inner := &ctxRepo{Repository: memory.New()}
+	repo := &hookedApplyRepo{Repository: inner, err: agentkit.ErrConflict}
+	var steps atomic.Int64
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: advanceThenDone(&steps)})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repo.onApply = func(agentkit.Repository) { cancel() }
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, agentkit.WithMaxStepsPerClaim(1), noBackoff())).
+		Equal(agentkit.ClaimRequeued)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Nil(t, p.LeaseUntil)
+	gt.Value(t, p.StateSeq).Equal(0)
+	gt.Value(t, p.StepAttempts).Equal(0)
+	gt.Value(t, inner.refusedApplies.Load()).Equal(int64(0))
+}
+
+// The same window on the terminal commit. A re-read that fails there says
+// nothing about whether the Process is finished, so it must not be reported as
+// finished — and the row must not be left running.
+func TestTerminalCommitConflictThenCancellationStillSettles(t *testing.T) {
+	inner := &ctxRepo{Repository: memory.New()}
+	repo := &hookedApplyRepo{Repository: inner, err: agentkit.ErrConflict}
+	reg := agentkit.NewRegistry()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repo.onApply = func(agentkit.Repository) { cancel() }
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, noBackoff())).Equal(agentkit.ClaimRequeued)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Nil(t, p.LeaseUntil)
+	gt.Value(t, p.StepAttempts).Equal(0) // a shutdown is not the strategy's failure.
+}
+
+// context.Canceled and context.DeadlineExceeded carry no origin, so a strategy
+// deadline that expires while the claim context is also done reads as a
+// shutdown. That is the intended reading — the worker is going away either way —
+// and this pins it so a later change has to be deliberate.
+func TestStrategyDeadlineUnderAClosingClaimIsTreatedAsShutdown(t *testing.T) {
+	repo := &ctxRepo{Repository: memory.New()}
+	reg := agentkit.NewRegistry()
+	step := func(c context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		own, cancel := context.WithTimeout(c, time.Millisecond)
+		defer cancel()
+		<-own.Done()
+		<-c.Done() // the claim context closes too before the error surfaces.
+		return st, agentkit.Decision[[]byte]{}, own.Err()
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	gt.Value(t, k.RunClaimForTest(ctx, proc, noBackoff())).Equal(agentkit.ClaimRequeued)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Value(t, p.StepAttempts).Equal(0)
+}
+
+// hookedApplyRepo runs onApply instead of the first Apply made while armed and
+// then reports err. The hook is how a test stages what another worker did in the
+// window between a failed commit and the settle's re-read.
+type hookedApplyRepo struct {
+	agentkit.Repository
+	armed   atomic.Bool
+	fired   atomic.Bool
+	onApply func(inner agentkit.Repository)
+	err     error
+}
+
+func (r *hookedApplyRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	if r.armed.Load() && r.fired.CompareAndSwap(false, true) {
+		r.onApply(r.Repository)
+		return r.err
+	}
+	return r.Repository.Apply(ctx, cs)
+}
+
+// A terminal row is not by itself proof that this claim finished it: another
+// owner that took the lease over and finalized the Process leaves one too. The
+// lease decides, so this claim is not credited with someone else's work.
+func TestTerminalCommitFailureDoesNotClaimAnotherOwnersFinish(t *testing.T) {
+	ctx := context.Background()
+	repo := &hookedApplyRepo{Repository: memory.New(), err: gollemErr("disk gone at terminal commit")}
+	reg := agentkit.NewRegistry()
+	step := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		return st, agentkit.Done([]byte("ours")), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	// While this claim's terminal commit is failing, another owner takes the lease
+	// and finishes the Process.
+	repo.onApply = func(inner agentkit.Repository) {
+		stolen := agentkit.CloneProcess(mustGet(t, inner, pid))
+		stolen.LeaseToken = "another-worker"
+		stolen.LeaseUntil = nil
+		stolen.Status = agentkit.ProcessSucceeded
+		stolen.Output = []byte("theirs")
+		gt.NoError(t, inner.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{stolen}}))
+	}
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, noBackoff())).Equal(agentkit.ClaimAbandoned)
+	gt.Value(t, string(mustGet(t, repo, pid).Output)).Equal("theirs")
+}
+
+// conflictThenUnreadableRepo makes the first Apply made while armed conflict and
+// the re-read that follows it fail — a store that goes away in the window
+// between a commit conflict and the rebuild.
+type conflictThenUnreadableRepo struct {
+	agentkit.Repository
+	armed    atomic.Bool
+	fired    atomic.Bool
+	readFail atomic.Bool
+}
+
+func (r *conflictThenUnreadableRepo) Apply(ctx context.Context, cs agentkit.ChangeSet) error {
+	if r.armed.Load() && r.fired.CompareAndSwap(false, true) {
+		r.readFail.Store(true)
+		return agentkit.ErrConflict
+	}
+	return r.Repository.Apply(ctx, cs)
+}
+
+func (r *conflictThenUnreadableRepo) GetProcess(ctx context.Context, pid agentkit.ProcessID) (*agentkit.Process, error) {
+	if r.readFail.CompareAndSwap(true, false) {
+		return nil, gollemErr("read boom")
+	}
+	return r.Repository.GetProcess(ctx, pid)
+}
+
+// A conflict proves nothing committed, but the re-read that would rebuild the
+// commit can fail on its own. That failure says nothing about the lease, so the
+// row still has to go back rather than be left running.
+func TestCommitConflictWithAnUnreadableRowStillRequeues(t *testing.T) {
+	ctx := context.Background()
+	var steps atomic.Int64
+	repo := &conflictThenUnreadableRepo{Repository: memory.New()}
+	reg := agentkit.NewRegistry()
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: advanceThenDone(&steps)})
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	proc := mustClaim(t, k, pid)
+	repo.armed.Store(true)
+
+	gt.Value(t, k.RunClaimForTest(ctx, proc, agentkit.WithMaxStepsPerClaim(1), noBackoff())).
+		Equal(agentkit.ClaimRequeued)
+	p := mustGet(t, repo, pid)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessPending)
+	gt.Nil(t, p.LeaseUntil)
+	gt.Value(t, p.StateSeq).Equal(0) // the conflict proved nothing committed.
+	gt.Value(t, p.StepAttempts).Equal(0)
+}
+
+// A non-positive settle timeout would make every settle fail before it reached
+// the store, which is the failure the bound exists to prevent.
+func TestSettleTimeoutRejectsNonPositiveValues(t *testing.T) {
+	cases := map[string]struct {
+		opts []agentkit.ServeOption
+		want time.Duration
+	}{
+		"default":              {nil, 5 * time.Second},
+		"zero is the default":  {[]agentkit.ServeOption{agentkit.WithSettleTimeout(0)}, 5 * time.Second},
+		"negative is likewise": {[]agentkit.ServeOption{agentkit.WithSettleTimeout(-time.Second)}, 5 * time.Second},
+		"explicit value kept":  {[]agentkit.ServeOption{agentkit.WithSettleTimeout(time.Second)}, time.Second},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			gt.Value(t, agentkit.SettleTimeoutForTest(tc.opts...)).Equal(tc.want)
+		})
+	}
+}

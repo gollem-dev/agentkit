@@ -18,6 +18,13 @@ crash", which one counter cannot express.
 Both counters are readable from the strategy through `Syscalls.Attempt()` and
 from middleware through `EffectContext.Attempt`, as `AttemptInfo`.
 
+Counting only means anything while `running` really does imply "the previous
+claim vanished", so the worker maintains that: **a claim never ends with its row
+`running` under its own `LeaseToken` unless the row itself names a different
+one**. Every read and write that moves a row out of `running` runs on a context
+derived with `context.WithoutCancel` and bounded by `WithSettleTimeout`, and a
+cancelled claim charges neither counter.
+
 ADR-0003 is unchanged: replay is still at-least-once and there is still no
 effect journal. What changes is that replay is now **bounded** and **visible**.
 
@@ -61,6 +68,50 @@ observed would be charged to the wrong budget, and `StepAttempts` would never
 record it. That is not a hypothetical — a concurrent `Respond` or a sibling
 finalize advancing `Rev` mid-transition is enough to produce it.
 
+Stated as the invariant the worker enforces: **a claim never ends while its row
+is `running` under that claim's own `LeaseToken`, unless the row proves the lease
+is gone (`LeaseToken` names someone else).** `ClaimAbandoned` therefore means
+"another owner has it", not "our context died". Two mechanisms carry it:
+
+- **Settling does not ride the claim's context.** `requeue`, `release` and
+  `finalizeClaimed` derive theirs with `settleCtx` —
+  `context.WithTimeout(context.WithoutCancel(parent), WithSettleTimeout)`, 5s by
+  default. Cancelling the `Serve` context is what a host does to ask a worker to
+  stop, and it is therefore the most common reason a row has to be settled at
+  all; a settle inheriting it could never reach the store. The detach is
+  unconditional rather than conditional on `parent.Err() != nil`, because the
+  cancel can arrive between the test and the write. The timeout is what keeps a
+  store that stopped answering from holding `Serve` open, and it bounds the
+  settle as a whole: `settleCtx` returns a context that is already a settle
+  context unchanged, so a settle that reads before it writes gets one budget
+  rather than one per store call. The strategy's own work keeps the claim's
+  context and still stops promptly: what survives a shutdown is only the
+  bookkeeping recording that the work stopped.
+- **An unknown commit outcome is resolved from the row, not the error.** A
+  non-conflict `Apply` failure does not prove the write missed the store, so the
+  worker re-reads on the settle context. For a transition commit `StateSeq`
+  decides, because every commit this worker builds writes it and nothing else in
+  the kernel touches it — `Rev` cannot, since a concurrent `Cancel` advances the
+  `Rev` of a running row without committing anything. Unchanged means nothing
+  committed and the transition is retried; advanced means the commit landed, so
+  its metrics and attempt reset stand and the row is only put back (via
+  `requeueInfra`, whose backoff is what stops a store failing this way from being
+  re-claimed in a tight loop by eager dispatch). For a terminal commit the status
+  decides, tested after the lease so that a Process another owner finished is not
+  credited to this claim. Reporting follows the row: `ClaimFinished` for a
+  terminal one, `ClaimSuspended` for a waiting one. That also ends a misreport —
+  a landed terminal commit whose response was lost used to surface as
+  `ClaimAbandoned`.
+
+The reads that decide are treated the same way when they themselves fail. A read
+failure at the claim loop head, or on the re-read that would rebuild a commit
+after `ErrConflict`, is not evidence the lease was lost — only a row naming a
+different token is — so the row is requeued as infrastructure rather than
+abandoned. `commitFinal` separates the two cases for the same reason: it used to
+fold a failed re-read into "already terminal by another path" and report the
+commit as settled, which would announce a finished Process for a row that may
+still be running under this claim's lease.
+
 The bound is checked in `runClaim` **before** `Step`, unlike the `StepAttempts`
 bound which is checked after a failure. An unclean reclaim is already counted by
 the time the Process is claimed, so the only useful question is whether to run
@@ -79,6 +130,16 @@ before `Step` — a `ToolFactory` that could not build the tools, say — requeu
 without consuming an attempt, because nothing the strategy could have done ran,
 and reporting it as a replay would tell a strategy that effects may have fired
 when none could have.
+
+A transition that failed because the worker was asked to stop is exempt on the
+same reasoning, even though `Step` did run: it produced no decision. `Step`
+failing with the claim context's own `context.Canceled` while that context is
+done requeues as infrastructure. Charging it would spend the retry budget on
+shutdowns, so a Process unlucky enough to meet several restarts would end as
+`FailureRetryExhausted` with nothing wrong with it. Both halves of the test
+matter — a deadline the strategy set on its own work surfaces while the claim
+context is still live, and that is a real transition failure that keeps costing
+an attempt.
 
 ## Alternatives rejected
 
@@ -106,6 +167,21 @@ when none could have.
 - **Reinstating an effect journal so replay could be exact.** ADR-0003 removed
   it; nothing here needs it. Bounding and reporting replay is not the same as
   eliminating it.
+- **Detaching a settle only when the parent context is already done.** It looks
+  like the smaller change and it keeps the same defect: the cancel can arrive
+  between the test and the write. A conditional detach narrows the window rather
+  than closing it.
+- **Detaching the transition commit and the terminal commit too.** Tempting,
+  because the transition already ran and its LLM calls were already paid for. It
+  was declined: those `Apply` calls start further work on the way out — eager
+  dispatch of buffered children and the spawn `OnCommit` callbacks — and the
+  at-least-once model (ADR-0003) already covers losing an uncommitted transition.
+  Re-reading the row afterwards is what keeps the invariant without extending a
+  dying instance's reach.
+- **Leaving a row whose commit landed indeterminately to its lease.** That is the
+  behaviour this record exists to prevent: it is unreachable for a full lease and
+  the takeover is billed as a crash. The row is put back instead, and only a
+  different `LeaseToken` permits walking away.
 
 ## Consequences
 
@@ -126,9 +202,22 @@ when none could have.
 - The bound only fires on the first transition of a claim that took over a dead
   one, because a successful commit clears the counter. That is intended, and it
   is why the check sits inside the loop rather than before it.
+- A settle can outlive the cancellation that triggered it, by up to
+  `WithSettleTimeout`. `Serve` joins its claims before returning, so that time is
+  spent inside the host's grace period between asking a process to stop and
+  killing it. The default of 5s assumes a grace period of roughly 10s; a shorter
+  one needs a shorter setting.
+- A claim ending after a shutdown does not fold its run's metrics: `requeueInfra`
+  writes `Metrics{}`. Effects the interrupted transition already paid for are
+  therefore missing from `Process.Metrics`, so a budget read from it under-counts
+  after a shutdown.
+- There is no `EventKind` for a claim that ended abnormally and no log line on
+  the settle success path, so a clean shutdown followed by recovery leaves no
+  record beyond the row itself.
 
 ## History
 
 | Date | Change |
 |---|---|
 | 2026-07-21 | Initial record. |
+| 2026-09-10 | Stated the settle invariant explicitly and recorded the two mechanisms that carry it: `settleCtx` detaching every row-settling read and write from the claim's cancellation (`WithSettleTimeout`, default 5s), and resolving an unknown commit outcome from the row. A cancelled claim now charges neither counter. Prompted by a rolling update in which a cancelled `Serve` context left claimed rows `running` for a full lease. |

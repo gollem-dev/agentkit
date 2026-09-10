@@ -141,6 +141,28 @@ is no window in which a child is done and the parent never hears about it.
 See [design/consistency-model.md](design/consistency-model.md) for the full set
 of failure windows and how each is closed.
 
+## Shutting a worker down
+
+Cancel the context you passed to `Serve`. It stops claiming, lets the in-flight
+transitions fail with that cancellation, puts their rows back to `pending`, and
+returns once every claim has finished — so the Processes it was driving are
+claimable by another instance immediately rather than after their leases lapse.
+A transition interrupted this way is not charged a retry attempt, because it
+produced no decision; a strategy sees the next run as a first attempt, not a
+replay.
+
+The rows are settled on a context the cancellation does not reach, bounded by
+`WithSettleTimeout` (5s by default). Set it below the grace period your host
+allows between asking the process to stop and killing it — with a 10s grace
+period the default leaves room for the rest of the shutdown. A worker killed
+before it settles is the ordinary crash case: the row's lease lapses and the
+next claim counts an unclean reclaim
+([ADR-0015](adr/0015-unclean-reclaims-are-counted-and-bounded.md)).
+
+What a cancellation does *not* do is unwind the interrupted transition. Its LLM
+and tool calls already happened, and the next claim re-runs `Step` from the last
+committed state — the at-least-once model above, unchanged.
+
 ## Confirmation is not a security gate
 
 A strategy can ask a human before acting:

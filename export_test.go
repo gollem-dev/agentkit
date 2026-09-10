@@ -116,6 +116,12 @@ func MaxStepsPerClaimForTest(opts ...ServeOption) int {
 	return newServeConfig(opts).maxStepsPerClaim
 }
 
+// SettleTimeoutForTest resolves ServeOptions to the settle timeout in force, so
+// a test can assert both the default and the clamp on a non-positive value.
+func SettleTimeoutForTest(opts ...ServeOption) time.Duration {
+	return newServeConfig(opts).settleTimeout
+}
+
 // RunClaimForTest drives an already-claimed Process through runClaim, so a test
 // can assert the ClaimOutcome the kernel reports without racing a Serve loop.
 func (k *Kernel) RunClaimForTest(ctx context.Context, proc *Process, opts ...ServeOption) ClaimOutcome {
