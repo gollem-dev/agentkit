@@ -144,7 +144,17 @@ the cause instead of documenting the symptom.
   closes. And it must not name its own Process, whose current version its
   in-flight commit releases. One rule closes both: the named Process's
   `ParentID` must be the calling Process's id, otherwise `ErrInvalidRequest` —
-  also when no Process by that id exists, as `WaitChildren` reports it. The
+  also when no Process by that id exists, as `WaitChildren` reports it. A child
+  spawned earlier in the same transition has no row yet but is the caller's
+  own, as `WaitChildren` also treats it; it is refused because it has committed
+  no conversation. A sibling that is **still running** is not refused. Its next
+  commit may release the version the child pinned, which is the exposure the
+  top-level `Spawn` already accepts for a running issuer (see Consequences), and
+  refusing it would rule out branching off the conversation a running Process
+  has committed so far. The caller's own Process differs in where the release
+  comes from: it is the very commit that inserts the child, so whenever the
+  spawning transition saves a conversation, the child would be committed
+  pointing at a version that same commit announces as superseded. The
   pair is resolved before the middleware chain and carried on
   `SpawnRequest.InheritedHistory`, next to `Metadata`, so a `SpawnMiddleware`
   can see and drop it; a pair a middleware sets itself is recorded without the

@@ -368,7 +368,9 @@ The second child is an ordinary child: the parent waits on it, and its `Metrics`
 fold into the parent when the await resolves. Naming any Process the caller did
 not spawn — a sibling's child, an unrelated Process, the caller's own — is
 `ErrInvalidRequest`, and so is an id no Process has; the other failures are the
-same as on `Spawn`. A `SpawnMiddleware` sees the resolved pair on
+same as on `Spawn` — a child spawned earlier in the same `Step` fails as having
+committed no conversation. Naming a child that is still running is allowed, with
+the same caveat as inheriting from a running Process above. A `SpawnMiddleware` sees the resolved pair on
 `req.InheritedHistory` and can set it to `nil` to start the child empty.
 
 ### Where a cancel can stop

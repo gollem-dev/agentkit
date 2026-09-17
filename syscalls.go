@@ -531,15 +531,9 @@ func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts .
 	}
 	// Resolved before the chain, like the metadata below, so a SpawnMiddleware sees
 	// the pair and can drop it.
-	var inherited *InheritedHistory
-	if cfg.hasInheritFrom {
-		b, err := s.k.agents.binding(agent)
-		if err != nil {
-			return "", err
-		}
-		if inherited, err = s.k.resolveInheritedHistory(ctx, cfg, agent, b, &s.proc.ID); err != nil {
-			return "", err
-		}
+	inherited, err := s.resolveInheritedHistory(ctx, cfg, agent)
+	if err != nil {
+		return "", err
 	}
 	// A child runs under its parent's infrastructure scope, so the map carries
 	// over when the caller named none — a ToolFactory keying off metadata["tenant"]
@@ -564,6 +558,49 @@ func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts .
 		return "", goerr.Wrap(ErrInvalidConfig, "spawn middleware returned a nil handler")
 	}
 	return h(ctx, req)
+}
+
+// resolveInheritedHistory is SpawnChild's side of Kernel.resolveInheritedHistory.
+// `from` must be a Process this one spawned — the set resolveWaitChildren
+// accepts — so the option lets a strategy read no conversation it could not
+// already collect, and it cannot name this Process's own version, which this
+// transition's commit may release. As in resolveWaitChildren, an id outside that
+// set is ErrInvalidRequest whether or not a Process by that id exists.
+func (s *syscalls) resolveInheritedHistory(ctx context.Context, cfg *spawnConfig, agent AgentName) (*InheritedHistory, error) {
+	if !cfg.hasInheritFrom {
+		return nil, nil
+	}
+	// Checked against the agent SpawnChild named. spawnBase binds req.Agent, which
+	// a SpawnMiddleware may rewrite: a child moved to an agent without
+	// WithHistoryStore keeps the pair, and its first Session use reports
+	// ErrHistoryNotConfigured.
+	b, err := s.k.agents.binding(agent)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateInheritFrom(cfg, agent, b); err != nil {
+		return nil, err
+	}
+	// A child buffered earlier in this transition is this Process's own but has
+	// no row yet, so GetProcess would call it unknown. resolveWaitChildren
+	// accepts it the same way; it simply has no conversation to inherit.
+	if pendingChild(cfg.inheritFrom, s.pendingChildren) {
+		return nil, goerr.Wrap(ErrInvalidRequest, "the process to inherit from has committed no conversation",
+			goerr.V("from", cfg.inheritFrom), goerr.V("status", ProcessPending))
+	}
+	issuer, err := s.k.repo.GetProcess(ctx, cfg.inheritFrom)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory names a process this one did not spawn",
+				goerr.V("from", cfg.inheritFrom), goerr.V("spawner", s.proc.ID))
+		}
+		return nil, err
+	}
+	if issuer.ParentID == nil || *issuer.ParentID != s.proc.ID {
+		return nil, goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory names a process this one did not spawn",
+			goerr.V("from", issuer.ID), goerr.V("spawner", s.proc.ID))
+	}
+	return inheritedHistoryOf(issuer)
 }
 
 // registerSpawnCommit buffers fn to be called once with this transition's

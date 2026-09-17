@@ -13,6 +13,7 @@ import (
 	"github.com/gollem-dev/agentkit/repository/memory"
 	"github.com/gollem-dev/gollem"
 	"github.com/gollem-dev/gollem/mock"
+	"github.com/m-mizutani/goerr/v2"
 	"github.com/m-mizutani/gt"
 )
 
@@ -558,6 +559,54 @@ func TestSpawnChildInheritedHistoryValidation(t *testing.T) {
 			func(_ agentkit.Syscalls, first agentkit.ProcessID) agentkit.ProcessID { return first })
 		rejected(t, k, repo, parent, probe, agentkit.ErrHistoryNotConfigured)
 	})
+}
+
+// A child buffered earlier in the same transition is the caller's own, so it is
+// refused for the reason that applies to it — it has committed no conversation —
+// and not as a Process the caller did not spawn, which is what a lookup of
+// committed rows alone would report.
+func TestSpawnChildInheritFromChildSpawnedInSameTransition(t *testing.T) {
+	ctx := context.Background()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: doneStep()},
+		agentkit.WithHistoryStore[[]byte](histmem.New()))
+	gt.NoError(t, err)
+
+	probe := &inheritProbe{}
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			first, err := child.SpawnChild(c, sys, scriptInput{Seed: "first"})
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			second, err := child.SpawnChild(c, sys, scriptInput{Seed: "second"},
+				agentkit.WithInheritedHistory(first))
+			probe.set(first, second, err)
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("first", first)), nil
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	repo := memory.New()
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	_, second, spawnErr := probe.get()
+	gt.Error(t, spawnErr).Is(agentkit.ErrInvalidRequest)
+	gt.Value(t, second).Equal(agentkit.ProcessID(""))
+	// Both refusals are ErrInvalidRequest, so the reason is told apart by the
+	// context each one carries.
+	values := goerr.Values(spawnErr)
+	gt.Value(t, values["status"]).Equal(any(agentkit.ProcessPending))
+	_, named := values["spawner"]
+	gt.Bool(t, named).False()
 }
 
 // The pair is resolved before the chain, so a SpawnMiddleware sees it and can
