@@ -182,7 +182,8 @@ That is what extends the two guarantees above to History:
   why there is no lease re-check around the save.
 
 A Process can also start from a version *another* Process committed
-(`Spawn` + `WithInheritedHistory`). The pair naming it lives in
+(`Spawn` or `SpawnChild` + `WithInheritedHistory`; on `SpawnChild`, only from a
+Process the caller spawned). The pair naming it lives in
 `Process.InheritedHistory`, deliberately not in `HistoryRef`: `HistoryRef` is
 what the post-commit release treats as superseded, and it releases it under the
 committing Process's own id, so an inherited ref placed there would announce

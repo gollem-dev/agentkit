@@ -307,23 +307,40 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 // store and still not be a guarantee (the issuer's next commit can release the
 // version right after it passed). An unreachable version surfaces as a
 // transition error on first Session use instead of being swallowed.
+//
+// SpawnChild resolves through syscalls.resolveInheritedHistory, which narrows
+// the Processes `from` may name and shares the checks below.
 func (k *Kernel) resolveInheritedHistory(ctx context.Context, cfg *spawnConfig, name AgentName, b StrategyBinding) (*InheritedHistory, error) {
 	if !cfg.hasInheritFrom {
 		return nil, nil
 	}
-	if b.historyStore == nil {
-		return nil, goerr.Wrap(ErrHistoryNotConfigured,
-			"WithInheritedHistory needs an agent registered with WithHistoryStore",
-			goerr.V("agent", name))
-	}
-	if cfg.inheritFrom == "" {
-		return nil, goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory with an empty process id",
-			goerr.V("agent", name))
+	if err := validateInheritFrom(cfg, name, b); err != nil {
+		return nil, err
 	}
 	issuer, err := k.repo.GetProcess(ctx, cfg.inheritFrom) // ErrProcessNotFound propagates.
 	if err != nil {
 		return nil, err
 	}
+	return inheritedHistoryOf(issuer)
+}
+
+// validateInheritFrom reports what makes WithInheritedHistory unusable before
+// any record is read.
+func validateInheritFrom(cfg *spawnConfig, name AgentName, b StrategyBinding) error {
+	if b.historyStore == nil {
+		return goerr.Wrap(ErrHistoryNotConfigured,
+			"WithInheritedHistory needs an agent registered with WithHistoryStore",
+			goerr.V("agent", name))
+	}
+	if cfg.inheritFrom == "" {
+		return goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory with an empty process id",
+			goerr.V("agent", name))
+	}
+	return nil
+}
+
+// inheritedHistoryOf pins the version issuer's record currently names.
+func inheritedHistoryOf(issuer *Process) (*InheritedHistory, error) {
 	if issuer.HistoryRef == "" {
 		return nil, goerr.Wrap(ErrInvalidRequest, "the process to inherit from has committed no conversation",
 			goerr.V("from", issuer.ID), goerr.V("status", issuer.Status))

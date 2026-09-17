@@ -402,6 +402,13 @@ type SpawnRequest struct {
 	Metadata map[string]string
 	Subject  *SubjectRef
 
+	// InheritedHistory is the pair WithInheritedHistory resolved to, nil when the
+	// option was not used. It has already been checked to name a Process the
+	// spawning Process spawned; setting it to nil starts the child from an empty
+	// conversation. A pair a middleware sets itself is recorded without that
+	// check.
+	InheritedHistory *InheritedHistory
+
 	// OnCommit registers fn to be called exactly once with this TRANSITION's
 	// commit outcome: nil when the transition committed, non-nil when it did
 	// not.
