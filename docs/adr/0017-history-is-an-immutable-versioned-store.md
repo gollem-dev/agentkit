@@ -21,7 +21,9 @@ A new Process can **start from a version another Process committed**:
 `HistoryRef` and pins the pair on `Process.InheritedHistory`. It is read-only —
 the inheriting Process saves its own versions under its own id, and the kernel
 never `Discard`s an inherited version, because the issuing Process's record may
-still name it.
+still name it. On `SpawnChild` the option names only a Process the calling
+Process spawned itself — the set `WaitChildren` accepts — so a parent can hand a
+child the conversation of a sibling it has already collected.
 
 ## Context
 
@@ -134,12 +136,21 @@ the cause instead of documenting the symptom.
   what the new Process starts from. Spawn therefore reads that record, and
   reports `ErrProcessNotFound`, or `ErrInvalidRequest` when it has committed no
   conversation, instead of leaving a Process to fail on its first transition.
-- **Not on `SpawnChild`.** `Syscalls` hands out no `HistoryRef`, so a strategy
-  has no version to name; the one it would reach for — its own — is exactly what
-  its current transition's commit releases. Rejected as `ErrInvalidRequest`
-  before the middleware chain, like `WithIdempotencyKey`, and absent from
-  `SpawnRequest`. Permitting it later is a compatible addition; withdrawing it
-  would not be.
+- **On `SpawnChild`, only a Process the caller spawned.** Because the option
+  takes a `ProcessID` and the kernel reads the version off that record, a
+  strategy needs no `HistoryRef` handed to it to name one. Two things still have
+  to be excluded. A strategy must not be able to name an arbitrary `ProcessID`
+  and read that Process's conversation — the same reach `resolveWaitChildren`
+  closes. And it must not name its own Process, whose current version its
+  in-flight commit releases. One rule closes both: the named Process's
+  `ParentID` must be the calling Process's id, otherwise `ErrInvalidRequest` —
+  also when no Process by that id exists, as `WaitChildren` reports it. The
+  pair is resolved before the middleware chain and carried on
+  `SpawnRequest.InheritedHistory`, next to `Metadata`, so a `SpawnMiddleware`
+  can see and drop it; a pair a middleware sets itself is recorded without the
+  check. The use this exists for: a parent hands part of a batch to a child,
+  collects it, and gives the remainder to a second child that starts from the
+  first one's conversation instead of a prompt that restates it.
 
 ## Alternatives rejected
 
@@ -178,6 +189,16 @@ the cause instead of documenting the symptom.
   starts from would then depend on when it first runs: a turn the issuer commits
   in between silently changes the transcript. It would also put a `Repository`
   read inside the History load path.
+- **Refusing the option on `SpawnChild` outright.** The previous decision. Its
+  stated reason — `Syscalls` hands out no `HistoryRef`, so a strategy has no
+  version to name — stopped applying once the option took a `ProcessID`
+  instead of a ref. The refusal also made "continue a finished conversation in a
+  Process the parent waits on" unreachable: the top-level `Spawn` accepts the
+  option but sets no `ParentID`, so `WaitChildren` refuses the Process it
+  creates.
+- **Accepting any `ProcessID` on `SpawnChild`.** It would let a strategy read
+  the conversation of any Process whose id it learns, and name its own, whose
+  version its in-flight commit releases.
 - **Verifying at Spawn that the inherited version is still in the store.** It
   would couple Spawn to the blob store's availability and still not be a
   guarantee — the issuer's next commit can release the version immediately after
@@ -235,7 +256,13 @@ the cause instead of documenting the symptom.
   conversation does. A Process that inherits starts with empty `Metrics`, its own
   `Limit` budget, and its own cancellation. That is what the capability is for —
   running one question of a longer conversation as a unit that can be stopped and
-  bounded on its own.
+  bounded on its own. A child that inherits is no exception.
+- **Inheriting is not always the cheaper route.** An inherited conversation can
+  be much longer than the prompt it replaces. If the provider's prompt cache
+  still holds it when the inheriting Process runs, the first request is a cache
+  read of the whole conversation; if not, it is a cache write of the whole
+  conversation, which can cost more than rebuilding a short prompt. What decides
+  it is the time between the two Processes, which the kernel does not control.
 - The kernel still marshals nothing: the `HistoryStore` implementation
   serializes `*gollem.History` (ADR-0007 unchanged). `gollem.History` carries a
   version gate, so a load of an incompatible stored version surfaces as an error
@@ -255,3 +282,4 @@ the cause instead of documenting the symptom.
 | 2026-08-01 | Rewritten. Versions are immutable and named by `Process.HistoryRef`, committed atomically, so History rolls back with State: the duplication window and the one-Step obligation are both gone, and human-in-the-loop works with the managed conversation. `gollem.HistoryRepository` is replaced by the agentkit `HistoryStore` port (`Save`/`Load`/`Discard`), the flat `Session*` methods by a `Session()` handle that also carries `CallTool`, and the pre-save `ownsLease` fence is removed as unnecessary. |
 | 2026-08-03 | Added `WithInheritedHistory`: a new Process can start from a version another one committed, pinned at Spawn on `Process.InheritedHistory`. It is read-only and never `Discard`ed, which is why it is a field of its own rather than a value written into `HistoryRef` — the post-commit release reads that one. Rejected on `SpawnChild`. |
 | 2026-08-17 | `Session().CallTool` groups the results of one model turn into one `gollem.Message` instead of appending a message per call, and answers a call whose result cannot be encoded with an error response instead of leaving the pair open. One message per call made a parallel tool round answer one turn in several, which Claude and Gemini reject permanently, since the shape is in the committed history. gollem v0.28.2 merges consecutive tool messages in its Claude and Gemini converters, which repairs versions already stored that way. |
+| 2026-09-17 | `WithInheritedHistory` is accepted on `SpawnChild` when it names a Process the caller spawned, and refused as `ErrInvalidRequest` otherwise, the caller's own Process included. The blanket refusal rested on `Syscalls` handing out no `HistoryRef`, which the `ProcessID`-taking option no longer needs, and it left a Process that inherits a conversation unreachable by its parent's `WaitChildren`. The resolved pair is on `SpawnRequest.InheritedHistory`. |

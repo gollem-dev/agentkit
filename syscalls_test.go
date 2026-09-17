@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gollem-dev/agentkit"
+	histmem "github.com/gollem-dev/agentkit/historystore/memory"
 	"github.com/gollem-dev/agentkit/repository/memory"
 	"github.com/gollem-dev/gollem"
 	"github.com/gollem-dev/gollem/mock"
@@ -359,54 +360,249 @@ func TestSpawnChildWithParentHavingNoMetadata(t *testing.T) {
 	gt.Value(t, len(child.Metadata)).Equal(0)
 }
 
-// A strategy cannot obtain a History version to inherit — Syscalls hands out no
-// HistoryRef — so WithInheritedHistory on a child could only carry a reference
-// from outside the runtime, and the one a strategy would reach for (its own) is
-// released by this very transition's commit. It is rejected as the static misuse
-// it is, before any middleware sees the request.
-func TestSpawnChildRejectsInheritedHistory(t *testing.T) {
-	ctx := context.Background()
+// inheritProbe carries what the parent's second SpawnChild saw out of its Step.
+type inheritProbe struct {
+	mu       sync.Mutex
+	first    agentkit.ProcessID
+	second   agentkit.ProcessID
+	spawnErr error
+}
 
-	var mu sync.Mutex
-	var spawnErr error
-	repo := memory.New()
-	reg := agentkit.NewRegistry()
-	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: doneStep()})
-	gt.NoError(t, err)
+func (p *inheritProbe) set(first, second agentkit.ProcessID, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.first, p.second, p.spawnErr = first, second, err
+}
 
-	var childID agentkit.ProcessID
-	parentStep := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
-		id, e := child.SpawnChild(c, sys, scriptInput{Seed: "kid"},
-			agentkit.WithInheritedHistory(sys.ProcessID()))
-		mu.Lock()
-		spawnErr, childID = e, id
-		mu.Unlock()
-		// Swallowed on purpose: the point is what SpawnChild returned, and a
-		// committed Process makes the "no child was buffered" check meaningful.
+func (p *inheritProbe) get() (agentkit.ProcessID, agentkit.ProcessID, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.first, p.second, p.spawnErr
+}
+
+// setupInheritingParent registers a parent, on reg, that runs one
+// Session().Generate and spawns a child, waits for it, then spawns a second
+// child with WithInheritedHistory(from(sys, first)) and waits for that one too.
+// The parent's own conversation is committed before its second Step, so naming
+// the parent itself fails for no reason other than whose Process it is. A
+// rejected SpawnChild is recorded and the parent finishes with output
+// "rejected", so the test can assert on the error.
+func setupInheritingParent(t *testing.T, reg *agentkit.Registry, child agentkit.Agent[scriptInput],
+	from func(sys agentkit.Syscalls, first agentkit.ProcessID) agentkit.ProcessID,
+	kopts ...agentkit.KernelOption) (*agentkit.Kernel, agentkit.Repository, agentkit.Agent[scriptInput], *inheritProbe) {
+	t.Helper()
+	probe := &inheritProbe{}
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		switch st.N {
+		case 0:
+			if _, err := sys.Session().Generate(c, []gollem.Input{gollem.Text("plan")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			id, err := child.SpawnChild(c, sys, scriptInput{Seed: "first"})
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			st.N = 1
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("first", id)), nil
+		case 1:
+			aw, ok := sys.Await("first")
+			if !ok || len(aw.Results) != 1 {
+				return st, agentkit.Decision[[]byte]{}, errors.New("the first child's result is missing")
+			}
+			first := aw.Results[0].ProcessID
+			id, err := child.SpawnChild(c, sys, scriptInput{Seed: "second"},
+				agentkit.WithInheritedHistory(from(sys, first)))
+			probe.set(first, id, err)
+			if err != nil {
+				return st, agentkit.Done([]byte("rejected")), nil
+			}
+			st.N = 2
+			return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("second", id)), nil
+		}
 		return st, agentkit.Done([]byte("done")), nil
 	}
-	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: parentStep})
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: step},
+		agentkit.WithHistoryStore[[]byte](histmem.New()))
 	gt.NoError(t, err)
-	model, _ := mockLLM(textResponse("x"))
-	k, err := agentkit.New(repo, model, reg)
+	repo := memory.New()
+	k, err := agentkit.New(repo, growingLLM(), reg, kopts...)
 	gt.NoError(t, err)
+	return k, repo, parent, probe
+}
+
+// A parent hands a second child the conversation of a first one it has already
+// collected, and waits on the second child like on any other.
+func TestSpawnChildInheritsSiblingHistory(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	store := histmem.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: sessionStep(&seen, &mu, 1)},
+		agentkit.WithHistoryStore[[]byte](store))
+	gt.NoError(t, err)
+	k, repo, parent, probe := setupInheritingParent(t, reg, child,
+		func(_ agentkit.Syscalls, first agentkit.ProcessID) agentkit.ProcessID { return first })
 
 	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
 	gt.NoError(t, err)
 	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	// "done" is only reachable after the await on the second child resolved.
+	gt.Value(t, string(p.Output)).Equal("done")
+
+	first, second, spawnErr := probe.get()
+	gt.NoError(t, spawnErr)
+	firstProc, err := k.GetProcess(ctx, first)
+	gt.NoError(t, err)
+	secondProc, err := k.GetProcess(ctx, second)
+	gt.NoError(t, err)
+	gt.Value(t, secondProc.Status).Equal(agentkit.ProcessSucceeded)
+	gt.NotNil(t, secondProc.ParentID)
+	gt.Value(t, *secondProc.ParentID).Equal(pid)
+	gt.NotNil(t, secondProc.InheritedHistory)
+	gt.Value(t, *secondProc.InheritedHistory).
+		Equal(agentkit.InheritedHistory{Process: first, Ref: firstProc.HistoryRef})
 
 	mu.Lock()
-	gotErr, gotID := spawnErr, childID
-	mu.Unlock()
-	gt.Error(t, gotErr).Is(agentkit.ErrInvalidRequest)
-	gt.Value(t, gotID).Equal(agentkit.ProcessID("")) // no id was minted.
+	defer mu.Unlock()
+	// The first child started empty; the second started from the first's message.
+	gt.Value(t, seen).Equal([]int{0, 1})
+	gt.Value(t, histLen(committedHistory(t, store, secondProc))).Equal(2)
+	gt.Value(t, histLen(committedHistory(t, store, firstProc))).Equal(1)
+}
 
-	// And no child row exists: the parent's own commit was the only write.
-	now := time.Now()
-	claimed, err := repo.ClaimNextProcess(ctx, "probe", now.Add(time.Minute), now)
+// Only a Process the caller itself spawned can be named. Everything else is
+// refused before a child is minted, whether or not the named Process exists.
+func TestSpawnChildInheritedHistoryValidation(t *testing.T) {
+	ctx := context.Background()
+
+	// rejected serves the parent to completion and asserts the second SpawnChild
+	// failed with want and left no row behind.
+	rejected := func(t *testing.T, k *agentkit.Kernel, repo agentkit.Repository,
+		parent agentkit.Agent[scriptInput], probe *inheritProbe, want error) {
+		t.Helper()
+		pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+		gt.NoError(t, err)
+		p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+		gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, string(p.Output)).Equal("rejected")
+
+		_, second, spawnErr := probe.get()
+		gt.Error(t, spawnErr).Is(want)
+		gt.Value(t, second).Equal(agentkit.ProcessID("")) // no id was minted.
+		now := time.Now()
+		claimed, err := repo.ClaimNextProcess(ctx, "probe", now.Add(time.Minute), now)
+		gt.NoError(t, err)
+		gt.Nil(t, claimed)
+	}
+
+	registerChild := func(t *testing.T, reg *agentkit.Registry, step stepFn, opts ...agentkit.RegisterOption[[]byte]) agentkit.Agent[scriptInput] {
+		t.Helper()
+		child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: step}, opts...)
+		gt.NoError(t, err)
+		return child
+	}
+
+	t.Run("a process the caller did not spawn", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		reg := agentkit.NewRegistry()
+		child := registerChild(t, reg, sessionStep(&seen, &mu, 1), agentkit.WithHistoryStore[[]byte](histmem.New()))
+		var outsider agentkit.ProcessID
+		k, repo, parent, probe := setupInheritingParent(t, reg, child,
+			func(agentkit.Syscalls, agentkit.ProcessID) agentkit.ProcessID { return outsider })
+
+		// A finished Process with a committed conversation, outside the parent's tree.
+		id, err := child.Spawn(ctx, k, scriptInput{Seed: "outsider"})
+		gt.NoError(t, err)
+		op := serveUntil(t, k, repo, id, 5*time.Second, isTerminal)
+		gt.Value(t, op.HistoryRef).NotEqual(agentkit.HistoryRef(""))
+		outsider = id
+
+		rejected(t, k, repo, parent, probe, agentkit.ErrInvalidRequest)
+	})
+
+	t.Run("an unknown process", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		reg := agentkit.NewRegistry()
+		child := registerChild(t, reg, sessionStep(&seen, &mu, 1), agentkit.WithHistoryStore[[]byte](histmem.New()))
+		k, repo, parent, probe := setupInheritingParent(t, reg, child,
+			func(agentkit.Syscalls, agentkit.ProcessID) agentkit.ProcessID { return "no-such-process" })
+		rejected(t, k, repo, parent, probe, agentkit.ErrInvalidRequest)
+	})
+
+	t.Run("the caller's own process", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []int
+		reg := agentkit.NewRegistry()
+		child := registerChild(t, reg, sessionStep(&seen, &mu, 1), agentkit.WithHistoryStore[[]byte](histmem.New()))
+		k, repo, parent, probe := setupInheritingParent(t, reg, child,
+			func(sys agentkit.Syscalls, _ agentkit.ProcessID) agentkit.ProcessID { return sys.ProcessID() })
+		rejected(t, k, repo, parent, probe, agentkit.ErrInvalidRequest)
+	})
+
+	t.Run("a child with no committed conversation", func(t *testing.T) {
+		reg := agentkit.NewRegistry()
+		child := registerChild(t, reg, doneStep(), agentkit.WithHistoryStore[[]byte](histmem.New()))
+		k, repo, parent, probe := setupInheritingParent(t, reg, child,
+			func(_ agentkit.Syscalls, first agentkit.ProcessID) agentkit.ProcessID { return first })
+		rejected(t, k, repo, parent, probe, agentkit.ErrInvalidRequest)
+	})
+
+	t.Run("a child agent without a history store", func(t *testing.T) {
+		reg := agentkit.NewRegistry()
+		child := registerChild(t, reg, doneStep())
+		k, repo, parent, probe := setupInheritingParent(t, reg, child,
+			func(_ agentkit.Syscalls, first agentkit.ProcessID) agentkit.ProcessID { return first })
+		rejected(t, k, repo, parent, probe, agentkit.ErrHistoryNotConfigured)
+	})
+}
+
+// The pair is resolved before the chain, so a SpawnMiddleware sees it and can
+// drop it; the child then starts from an empty conversation.
+func TestSpawnMiddlewareCanDropInheritedHistory(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	var sawPair bool
+	mw := func(next agentkit.SpawnHandler) agentkit.SpawnHandler {
+		return func(c context.Context, req *agentkit.SpawnRequest) (agentkit.ProcessID, error) {
+			if req.InheritedHistory != nil {
+				mu.Lock()
+				sawPair = true
+				mu.Unlock()
+				req.InheritedHistory = nil
+			}
+			return next(c, req)
+		}
+	}
+	store := histmem.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: sessionStep(&seen, &mu, 1)},
+		agentkit.WithHistoryStore[[]byte](store))
 	gt.NoError(t, err)
-	gt.Nil(t, claimed)
+	k, repo, parent, probe := setupInheritingParent(t, reg, child,
+		func(_ agentkit.Syscalls, first agentkit.ProcessID) agentkit.ProcessID { return first },
+		agentkit.WithSpawnMiddleware(mw))
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, string(p.Output)).Equal("done")
+
+	_, second, spawnErr := probe.get()
+	gt.NoError(t, spawnErr)
+	secondProc, err := k.GetProcess(ctx, second)
+	gt.NoError(t, err)
+	gt.Nil(t, secondProc.InheritedHistory)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Bool(t, sawPair).True()
+	gt.Value(t, seen).Equal([]int{0, 0})
+	gt.Value(t, histLen(committedHistory(t, store, secondProc))).Equal(1)
 }
 
 // Inheritance runs before the chain, so a SpawnMiddleware is the place to strip

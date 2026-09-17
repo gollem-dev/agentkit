@@ -255,10 +255,17 @@ func WithMetadata(m map[string]string) SpawnOption {
 // a notification, so whether it is really reclaimed is the store's call).
 // Inherit from a finished Process, or accept that.
 //
-// Not usable on SpawnChild: a strategy has no way to obtain a version to
-// inherit (Syscalls hands out no HistoryRef), so the option would only be
-// reachable with a ref smuggled in from outside. Specifying it there is
-// ErrInvalidRequest.
+// On SpawnChild, `from` must be a Process the calling Process itself spawned —
+// the same set WaitChildren accepts — which is how a parent hands a child the
+// conversation of a sibling it has already collected. Any other id, the caller's
+// own included, is ErrInvalidRequest. The resolved pair is on
+// SpawnRequest.InheritedHistory, where a SpawnMiddleware can drop it.
+//
+// An inherited conversation can be much longer than the prompt it replaces.
+// Whether that is cheaper depends on the provider's prompt cache still holding
+// it when the new Process runs: warm, it is a cache read of the whole
+// conversation; cold, it is a cache write of the whole conversation, which can
+// cost more than rebuilding a short prompt would.
 func WithInheritedHistory(from ProcessID) SpawnOption {
 	return func(c *spawnConfig) { c.inheritFrom = from; c.hasInheritFrom = true }
 }
@@ -522,9 +529,17 @@ func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts .
 	if cfg.hasIdempotencyKey {
 		return "", goerr.Wrap(ErrInvalidRequest, "WithIdempotencyKey is not allowed on SpawnChild (D48)")
 	}
+	// Resolved before the chain, like the metadata below, so a SpawnMiddleware sees
+	// the pair and can drop it.
+	var inherited *InheritedHistory
 	if cfg.hasInheritFrom {
-		return "", goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory is not allowed on SpawnChild",
-			goerr.V("from", cfg.inheritFrom))
+		b, err := s.k.agents.binding(agent)
+		if err != nil {
+			return "", err
+		}
+		if inherited, err = s.k.resolveInheritedHistory(ctx, cfg, agent, b, &s.proc.ID); err != nil {
+			return "", err
+		}
 	}
 	// A child runs under its parent's infrastructure scope, so the map carries
 	// over when the caller named none — a ToolFactory keying off metadata["tenant"]
@@ -536,12 +551,13 @@ func (s *syscalls) spawn(ctx context.Context, agent AgentName, input any, opts .
 		md = maps.Clone(s.proc.Metadata)
 	}
 	req := &SpawnRequest{
-		Effect:   s.ec(),
-		Agent:    agent,
-		Metadata: md,
-		Subject:  cfg.subject,
-		OnCommit: s.registerSpawnCommit,
-		input:    input,
+		Effect:           s.ec(),
+		Agent:            agent,
+		Metadata:         md,
+		Subject:          cfg.subject,
+		InheritedHistory: inherited,
+		OnCommit:         s.registerSpawnCommit,
+		input:            input,
 	}
 	h := chainSpawn(s.k.spawnMW, s.spawnBase)
 	if h == nil {
@@ -592,18 +608,19 @@ func (s *syscalls) spawnBase(ctx context.Context, req *SpawnRequest) (ProcessID,
 	}
 	now := s.k.clock()
 	s.pendingChildren = append(s.pendingChildren, &Process{
-		ID:           cid,
-		Agent:        req.Agent,
-		Status:       ProcessPending,
-		Metadata:     req.Metadata,
-		State:        raw,
-		StateVersion: b.version,
-		ParentID:     &s.proc.ID,
-		RootID:       s.proc.RootID,
-		Subject:      req.Subject,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		Rev:          0,
+		ID:               cid,
+		Agent:            req.Agent,
+		Status:           ProcessPending,
+		Metadata:         req.Metadata,
+		State:            raw,
+		StateVersion:     b.version,
+		ParentID:         &s.proc.ID,
+		RootID:           s.proc.RootID,
+		Subject:          req.Subject,
+		InheritedHistory: req.InheritedHistory,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		Rev:              0,
 	})
 	s.meter(ctx, Metrics{Spawns: 1})
 	return cid, nil

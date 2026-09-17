@@ -213,7 +213,7 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 	// Resolved before Init, so a request that cannot succeed does not run Init and
 	// its middleware. It is also before the idempotency lookup, like Init itself:
 	// an idempotent Spawn that returns an existing Process still pays this read.
-	inherited, err := k.resolveInheritedHistory(ctx, cfg, name, b)
+	inherited, err := k.resolveInheritedHistory(ctx, cfg, name, b, nil)
 	if err != nil {
 		return "", err
 	}
@@ -307,7 +307,14 @@ func (k *Kernel) spawnFromApp(ctx context.Context, name AgentName, input any, op
 // store and still not be a guarantee (the issuer's next commit can release the
 // version right after it passed). An unreachable version surfaces as a
 // transition error on first Session use instead of being swallowed.
-func (k *Kernel) resolveInheritedHistory(ctx context.Context, cfg *spawnConfig, name AgentName, b StrategyBinding) (*InheritedHistory, error) {
+//
+// spawner is the Process calling SpawnChild, or nil for the top-level Spawn. When
+// set, `from` must be a Process spawner itself spawned — the reach WaitChildren
+// already allows — so the option lets a strategy read no conversation it could
+// not already collect, and it cannot name spawner's own version, which spawner's
+// in-flight commit is about to release. As in resolveWaitChildren, an id outside
+// that reach is ErrInvalidRequest whether or not a Process by that id exists.
+func (k *Kernel) resolveInheritedHistory(ctx context.Context, cfg *spawnConfig, name AgentName, b StrategyBinding, spawner *ProcessID) (*InheritedHistory, error) {
 	if !cfg.hasInheritFrom {
 		return nil, nil
 	}
@@ -320,9 +327,17 @@ func (k *Kernel) resolveInheritedHistory(ctx context.Context, cfg *spawnConfig, 
 		return nil, goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory with an empty process id",
 			goerr.V("agent", name))
 	}
-	issuer, err := k.repo.GetProcess(ctx, cfg.inheritFrom) // ErrProcessNotFound propagates.
+	issuer, err := k.repo.GetProcess(ctx, cfg.inheritFrom)
 	if err != nil {
-		return nil, err
+		if spawner != nil && isNotFound(err) {
+			return nil, goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory names a process this one did not spawn",
+				goerr.V("from", cfg.inheritFrom), goerr.V("spawner", *spawner))
+		}
+		return nil, err // ErrProcessNotFound propagates on the top-level Spawn.
+	}
+	if spawner != nil && (issuer.ParentID == nil || *issuer.ParentID != *spawner) {
+		return nil, goerr.Wrap(ErrInvalidRequest, "WithInheritedHistory names a process this one did not spawn",
+			goerr.V("from", issuer.ID), goerr.V("spawner", *spawner))
 	}
 	if issuer.HistoryRef == "" {
 		return nil, goerr.Wrap(ErrInvalidRequest, "the process to inherit from has committed no conversation",

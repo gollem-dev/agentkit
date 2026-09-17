@@ -335,8 +335,41 @@ reasonable thing to want — but the version can be gone by the time it is read,
 which surfaces as a failing first transition, not as an empty conversation.
 
 `Spawn` fails synchronously if `previous` does not exist, or has committed no
-conversation yet, or the agent was registered without `WithHistoryStore`. It is
-not available on `SpawnChild`: a strategy has no `HistoryRef` to name.
+conversation yet, or the agent was registered without `WithHistoryStore`.
+
+**An inherited conversation is not always cheaper than a fresh prompt.** It can
+be much longer than the prompt it replaces. If the provider's prompt cache still
+holds it when the new Process runs, the first request reads the whole
+conversation from the cache; if the cache has expired, it writes the whole
+conversation to the cache, which can cost more than rebuilding a short prompt.
+Size the choice against the time between the two Processes.
+
+#### From a strategy, for a child
+
+A strategy can pass the option to `SpawnChild` too, naming a Process **it spawned
+itself** — typically a child it has already waited on. The use: hand part of a
+batch to one child, collect what it did, and give the remainder to a second child
+that starts from the first one's conversation instead of a prompt restating it.
+
+```go
+func (s *Batcher) Step(ctx context.Context, sys agentkit.Syscalls, st State) (State, agentkit.Decision[Output], error) {
+    // ... an earlier Step spawned st.First and suspended on WaitChildren("first", st.First).
+    next, err := s.worker.SpawnChild(ctx, sys, workerInput{Prompt: "here is what is left: ..."},
+        agentkit.WithInheritedHistory(st.First))
+    if err != nil {
+        return st, agentkit.Decision[Output]{}, err
+    }
+    st.Second = next
+    return st, agentkit.Suspend[Output](agentkit.WaitChildren("second", next)), nil
+}
+```
+
+The second child is an ordinary child: the parent waits on it, and its `Metrics`
+fold into the parent when the await resolves. Naming any Process the caller did
+not spawn — a sibling's child, an unrelated Process, the caller's own — is
+`ErrInvalidRequest`, and so is an id no Process has; the other failures are the
+same as on `Spawn`. A `SpawnMiddleware` sees the resolved pair on
+`req.InheritedHistory` and can set it to `nil` to start the child empty.
 
 ### Where a cancel can stop
 
