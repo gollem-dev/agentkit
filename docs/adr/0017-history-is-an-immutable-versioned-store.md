@@ -69,8 +69,8 @@ the cause instead of documenting the symptom.
   the `StrategyBinding`. `Kernel.New(repo, ...)` is unchanged; the transactional
   `Repository` and the blob `HistoryStore` are injected through different
   channels.
-- **`Syscalls.Session()` returns a handle** with `Generate`, `CallTool` and
-  `History`. It always returns a usable handle; the methods report
+- **`Syscalls.Session()` returns a handle** with `Generate`, `CallTool`,
+  `SetHistory` and `History`. It always returns a usable handle; the methods report
   `ErrHistoryNotConfigured` when the agent has no store, so a misconfiguration
   surfaces at the point of use rather than as a nil check a caller can forget.
   The handle is scoped to one transition, like the `Syscalls` it came from.
@@ -98,6 +98,25 @@ the cause instead of documenting the symptom.
   repairs versions already stored in the split shape; grouping here decides the
   shape agentkit *commits*, which is also what every other reader of the stored
   conversation sees.
+- **Three calls change the transition's working copy: `Generate`, `CallTool`
+  and `SetHistory`.** The rules for saving and committing a version do not
+  depend on which one ran. `SetHistory` replaces the working copy with a
+  history the strategy built — in practice the `GenerateResult.History` of a
+  primitive `Syscalls.Generate` that started from `Session().History()` — so
+  a turn that has to run without the agent's tools (one schema-bound answer,
+  say) still becomes part of the conversation, and a Process whose turns are
+  all primitive can still commit a version and be inherited from. It clones
+  what it is given, for the reason `History` hands out a copy: once the
+  transition commits, the working copy becomes the claim's baseline, which
+  later transitions and their same-lease retries start from, so a caller
+  editing the history afterwards must not reach it. A retry after a conflict
+  still starts from the previous baseline, because `commitHistory` runs only
+  after a successful `Apply`. It refuses, as
+  `ErrInvalidRequest`, a nil history, one with an unanswered tool call (the next
+  request would be rejected, and ADR-0020's cancel waits for a closed
+  conversation), and one whose `LLType` differs from the working copy or the
+  baseline. It does **not** check that the history continues the current
+  conversation; that is the caller's responsibility.
 - **Save precedes commit.** In `worker.go` the save runs ahead of both
   `buildCommit` (which records the ref it returns) and the `commitTerminal` on
   the Done/Fail path, because the commit is the completion marker: durable work
@@ -217,6 +236,19 @@ the cause instead of documenting the symptom.
 - **Flat `SessionGenerate` / `SessionHistory` / `SessionCallTool` methods on
   `Syscalls`.** What the previous version of this ADR chose, when there were two
   of them. A third made the repeated prefix worse than a handle.
+- **Removing the agent's tools for one `Session().Generate` instead of adding
+  `SetHistory`.** `WithTools` only adds tools, so this would take a Generate
+  middleware that clears `GenerateRequest.Tools`, or a new option. No new
+  `Session` method, but the tool list then changes in the middle of the
+  conversation: the provider's prompt cache no longer matches, and a provider
+  that verifies thinking-block signatures can reject the following request.
+- **Having `SetHistory` verify that the history continues the current one**
+  (for example, that the message count did not shrink or the existing messages
+  are an exact prefix). A Generate middleware may legitimately rewrite the
+  history it returns — stripping thinking blocks is the expected case — and an
+  exact-prefix comparison fails on that. A weaker check would reject some
+  mistakes and still not establish continuity, so the responsibility is stated
+  on the method instead.
 - **`Session() (Session, bool)`, or a nil handle when unconfigured.** The
   comma-ok form lets a caller ignore the bool and silently do nothing, which is
   exactly the "runs without persistence" this ADR refuses; the nil form turns the
@@ -293,3 +325,4 @@ the cause instead of documenting the symptom.
 | 2026-08-03 | Added `WithInheritedHistory`: a new Process can start from a version another one committed, pinned at Spawn on `Process.InheritedHistory`. It is read-only and never `Discard`ed, which is why it is a field of its own rather than a value written into `HistoryRef` — the post-commit release reads that one. Rejected on `SpawnChild`. |
 | 2026-08-17 | `Session().CallTool` groups the results of one model turn into one `gollem.Message` instead of appending a message per call, and answers a call whose result cannot be encoded with an error response instead of leaving the pair open. One message per call made a parallel tool round answer one turn in several, which Claude and Gemini reject permanently, since the shape is in the committed history. gollem v0.28.2 merges consecutive tool messages in its Claude and Gemini converters, which repairs versions already stored that way. |
 | 2026-09-17 | `WithInheritedHistory` is accepted on `SpawnChild` when it names a Process the caller spawned, and refused as `ErrInvalidRequest` otherwise, the caller's own Process included. The blanket refusal rested on `Syscalls` handing out no `HistoryRef`, which the `ProcessID`-taking option no longer needs, and it left a Process that inherits a conversation unreachable by its parent's `WaitChildren`. The resolved pair is on `SpawnRequest.InheritedHistory`. |
+| 2026-10-01 | Added `Session().SetHistory`, a third way to change the working copy next to `Generate` and `CallTool`, so a primitive `Syscalls.Generate` run without the agent's tools can be brought into the managed conversation. Before it, such a turn was lost, and a Process that used only the primitive Generate committed no version and could not be inherited from. Saving and committing are unchanged. |

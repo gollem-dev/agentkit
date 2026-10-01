@@ -277,15 +277,16 @@ func TestSession_PersistsAcrossClaims(t *testing.T) {
 func TestSession_WithoutStoreErrors(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
-	var genErr, histErr, toolErr error
+	var genErr, histErr, toolErr, setErr error
 	var handleNil bool
 	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
 		sess := sys.Session()
 		_, he := sess.History(ctx)
 		_, te := sess.CallTool(ctx, gollem.FunctionCall{ID: "c1", Name: "t"})
+		se := sess.SetHistory(ctx, &gollem.History{LLType: gollem.LLMTypeClaude, Version: gollem.HistoryVersion})
 		_, ge := sess.Generate(ctx, []gollem.Input{gollem.Text("hi")})
 		mu.Lock()
-		handleNil, histErr, toolErr, genErr = sess == nil, he, te, ge
+		handleNil, histErr, toolErr, setErr, genErr = sess == nil, he, te, se, ge
 		mu.Unlock()
 		return st, agentkit.Decision[[]byte]{}, ge
 	}
@@ -307,6 +308,7 @@ func TestSession_WithoutStoreErrors(t *testing.T) {
 	gt.Value(t, errors.Is(genErr, agentkit.ErrHistoryNotConfigured)).Equal(true)
 	gt.Value(t, errors.Is(histErr, agentkit.ErrHistoryNotConfigured)).Equal(true)
 	gt.Value(t, errors.Is(toolErr, agentkit.ErrHistoryNotConfigured)).Equal(true)
+	gt.Value(t, errors.Is(setErr, agentkit.ErrHistoryNotConfigured)).Equal(true)
 }
 
 // ---- error paths ----
@@ -1965,4 +1967,460 @@ func TestSessionGenerateCarriesResolvedModel(t *testing.T) {
 	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
 	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
 	gt.Value(t, string(p.Output)).Equal("session-m")
+}
+
+// ---- SetHistory ----
+
+// sessionSeed is what one LLM session was constructed with.
+type sessionSeed struct {
+	history *gollem.History
+	tools   int
+	schema  bool
+}
+
+// answeringLLM answers every Generate with one assistant text message appended
+// to the history the session was seeded with — "answer-1", "answer-2", ... in
+// call order — and records each session's seed, so a test can see what a
+// Generate started from.
+type answeringLLM struct {
+	mu    sync.Mutex
+	calls int
+	seeds []sessionSeed
+}
+
+func (m *answeringLLM) client() gollem.LLMClient {
+	return &mock.LLMClientMock{
+		NewSessionFunc: func(_ context.Context, opts ...gollem.SessionOption) (gollem.Session, error) {
+			cfg := gollem.NewSessionConfig(opts...)
+			seeded := cfg.History().Clone()
+			m.mu.Lock()
+			m.seeds = append(m.seeds, sessionSeed{history: seeded, tools: len(cfg.Tools()), schema: cfg.ResponseSchema() != nil})
+			m.mu.Unlock()
+			var answered *gollem.History
+			return &mock.SessionMock{
+				GenerateFunc: func(_ context.Context, _ []gollem.Input, _ ...gollem.GenerateOption) (*gollem.Response, error) {
+					m.mu.Lock()
+					m.calls++
+					text := fmt.Sprintf("answer-%d", m.calls)
+					m.mu.Unlock()
+					c, err := gollem.NewTextContent(text)
+					if err != nil {
+						return nil, err
+					}
+					answered = seeded.Clone()
+					if answered == nil {
+						answered = &gollem.History{LLType: gollem.LLMTypeClaude, Version: gollem.HistoryVersion}
+					}
+					answered.Messages = append(answered.Messages,
+						gollem.Message{Role: gollem.RoleAssistant, Contents: []gollem.MessageContent{c}})
+					return &gollem.Response{Texts: []string{text}, InputToken: 1, OutputToken: 1}, nil
+				},
+				HistoryFunc: func() (*gollem.History, error) { return answered, nil },
+			}, nil
+		},
+	}
+}
+
+func (m *answeringLLM) seen() []sessionSeed {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]sessionSeed(nil), m.seeds...)
+}
+
+// messageTexts returns the text of every text content in h, in order.
+func messageTexts(t *testing.T, h *gollem.History) []string {
+	t.Helper()
+	if h == nil {
+		return nil
+	}
+	var out []string
+	for _, m := range h.Messages {
+		for i := range m.Contents {
+			if m.Contents[i].Type != gollem.MessageContentTypeText {
+				continue
+			}
+			tc, err := m.Contents[i].GetTextContent()
+			gt.NoError(t, err)
+			out = append(out, tc.Text)
+		}
+	}
+	return out
+}
+
+var verdictSchema = &gollem.Parameter{
+	Type:       gollem.TypeObject,
+	Properties: map[string]*gollem.Parameter{"verdict": {Type: gollem.TypeString}},
+}
+
+// generateWithoutTools runs the turn SetHistory exists for: the primitive
+// Generate over the managed conversation, schema-bound and with no tools.
+func generateWithoutTools(ctx context.Context, sys agentkit.Syscalls) (*agentkit.GenerateResult, error) {
+	h, err := sys.Session().History(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return sys.Generate(ctx, []gollem.Input{gollem.Text("judge")},
+		agentkit.WithHistory(h), agentkit.WithSchema(verdictSchema))
+}
+
+// A Process whose only LLM turn is a primitive Generate commits a version once
+// it hands the result to SetHistory, and the next transition reads it back.
+func TestSession_SetHistoryCommitsAPrimitiveGenerate(t *testing.T) {
+	ctx := context.Background()
+	llm := &answeringLLM{}
+	store := &probeStore{inner: histmem.New()}
+	var mu sync.Mutex
+	var adopted, next *gollem.History
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N == 0 {
+			res, err := generateWithoutTools(ctx, sys)
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			if err := sys.Session().SetHistory(ctx, res.History); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			mu.Lock()
+			adopted = res.History.Clone()
+			mu.Unlock()
+			st.N = 1
+			return st, agentkit.Continue[[]byte](), nil
+		}
+		h, err := sys.Session().History(ctx)
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		mu.Lock()
+		next = h
+		mu.Unlock()
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	k, repo, ag := registerWithHistory(t, step, llm.client(), store)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	// One transition per claim, so the second transition reads the version from
+	// the store rather than from the claim's in-memory baseline.
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal, agentkit.WithMaxStepsPerClaim(1))
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	gt.Value(t, p.HistoryRef).NotEqual(agentkit.HistoryRef(""))
+	// Only the adopting transition saved; the second one did not touch the
+	// conversation, so the ref the record names is the adopted version.
+	gt.Value(t, store.saveCount()).Equal(1)
+	gt.Array(t, store.loaded()).Length(1)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Value(t, messageTexts(t, adopted)).Equal([]string{"answer-1"})
+	gt.Value(t, messageTexts(t, next)).Equal(messageTexts(t, adopted))
+	gt.Value(t, histLen(next)).Equal(histLen(adopted))
+	gt.Value(t, messageTexts(t, committedHistory(t, store, p))).Equal(messageTexts(t, adopted))
+}
+
+// Without SetHistory, a Process that only ran the primitive Generate commits no
+// conversation and WithInheritedHistory refuses it. With it, the Process is an
+// issuer like any other.
+func TestSession_SetHistoryMakesAProcessInheritable(t *testing.T) {
+	ctx := context.Background()
+	llm := &answeringLLM{}
+	store := &probeStore{inner: histmem.New()}
+	var mu sync.Mutex
+	var heirSaw *gollem.History
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.Seed == "issuer" {
+			res, err := generateWithoutTools(ctx, sys)
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			if err := sys.Session().SetHistory(ctx, res.History); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		h, err := sys.Session().History(ctx)
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		mu.Lock()
+		heirSaw = h
+		mu.Unlock()
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	k, repo, ag := registerWithHistory(t, step, llm.client(), store)
+
+	issuer := runIssuer(t, k, repo, ag) // asserts the issuer committed a ref.
+
+	heirID, err := ag.Spawn(ctx, k, scriptInput{Seed: "heir"}, agentkit.WithInheritedHistory(issuer.ID))
+	gt.NoError(t, err)
+	heir := serveUntil(t, k, repo, heirID, 5*time.Second, isTerminal)
+	gt.Value(t, heir.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Value(t, messageTexts(t, heirSaw)).Equal([]string{"answer-1"})
+}
+
+// After SetHistory, Session().Generate starts from the adopted history and binds
+// the agent's tools again; the primitive turn before it ran schema-bound and
+// without them.
+func TestSession_GenerateAfterSetHistorySeedsFromIt(t *testing.T) {
+	ctx := context.Background()
+	llm := &answeringLLM{}
+	store := histmem.New()
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		res, err := generateWithoutTools(ctx, sys)
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if err := sys.Session().SetHistory(ctx, res.History); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("go on")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	factory := func(_ context.Context, _ *agentkit.Process) ([]gollem.Tool, error) {
+		return []gollem.Tool{mockTool("t", map[string]any{})}, nil
+	}
+	k, repo, ag := registerWithHistory(t, step, llm.client(), store, agentkit.WithToolFactory(factory))
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	seeds := llm.seen()
+	gt.Array(t, seeds).Length(2)
+	gt.Value(t, seeds[0].tools).Equal(0)
+	gt.Value(t, seeds[0].schema).Equal(true)
+	gt.Value(t, seeds[1].tools).Equal(1)
+	gt.Value(t, messageTexts(t, seeds[1].history)).Equal([]string{"answer-1"})
+	gt.Value(t, messageTexts(t, committedHistory(t, store, p))).Equal([]string{"answer-1", "answer-2"})
+}
+
+// A same-lease retry after a conflicted Apply re-seeds from the committed
+// baseline: the history the abandoned attempt adopted is not seen again, and the
+// version that attempt saved is released.
+func TestSession_SetHistoryConflictRetryReseedsFromBaseline(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	var seen []int
+	inner := memory.New()
+	repo := &fragileRepo{Repository: inner, err: agentkit.ErrConflict}
+	store := &probeStore{inner: histmem.New()}
+	reg := agentkit.NewRegistry()
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		h, err := sys.Session().History(ctx)
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		mu.Lock()
+		seen = append(seen, histLen(h))
+		mu.Unlock()
+		switch st.N {
+		case 0:
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+		case 1:
+			repo.armed.Store(true) // conflict this transition's first Apply, after its save.
+			res, err := generateWithoutTools(ctx, sys)
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			if err := sys.Session().SetHistory(ctx, res.History); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+		default:
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		st.N++
+		return st, agentkit.Continue[[]byte](), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](store))
+	gt.NoError(t, err)
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, repo.fired.Load()).Equal(true)
+
+	mu.Lock()
+	got := append([]int(nil), seen...)
+	mu.Unlock()
+	// T1=0, T2-attempt1=1, T2-attempt2=1 (the baseline, not the 2 messages the
+	// abandoned attempt adopted), T3=2.
+	gt.Value(t, got).Equal([]int{0, 1, 1, 2})
+	gt.Value(t, histLen(committedHistory(t, store, p))).Equal(2)
+
+	saved := store.saved()
+	gt.Array(t, saved).Length(3) // T1, T2-attempt1 (conflicted), T2-attempt2.
+	gt.Value(t, slices.Contains(store.discarded(), saved[1])).Equal(true)
+	gt.Value(t, saved[2]).Equal(p.HistoryRef)
+}
+
+// SetHistory keeps its own copy: editing the history after the call reaches
+// neither the conversation nor the version the worker saves.
+func TestSession_SetHistoryKeepsACopy(t *testing.T) {
+	ctx := context.Background()
+	llm := &answeringLLM{}
+	store := histmem.New()
+	var mu sync.Mutex
+	var after *gollem.History
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		res, err := generateWithoutTools(ctx, sys)
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if err := sys.Session().SetHistory(ctx, res.History); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		tampered, err := gollem.NewTextContent("tampered")
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		res.History.Messages[0].Contents[0] = tampered
+		res.History.Messages = append(res.History.Messages, gollem.Message{Role: gollem.RoleUser})
+		h, err := sys.Session().History(ctx)
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		mu.Lock()
+		after = h
+		mu.Unlock()
+		return st, agentkit.Done([]byte("done")), nil
+	}
+	k, repo, ag := registerWithHistory(t, step, llm.client(), store)
+
+	pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	mu.Lock()
+	defer mu.Unlock()
+	gt.Value(t, messageTexts(t, after)).Equal([]string{"answer-1"})
+	gt.Value(t, messageTexts(t, committedHistory(t, store, p))).Equal([]string{"answer-1"})
+}
+
+// providerSwitchingLLM behaves like growingLLM, except that the history it
+// returns is Claude's for the first Generate and OpenAI's for every later one.
+// It is how a working copy ends up with another LLType than the committed
+// baseline without going through SetHistory.
+func providerSwitchingLLM() gollem.LLMClient {
+	var calls atomic.Int32
+	return &mock.LLMClientMock{
+		NewSessionFunc: func(_ context.Context, opts ...gollem.SessionOption) (gollem.Session, error) {
+			cfg := gollem.NewSessionConfig(opts...)
+			var seeded []gollem.Message
+			if h := cfg.History(); h != nil {
+				seeded = h.Messages
+			}
+			llType := gollem.LLMTypeClaude
+			if calls.Add(1) > 1 {
+				llType = gollem.LLMTypeOpenAI
+			}
+			return &mock.SessionMock{
+				GenerateFunc: func(_ context.Context, _ []gollem.Input, _ ...gollem.GenerateOption) (*gollem.Response, error) {
+					return &gollem.Response{Texts: []string{"ok"}, InputToken: 1, OutputToken: 1}, nil
+				},
+				HistoryFunc: func() (*gollem.History, error) {
+					grown := make([]gollem.Message, len(seeded)+1)
+					copy(grown, seeded)
+					return &gollem.History{LLType: llType, Version: gollem.HistoryVersion, Messages: grown}, nil
+				},
+			}, nil
+		},
+	}
+}
+
+// A history SetHistory refuses leaves the conversation as it was, and a
+// transition that did nothing else saves no version.
+func TestSession_SetHistoryRejectsInvalidHistory(t *testing.T) {
+	claude := func(msgs ...gollem.Message) *gollem.History { return history(msgs...) }
+	openAI := &gollem.History{LLType: gollem.LLMTypeOpenAI, Version: gollem.HistoryVersion,
+		Messages: []gollem.Message{textMsg(t, "from another provider")}}
+	open := claude(textMsg(t, "q"), toolCallMsg(t, "c1", "t"))
+
+	cases := map[string]struct {
+		commitFirst   bool            // run a Session().Generate and commit before the rejected call.
+		prime         *gollem.History // SetHistory this first, in the rejected call's transition.
+		generateFirst bool            // run a Session().Generate first, in the rejected call's transition.
+		given         *gollem.History
+		wantLen       int
+		wantSaves     int
+	}{
+		"nil on an empty conversation":                   {given: nil, wantLen: 0, wantSaves: 0},
+		"unanswered tool call on an empty conversation":  {given: open, wantLen: 0, wantSaves: 0},
+		"nil after a commit":                             {commitFirst: true, given: nil, wantLen: 1, wantSaves: 1},
+		"unanswered tool call after a commit":            {commitFirst: true, given: open, wantLen: 1, wantSaves: 1},
+		"another provider than the committed history":    {commitFirst: true, given: openAI, wantLen: 1, wantSaves: 1},
+		"another provider than this transition's change": {prime: claude(textMsg(t, "a"), textMsg(t, "b")), given: openAI, wantLen: 2, wantSaves: 1},
+		// The working copy is already OpenAI, matching what is given; only the
+		// committed baseline is Claude.
+		"same provider as the change, not the commit": {commitFirst: true, generateFirst: true, given: openAI, wantLen: 2, wantSaves: 2},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := &probeStore{inner: histmem.New()}
+			var mu sync.Mutex
+			var before, after *gollem.History
+			var setErr error
+			step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+				if tc.commitFirst && st.N == 0 {
+					if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+						return st, agentkit.Decision[[]byte]{}, err
+					}
+					st.N = 1
+					return st, agentkit.Continue[[]byte](), nil
+				}
+				if tc.prime != nil {
+					if err := sys.Session().SetHistory(ctx, tc.prime); err != nil {
+						return st, agentkit.Decision[[]byte]{}, err
+					}
+				}
+				if tc.generateFirst {
+					if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("hi")}); err != nil {
+						return st, agentkit.Decision[[]byte]{}, err
+					}
+				}
+				b, err := sys.Session().History(ctx)
+				if err != nil {
+					return st, agentkit.Decision[[]byte]{}, err
+				}
+				se := sys.Session().SetHistory(ctx, tc.given)
+				a, err := sys.Session().History(ctx)
+				if err != nil {
+					return st, agentkit.Decision[[]byte]{}, err
+				}
+				mu.Lock()
+				before, after, setErr = b, a, se
+				mu.Unlock()
+				return st, agentkit.Done([]byte("done")), nil
+			}
+			k, repo, ag := registerWithHistory(t, step, providerSwitchingLLM(), store)
+
+			pid, err := ag.Spawn(ctx, k, scriptInput{Seed: "s"})
+			gt.NoError(t, err)
+			p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+			gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+			mu.Lock()
+			defer mu.Unlock()
+			gt.Value(t, errors.Is(setErr, agentkit.ErrInvalidRequest)).Equal(true)
+			gt.Value(t, histLen(before)).Equal(tc.wantLen)
+			gt.Value(t, histLen(after)).Equal(tc.wantLen)
+			if before != nil {
+				gt.Value(t, after.LLType).Equal(before.LLType)
+			}
+			gt.Value(t, store.saveCount()).Equal(tc.wantSaves)
+			gt.Value(t, histLen(committedHistory(t, store, p))).Equal(tc.wantLen)
+		})
+	}
 }
