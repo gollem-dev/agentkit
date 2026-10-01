@@ -255,6 +255,11 @@ func WithMetadata(m map[string]string) SpawnOption {
 // a notification, so whether it is really reclaimed is the store's call).
 // Inherit from a finished Process, or accept that.
 //
+// A Process commits a version only when a transition advances its managed
+// conversation. One whose LLM turns all go through the primitive
+// Syscalls.Generate commits none — unless it hands a result to
+// Session().SetHistory, which makes it a valid `from`.
+//
 // On SpawnChild, `from` must be a Process the calling Process itself spawned —
 // the same set WaitChildren accepts — which is how a parent hands a child the
 // conversation of a sibling it has already collected. Any other id, the caller's

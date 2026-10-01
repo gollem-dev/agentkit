@@ -306,6 +306,51 @@ Keeping `History` in your own checkpointed state via raw `sys.Generate` +
 `agentkit.WithHistory(...)` is still fully supported, and is what
 `strategy/simple` does.
 
+### A schema-bound turn without the agent's tools
+
+`Session().Generate` always binds `sys.Tools()`. When an agent that has tools
+needs one structured answer without them — a verdict, a classification — run the
+primitive `sys.Generate` over the managed conversation and hand its history back
+with `Session().SetHistory`:
+
+```go
+h, err := sys.Session().History(ctx)
+if err != nil {
+    return st, agentkit.Decision[Output]{}, err
+}
+res, err := sys.Generate(ctx, []gollem.Input{gollem.Text("Give your verdict.")},
+    agentkit.WithHistory(h), agentkit.WithSchema(verdictSchema))
+if err != nil {
+    return st, agentkit.Decision[Output]{}, err
+}
+if err := sys.Session().SetHistory(ctx, res.History); err != nil {
+    return st, agentkit.Decision[Output]{}, err
+}
+```
+
+The turn is then part of the conversation: the worker saves it before the
+commit, later `Session().Generate` calls continue from it, and a Process whose
+only LLM turns are primitive ones becomes a valid source for
+`WithInheritedHistory`. Without `SetHistory` the turn is lost when the
+transition ends.
+
+Passing `WithTools()` to `Session().Generate` does not get you there:
+`WithTools` adds tools, so the agent's tools are still bound. Removing them for
+one turn — in a Generate middleware, say — changes the tool list in the middle
+of the conversation, which invalidates the provider's prompt cache and can make
+a provider that verifies thinking-block signatures reject the next request.
+
+`SetHistory` replaces the conversation with what you pass, as given. agentkit
+does not check that it continues the current conversation; passing the history
+of a `Generate` that started from `Session().History()` is how you keep it one.
+It returns `ErrInvalidRequest` and leaves the conversation alone when the
+history is nil, holds a tool call with no response, or comes from another
+provider than the current conversation. If the history carries thinking blocks
+signed under a different system prompt or tool list, strip them before
+`SetHistory` (in your code or a Generate middleware), or the next
+`Session().Generate` may be rejected. To answer a tool call the model made, use
+`Session().CallTool`, not `SetHistory`.
+
 ### Continuing a finished Process's conversation
 
 One long conversation does not have to be one Process. Spawn a new one per turn

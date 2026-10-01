@@ -121,6 +121,39 @@ type Session interface {
 	// fresh claim).
 	History(ctx context.Context) (*gollem.History, error)
 
+	// SetHistory makes h the conversation's working history for this transition,
+	// so the worker saves it as a new version and the commit records it, exactly
+	// as after a Generate.
+	//
+	// It exists for a turn Session().Generate cannot run: Generate always binds
+	// the agent's tools, so an agent that has tools but wants one schema-bound
+	// answer without them runs the primitive Syscalls.Generate with
+	// WithHistory(History()) and WithSchema, and hands the resulting
+	// GenerateResult.History back here. Without this, that turn is never part of
+	// the conversation, and a Process whose transitions use only the primitive
+	// Generate commits no version, so WithInheritedHistory refuses to inherit
+	// from it.
+	//
+	// h replaces the conversation as given. The kernel does NOT check that h
+	// continues the current conversation — a Generate middleware may legitimately
+	// rewrite what it returns, so no prefix comparison would be reliable — and
+	// keeping it a continuation is the caller's job. h is cloned, so changing it
+	// after the call does not reach the conversation.
+	//
+	// If h holds thinking blocks signed under a different system prompt or tool
+	// set than Session().Generate uses, a provider that verifies those signatures
+	// may reject the next Session().Generate. Strip them first, in the caller or
+	// in a Generate middleware, when that applies.
+	//
+	// It is not a way to answer tool calls: append a result for a call the model
+	// asked for with CallTool. h is rejected with ErrInvalidRequest, leaving the
+	// conversation unchanged, when it is nil, when it holds a tool call with no
+	// response (the next request would be refused, and a Cancel waits for a
+	// closed conversation), or when its LLType differs from the conversation's
+	// current or committed history. Unlike CallTool it works on an empty
+	// conversation, since h carries the provider identity itself.
+	SetHistory(ctx context.Context, h *gollem.History) error
+
 	session() // sealed, like the unexported spawn on Syscalls.
 }
 
@@ -241,11 +274,40 @@ func (c managedSession) History(ctx context.Context) (*gollem.History, error) {
 	// A copy, not the live value. *gollem.History is mutable, and the committed
 	// baseline is what a same-lease retry re-seeds from — handing it out would let
 	// a strategy edit the state this transition is supposed to be able to roll
-	// back to. Advancing the conversation goes through Generate and CallTool.
+	// back to. Advancing the conversation goes through Generate, CallTool and
+	// SetHistory.
 	if !s.sessStarted {
 		return s.hist.baseline.Clone(), nil
 	}
 	return s.sessWorking.Clone(), nil
+}
+
+func (c managedSession) SetHistory(ctx context.Context, h *gollem.History) error {
+	s := c.s
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	s.start()
+	if h == nil {
+		return goerr.Wrap(ErrInvalidRequest, "Session().SetHistory with a nil history")
+	}
+	if hasOpenToolCall(h) {
+		return goerr.Wrap(ErrInvalidRequest, "Session().SetHistory with an unanswered tool call",
+			goerr.V("messages", len(h.Messages)))
+	}
+	// Both are checked because they can differ: the working copy is what this
+	// transition has built so far, the baseline what the record names.
+	for _, cur := range []*gollem.History{s.sessWorking, s.hist.baseline} {
+		if cur != nil && cur.LLType != h.LLType {
+			return goerr.Wrap(ErrInvalidRequest, "Session().SetHistory with a history of another provider",
+				goerr.V("current", cur.LLType), goerr.V("given", h.LLType))
+		}
+	}
+	// Clone so a caller editing h afterwards cannot reach the working copy, nor
+	// — once committed — the baseline a same-lease retry re-seeds from.
+	s.sessWorking = h.Clone()
+	s.sessDirty = true
+	return nil
 }
 
 // historyPending reports whether this transition advanced the managed
