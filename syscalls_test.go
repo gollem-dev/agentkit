@@ -1017,3 +1017,85 @@ func TestGenerateResultModelJSONRoundTrip(t *testing.T) {
 		gt.Value(t, back.Model).Equal("")
 	})
 }
+
+// --- the provider's finish reason --------------------------------------------
+
+// finishReport smuggles what a Generate returned out through Process.Output.
+type finishReport struct {
+	FinishReason string   `json:"finish_reason"`
+	Texts        []string `json:"texts"`
+}
+
+// reportFinish runs one Step that calls Generate once and returns what the
+// result carried.
+func reportFinish(t *testing.T, model gollem.LLMClient) finishReport {
+	t.Helper()
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		res, err := sys.Generate(c, []gollem.Input{gollem.Text(st.Seed)})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		out, err := json.Marshal(finishReport{FinishReason: res.FinishReason, Texts: res.Texts})
+		if err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		return st, agentkit.Done(out), nil
+	}
+
+	k, repo, ag := setupScript(t, step, model)
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: "hello"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 3*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+
+	var got finishReport
+	gt.NoError(t, json.Unmarshal(p.Output, &got))
+	return got
+}
+
+func TestGenerateResultCarriesFinishReason(t *testing.T) {
+	t.Run("a response with texts", func(t *testing.T) {
+		model, _ := mockLLM(&gollem.Response{
+			Texts: []string{"ok"}, InputToken: 1, OutputToken: 1, FinishReason: "max_tokens",
+		})
+		gt.Value(t, reportFinish(t, model)).Equal(finishReport{
+			FinishReason: "max_tokens", Texts: []string{"ok"},
+		})
+	})
+
+	// The case the field exists for: no texts, no error, and only the reason
+	// says the model refused. The kernel hands it back as a success.
+	t.Run("a refusal with no texts", func(t *testing.T) {
+		model, _ := mockLLM(&gollem.Response{
+			Texts: []string{}, InputToken: 1, FinishReason: "refusal",
+		})
+		got := reportFinish(t, model)
+		gt.Value(t, got.FinishReason).Equal("refusal")
+		gt.Array(t, got.Texts).Length(0)
+	})
+
+	t.Run("a provider that reports none", func(t *testing.T) {
+		model, _ := mockLLM(textResponse("ok"))
+		gt.Value(t, reportFinish(t, model).FinishReason).Equal("")
+	})
+}
+
+// Like Model, the field may be folded into checkpointed state, so it has to
+// round-trip and stay out of the encoding when empty.
+func TestGenerateResultFinishReasonJSONRoundTrip(t *testing.T) {
+	t.Run("a reason is carried under finish_reason", func(t *testing.T) {
+		b, err := json.Marshal(&agentkit.GenerateResult{FinishReason: "refusal"})
+		gt.NoError(t, err)
+		gt.String(t, string(b)).Contains(`"finish_reason":"refusal"`)
+
+		var back agentkit.GenerateResult
+		gt.NoError(t, json.Unmarshal(b, &back))
+		gt.Value(t, back.FinishReason).Equal("refusal")
+	})
+
+	t.Run("an empty reason is omitted", func(t *testing.T) {
+		b, err := json.Marshal(&agentkit.GenerateResult{})
+		gt.NoError(t, err)
+		gt.String(t, string(b)).NotContains(`"finish_reason"`)
+	})
+}

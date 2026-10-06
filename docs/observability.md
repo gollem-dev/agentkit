@@ -555,6 +555,34 @@ reports `ErrInvalidRequest`. A short-circuiting middleware that may run for such
 an agent should return `req.History` (what the request carried in) alongside
 whatever it synthesised.
 
+### Why a generate stopped
+
+A `Generate` can return no error and an empty `Texts`, for example when the
+model refused or ran into the token limit. `GenerateResult.FinishReason` reports
+why the provider ended generation, which can help explain such a result. It is
+gollem's `Response.FinishReason`, passed through unchanged — the provider's own
+value, such as Claude's `"refusal"` or `"max_tokens"` or Gemini's `"STOP"` — and
+empty when the provider reported none. It does not say which content blocks
+came back. The "Finish Reason" section of gollem's `docs/llm.md` lists which
+provider field it comes from.
+
+The kernel never turns a finish reason into an error. When `err` is nil, the
+call is metered like any other, and retrying, asking again with a larger limit,
+or failing is the caller's decision. Errors the provider client returns itself
+still propagate — gollem's OpenAI client, for one, returns an error when a
+truncated response leaves tool arguments that are not valid JSON:
+
+```go
+res, err := sys.Generate(ctx, input, agentkit.WithSchema(schema))
+if err != nil {
+    return st, agentkit.Decision[Output]{}, err
+}
+if len(res.Texts) == 0 {
+    return st, agentkit.Fail[Output](agentkit.FailureStrategyError,
+        fmt.Sprintf("no output (finish reason %q)", res.FinishReason)), nil
+}
+```
+
 ## Choosing
 
 - **A durable audit record that must exist before an action happens** → inside
