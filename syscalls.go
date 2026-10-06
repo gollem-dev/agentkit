@@ -120,8 +120,13 @@ type GenerateResult struct {
 	// The kernel never turns a finish reason into an error or branches on it.
 	// Retrying or failing on a given reason is the caller's decision. An error the
 	// provider client itself returns still propagates as usual.
-	FinishReason string          `json:"finish_reason,omitempty"`
-	History      *gollem.History `json:"history"` // session history after the call (save it, pass it next time).
+	FinishReason string `json:"finish_reason,omitempty"`
+	// Refusal is gollem.Response.Refusal, unchanged: the reason, policy
+	// categories and explanation the provider gave when it refused the request
+	// or blocked the prompt or the output, nil when it reported none. Like
+	// FinishReason, the kernel never branches on it or turns it into an error.
+	Refusal *gollem.Refusal `json:"refusal,omitempty"`
+	History *gollem.History `json:"history"` // session history after the call (save it, pass it next time).
 }
 
 // GenerateOption configures a Generate. Only input is required (D26). The
@@ -492,6 +497,7 @@ func (s *syscalls) generateBase(ctx context.Context, req *GenerateRequest) (*Gen
 		CacheCreationInputTokens: resp.CacheCreationInputToken,
 		Model:                    model,
 		FinishReason:             resp.FinishReason,
+		Refusal:                  resp.Refusal,
 		History:                  hist,
 	}
 	s.meter(ctx, Metrics{

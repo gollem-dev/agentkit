@@ -1022,8 +1022,9 @@ func TestGenerateResultModelJSONRoundTrip(t *testing.T) {
 
 // finishReport smuggles what a Generate returned out through Process.Output.
 type finishReport struct {
-	FinishReason string   `json:"finish_reason"`
-	Texts        []string `json:"texts"`
+	FinishReason string          `json:"finish_reason"`
+	Refusal      *gollem.Refusal `json:"refusal"`
+	Texts        []string        `json:"texts"`
 }
 
 // reportFinish runs one Step that calls Generate once and returns what the
@@ -1035,7 +1036,7 @@ func reportFinish(t *testing.T, model gollem.LLMClient) finishReport {
 		if err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
-		out, err := json.Marshal(finishReport{FinishReason: res.FinishReason, Texts: res.Texts})
+		out, err := json.Marshal(finishReport{FinishReason: res.FinishReason, Refusal: res.Refusal, Texts: res.Texts})
 		if err != nil {
 			return st, agentkit.Decision[[]byte]{}, err
 		}
@@ -1076,7 +1077,43 @@ func TestGenerateResultCarriesFinishReason(t *testing.T) {
 
 	t.Run("a provider that reports none", func(t *testing.T) {
 		model, _ := mockLLM(textResponse("ok"))
-		gt.Value(t, reportFinish(t, model).FinishReason).Equal("")
+		got := reportFinish(t, model)
+		gt.Value(t, got.FinishReason).Equal("")
+		gt.Value(t, got.Refusal).Nil()
+	})
+}
+
+func TestGenerateResultCarriesRefusal(t *testing.T) {
+	t.Run("a refusal with details and no texts", func(t *testing.T) {
+		model, _ := mockLLM(&gollem.Response{
+			Texts: []string{}, InputToken: 1, FinishReason: "refusal",
+			Refusal: &gollem.Refusal{
+				Reason:      "refusal",
+				Categories:  []string{"cyber"},
+				Explanation: "the request asks for a working exploit",
+			},
+		})
+		got := reportFinish(t, model)
+		gt.Value(t, got.Refusal).Equal(&gollem.Refusal{
+			Reason:      "refusal",
+			Categories:  []string{"cyber"},
+			Explanation: "the request asks for a working exploit",
+		})
+		gt.Value(t, got.FinishReason).Equal("refusal")
+		gt.Array(t, got.Texts).Length(0)
+	})
+
+	// gollem's OpenAI Chat Completions client sets Refusal from message.refusal
+	// whatever finish_reason the choice carries, so the details are passed on
+	// independently of FinishReason.
+	t.Run("a refusal next to a stop finish reason", func(t *testing.T) {
+		model, _ := mockLLM(&gollem.Response{
+			Texts: []string{}, InputToken: 1, FinishReason: "stop",
+			Refusal: &gollem.Refusal{Reason: "refusal", Explanation: "I can't help with that."},
+		})
+		got := reportFinish(t, model)
+		gt.Value(t, got.Refusal).Equal(&gollem.Refusal{Reason: "refusal", Explanation: "I can't help with that."})
+		gt.Value(t, got.FinishReason).Equal("stop")
 	})
 }
 
@@ -1097,5 +1134,24 @@ func TestGenerateResultFinishReasonJSONRoundTrip(t *testing.T) {
 		b, err := json.Marshal(&agentkit.GenerateResult{})
 		gt.NoError(t, err)
 		gt.String(t, string(b)).NotContains(`"finish_reason"`)
+	})
+}
+
+func TestGenerateResultRefusalJSONRoundTrip(t *testing.T) {
+	t.Run("the details are carried under refusal", func(t *testing.T) {
+		in := &gollem.Refusal{Reason: "refusal", Categories: []string{"bio"}, Explanation: "declined"}
+		b, err := json.Marshal(&agentkit.GenerateResult{Refusal: in})
+		gt.NoError(t, err)
+		gt.String(t, string(b)).Contains(`"refusal":{`)
+
+		var back agentkit.GenerateResult
+		gt.NoError(t, json.Unmarshal(b, &back))
+		gt.Value(t, back.Refusal).Equal(in)
+	})
+
+	t.Run("no refusal is omitted", func(t *testing.T) {
+		b, err := json.Marshal(&agentkit.GenerateResult{})
+		gt.NoError(t, err)
+		gt.String(t, string(b)).NotContains(`"refusal"`)
 	})
 }
