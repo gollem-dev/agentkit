@@ -564,7 +564,10 @@ gollem's `Response.FinishReason`, passed through unchanged — the provider's ow
 value, such as Claude's `"refusal"` or `"max_tokens"` or Gemini's `"STOP"` — and
 empty when the provider reported none. It does not say which content blocks
 came back. The "Finish Reason" section of gollem's `docs/llm.md` lists which
-provider field it comes from.
+provider field it comes from. When a trace handler is in the ctx (see
+`examples/tracing`), gollem's LLM client records the same value in the
+`llm_call` span as `LLMCallData.Response.FinishReason`, also for a response with
+no texts.
 
 The kernel never turns a finish reason into an error. When `err` is nil, the
 call is metered like any other, and retrying, asking again with a larger limit,

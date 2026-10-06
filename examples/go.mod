@@ -11,7 +11,7 @@ replace github.com/gollem-dev/agentkit => ../
 
 require (
 	github.com/gollem-dev/agentkit v0.0.0
-	github.com/gollem-dev/gollem v0.30.1-0.20261006005033-7ea16852d90b
+	github.com/gollem-dev/gollem v0.30.1-0.20261006011343-cf18a0ed211f
 	github.com/m-mizutani/goerr/v2 v2.0.1
 	github.com/m-mizutani/gt v0.2.1
 )
