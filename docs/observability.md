@@ -569,7 +569,23 @@ provider field it comes from. When a trace handler is in the ctx (see
 `llm_call` span as `LLMCallData.Response.FinishReason`, also for a response with
 no texts.
 
-The kernel never turns a finish reason into an error. When `err` is nil, the
+When the provider refused the request or blocked the prompt or the output,
+`GenerateResult.Refusal` holds the details it gave: `Reason` (the provider's
+code, such as `"refusal"`, `"content_filter"` or Gemini's `"SAFETY"`),
+`Categories` (the policy or harm categories, such as Claude's `"cyber"`) and
+`Explanation` (the provider's text, which is not guaranteed to be stable). It is
+gollem's `Response.Refusal`, passed through unchanged, and nil when the provider
+reported no refusal. It is set independently of `FinishReason`: gollem's OpenAI
+Chat Completions client, for one, reports a refusal message under the finish
+reason `"stop"`. The "Refusal Details" section of gollem's `docs/llm.md` lists
+which provider fields each value comes from. gollem records the same details in
+the `llm_call` span as `LLMCallData.Response.Refusal`. A Gemini
+`PROHIBITED_CONTENT` block is not reported here: gollem's Gemini client returns
+it as an error wrapping `gollem.ErrProhibitedContent`, which carries the same
+details as the goerr values `refusal_reason`, `refusal_categories` and
+`refusal_explanation`.
+
+The kernel never turns a finish reason or a refusal into an error. When `err` is nil, the
 call is metered like any other, and retrying, asking again with a larger limit,
 or failing is the caller's decision. Errors the provider client returns itself
 still propagate — gollem's OpenAI client, for one, returns an error when a
@@ -579,6 +595,10 @@ truncated response leaves tool arguments that are not valid JSON:
 res, err := sys.Generate(ctx, input, agentkit.WithSchema(schema))
 if err != nil {
     return st, agentkit.Decision[Output]{}, err
+}
+if res.Refusal != nil {
+    return st, agentkit.Fail[Output](agentkit.FailureStrategyError,
+        fmt.Sprintf("refused (%s, categories %v)", res.Refusal.Reason, res.Refusal.Categories)), nil
 }
 if len(res.Texts) == 0 {
     return st, agentkit.Fail[Output](agentkit.FailureStrategyError,

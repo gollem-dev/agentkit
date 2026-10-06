@@ -109,7 +109,7 @@ it carries the conversation `History` in a form you can fold into your
 checkpointed state. It also reports the model the call resolved to, empty when
 that client does not say —
 [which model a generate ran against](observability.md#which-model-a-generate-ran-against).
-It also carries the provider's finish reason; see
+It also carries the provider's finish reason and refusal details; see
 [why a generate stopped](observability.md#why-a-generate-stopped).
 
 `Now()` is the kernel's clock (injectable for tests via `WithClock`). It is
