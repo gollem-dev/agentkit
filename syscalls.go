@@ -111,8 +111,17 @@ type GenerateResult struct {
 	// response may report: a caller pricing a call keys its table by the name it
 	// configured, and an alias resolving to a dated snapshot would turn a
 	// startup-time check into a mid-run lookup failure.
-	Model   string          `json:"model,omitempty"`
-	History *gollem.History `json:"history"` // session history after the call (save it, pass it next time).
+	Model string `json:"model,omitempty"`
+	// FinishReason is gollem.Response.FinishReason, unchanged: the reason the
+	// provider gave for ending generation ("end_turn", "max_tokens", "refusal",
+	// "STOP", ...), empty when the provider reported none. It can help explain an
+	// empty Texts, but it does not say which content blocks came back.
+	//
+	// The kernel never turns a finish reason into an error or branches on it.
+	// Retrying or failing on a given reason is the caller's decision. An error the
+	// provider client itself returns still propagates as usual.
+	FinishReason string          `json:"finish_reason,omitempty"`
+	History      *gollem.History `json:"history"` // session history after the call (save it, pass it next time).
 }
 
 // GenerateOption configures a Generate. Only input is required (D26). The
@@ -482,6 +491,7 @@ func (s *syscalls) generateBase(ctx context.Context, req *GenerateRequest) (*Gen
 		CacheReadInputTokens:     resp.CacheReadInputToken,
 		CacheCreationInputTokens: resp.CacheCreationInputToken,
 		Model:                    model,
+		FinishReason:             resp.FinishReason,
 		History:                  hist,
 	}
 	s.meter(ctx, Metrics{
