@@ -18,7 +18,9 @@ a deletion order. Without the option, `sys.Session()`'s methods return
 
 A new Process can **start from a version another Process committed**:
 `Spawn(..., WithInheritedHistory(from))` resolves that Process's current
-`HistoryRef` and pins the pair on `Process.InheritedHistory`. It is read-only —
+`HistoryRef` and pins the pair on `Process.InheritedHistory`; when `from` has
+committed no version of its own, its conversation is the one it inherited, and
+that pair is pinned unchanged. It is read-only —
 the inheriting Process saves its own versions under its own id, and the kernel
 never `Discard`s an inherited version, because the issuing Process's record may
 still name it. On `SpawnChild` the option names only a Process the calling
@@ -134,8 +136,21 @@ the cause instead of documenting the symptom.
   so accepting a ref would only add a value that can disagree with the record.
   Resolving at Spawn also pins it: a later turn of the issuer does not change
   what the new Process starts from. Spawn therefore reads that record, and
-  reports `ErrProcessNotFound`, or `ErrInvalidRequest` when it has committed no
+  reports `ErrProcessNotFound`, or `ErrInvalidRequest` when it has no
   conversation, instead of leaving a Process to fail on its first transition.
+- **A Process with no version of its own passes on the one it inherited.** Its
+  `HistoryRef` is empty, but its conversation is not: it is the inherited
+  version, which is how `ensureLoaded` and the cancel check already read that
+  record. So when `from` has an empty `HistoryRef` and an `InheritedHistory`,
+  the resolved pair is a copy of that `InheritedHistory` — its `Process` is the
+  one that saved the version, not `from`, because a store addresses a version
+  by `(pid, ref)`. However many such Processes sit in between (a turn that
+  answers with one primitive `Generate` and never touches `Session()`), the
+  pair names the saving Process in one step. Nothing new can release it: the
+  inheriting Process's first commit has `prev == ""`, and only the saving
+  Process's own commits release that version — the same exposure as inheriting
+  from its `HistoryRef` directly. `ErrInvalidRequest` remains for a Process with
+  neither.
 - **On `SpawnChild`, only a Process the caller spawned.** Because the option
   takes a `ProcessID` and the kernel reads the version off that record, a
   strategy needs no `HistoryRef` handed to it to name one. Two things still have
@@ -253,11 +268,13 @@ the cause instead of documenting the symptom.
   unanswered `tool_use`; an heir has to tolerate that, exactly as a re-run of the
   same Process would.
 - **The kernel does not promise an inherited version survives.** It pins the pair
-  at Spawn and never releases it, but the *issuing* Process, if it is still
-  running, releases that version as superseded on its next commit — and whether a
+  at Spawn and never releases it, but the Process that *saved* it — the issuing
+  one, or the one the issuer itself inherited from — if it is still running,
+  releases that version as superseded on its next commit — and whether a
   release is acted on is the store's call, since `Discard` is a notification.
-  Inheriting from a finished Process is therefore the safe use; inheriting from a
-  running one is allowed (branching off its current conversation is a legitimate
+  Inheriting a version whose saving Process has finished is therefore the safe
+  use — when the named Process only passed on a version it inherited, its own
+  completion does not establish that; inheriting from a running one is allowed (branching off its current conversation is a legitimate
   thing to want) and the version may be gone by the time it is read, surfacing as
   a failed first transition. The kernel refuses to guess which one a caller meant,
   and it does no reference counting — that would need a mechanism this ADR
@@ -293,3 +310,4 @@ the cause instead of documenting the symptom.
 | 2026-08-03 | Added `WithInheritedHistory`: a new Process can start from a version another one committed, pinned at Spawn on `Process.InheritedHistory`. It is read-only and never `Discard`ed, which is why it is a field of its own rather than a value written into `HistoryRef` — the post-commit release reads that one. Rejected on `SpawnChild`. |
 | 2026-08-17 | `Session().CallTool` groups the results of one model turn into one `gollem.Message` instead of appending a message per call, and answers a call whose result cannot be encoded with an error response instead of leaving the pair open. One message per call made a parallel tool round answer one turn in several, which Claude and Gemini reject permanently, since the shape is in the committed history. gollem v0.28.2 merges consecutive tool messages in its Claude and Gemini converters, which repairs versions already stored that way. |
 | 2026-09-17 | `WithInheritedHistory` is accepted on `SpawnChild` when it names a Process the caller spawned, and refused as `ErrInvalidRequest` otherwise, the caller's own Process included. The blanket refusal rested on `Syscalls` handing out no `HistoryRef`, which the `ProcessID`-taking option no longer needs, and it left a Process that inherits a conversation unreachable by its parent's `WaitChildren`. The resolved pair is on `SpawnRequest.InheritedHistory`. |
+| 2026-10-07 | `WithInheritedHistory` accepts a Process that committed no version of its own but inherited one, and pins that inherited pair unchanged. Refusing it contradicted how the record is read everywhere else — its conversation is the inherited version — and left the next turn of a conversation unstartable whenever a turn answered without `Session()`. |

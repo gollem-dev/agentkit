@@ -261,13 +261,20 @@ func WithMetadata(m map[string]string) SpawnOption {
 // The new Process saves its own versions under its own id, and the kernel never
 // Discards the inherited one.
 //
-// `from` must exist and must have committed a conversation, or Spawn fails with
-// ErrProcessNotFound / ErrInvalidRequest; the agent must be registered with
-// WithHistoryStore, or ErrHistoryNotConfigured. What the kernel does NOT
-// promise is that the inherited version survives: if `from` is still running,
-// its next commit releases the version this Process was pointed at (Discard is
-// a notification, so whether it is really reclaimed is the store's call).
-// Inherit from a finished Process, or accept that.
+// If `from` has committed no version of its own but was itself spawned with
+// WithInheritedHistory, its conversation is the version it inherited, and the
+// new Process inherits that same version: InheritedHistory then names the
+// Process that saved it, not `from`.
+//
+// `from` must exist and must have a conversation in one of those two ways, or
+// Spawn fails with ErrProcessNotFound / ErrInvalidRequest; the agent must be
+// registered with WithHistoryStore, or ErrHistoryNotConfigured. What the kernel
+// does NOT promise is that the inherited version survives: if the Process that
+// saved it is still running, its next commit releases the version this Process
+// was pointed at (Discard is a notification, so whether it is really reclaimed
+// is the store's call). Inherit a version whose saving Process has finished —
+// `from` having finished is not enough when `from` only passed on what it
+// inherited — or accept that.
 //
 // On SpawnChild, `from` must be a Process the calling Process itself spawned —
 // the same set WaitChildren accepts — which is how a parent hands a child the

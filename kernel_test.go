@@ -9,6 +9,7 @@ import (
 	"github.com/gollem-dev/agentkit"
 	histmem "github.com/gollem-dev/agentkit/historystore/memory"
 	"github.com/gollem-dev/agentkit/repository/memory"
+	"github.com/gollem-dev/gollem"
 	"github.com/m-mizutani/gt"
 )
 
@@ -167,6 +168,180 @@ func TestSpawnInheritedHistoryValidation(t *testing.T) {
 			agentkit.WithInheritedHistory(agentkit.ProcessID("whatever")))
 		gt.Error(t, err).Is(agentkit.ErrHistoryNotConfigured)
 		nothingClaimable(t, repo)
+	})
+}
+
+// directAnswerSeed marks a Process that answers with one primitive
+// sys.Generate and returns Done without touching Session(), so it commits no
+// version of its own.
+const directAnswerSeed = "direct"
+
+// inheritChain is the strategy for a conversation carried across Processes,
+// some of which answer directly. A Process seeded directAnswerSeed does that;
+// any other runs two Session().Generate turns, so its run both supersedes a
+// version and commits a final one. firstHistory records what Session().History
+// returned on each session-using Process's first Step, keyed by Seed.
+type inheritChain struct {
+	mu           sync.Mutex
+	seen         []int
+	firstHistory map[string]*gollem.History
+}
+
+func (c *inheritChain) step() stepFn {
+	session := sessionStep(&c.seen, &c.mu, 2)
+	return func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.Seed == directAnswerSeed {
+			if _, err := sys.Generate(ctx, []gollem.Input{gollem.Text("answer")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			return st, agentkit.Done([]byte("answered")), nil
+		}
+		if st.N == 0 {
+			h, err := sys.Session().History(ctx)
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			c.mu.Lock()
+			if c.firstHistory == nil {
+				c.firstHistory = map[string]*gollem.History{}
+			}
+			c.firstHistory[st.Seed] = h
+			c.mu.Unlock()
+		}
+		return session(ctx, sys, st)
+	}
+}
+
+func (c *inheritChain) first(seed string) *gollem.History {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.firstHistory[seed]
+}
+
+// spawnDirect spawns a Process that answers without Session(), serves it to
+// completion and returns its record.
+func spawnDirect(t *testing.T, k *agentkit.Kernel, repo agentkit.Repository, ag agentkit.Agent[scriptInput],
+	opts ...agentkit.SpawnOption) *agentkit.Process {
+	t.Helper()
+	pid, err := ag.Spawn(context.Background(), k, scriptInput{Seed: directAnswerSeed}, opts...)
+	gt.NoError(t, err).Required()
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, p.HistoryRef).Equal(agentkit.HistoryRef(""))
+	return p
+}
+
+// A Process that committed no version of its own still has a conversation — the
+// one it inherited — so inheriting from it pins that same version, named under
+// the Process that saved it.
+func TestSpawnInheritsThroughProcessWithoutOwnVersion(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("one direct answer in between", func(t *testing.T) {
+		chain := &inheritChain{}
+		store := &probeStore{inner: histmem.New()}
+		k, repo, ag := registerWithHistory(t, chain.step(), growingLLM(), store)
+
+		a := runIssuer(t, k, repo, ag)
+		b := spawnDirect(t, k, repo, ag, agentkit.WithInheritedHistory(a.ID))
+		want := &agentkit.InheritedHistory{Process: a.ID, Ref: a.HistoryRef}
+		gt.Value(t, b.InheritedHistory).Equal(want)
+
+		cID, err := ag.Spawn(ctx, k, scriptInput{Seed: "c"}, agentkit.WithInheritedHistory(b.ID))
+		gt.NoError(t, err).Required()
+		spawned, err := repo.GetProcess(ctx, cID)
+		gt.NoError(t, err).Required()
+		gt.Value(t, spawned.InheritedHistory).Equal(want)
+
+		c := serveUntil(t, k, repo, cID, 5*time.Second, isTerminal)
+		gt.Value(t, c.Status).Equal(agentkit.ProcessSucceeded)
+		// C's first turn started from A's conversation, as A committed it.
+		gt.Value(t, chain.first("c")).Equal(committedHistory(t, store, a))
+		gt.Value(t, histLen(committedHistory(t, store, c))).Equal(4)
+	})
+
+	t.Run("two direct answers in between", func(t *testing.T) {
+		chain := &inheritChain{}
+		store := &probeStore{inner: histmem.New()}
+		k, repo, ag := registerWithHistory(t, chain.step(), growingLLM(), store)
+
+		a := runIssuer(t, k, repo, ag)
+		b1 := spawnDirect(t, k, repo, ag, agentkit.WithInheritedHistory(a.ID))
+		b2 := spawnDirect(t, k, repo, ag, agentkit.WithInheritedHistory(b1.ID))
+		want := &agentkit.InheritedHistory{Process: a.ID, Ref: a.HistoryRef}
+		gt.Value(t, b2.InheritedHistory).Equal(want)
+
+		cID, err := ag.Spawn(ctx, k, scriptInput{Seed: "c"}, agentkit.WithInheritedHistory(b2.ID))
+		gt.NoError(t, err).Required()
+		c := serveUntil(t, k, repo, cID, 5*time.Second, isTerminal)
+		gt.Value(t, c.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, c.InheritedHistory).Equal(want)
+		gt.Value(t, chain.first("c")).Equal(committedHistory(t, store, a))
+	})
+
+	// A Process that inherited a version and then committed its own passes on its
+	// own: the inherited pair is where its conversation started, not what it is.
+	t.Run("its own version takes precedence over the inherited one", func(t *testing.T) {
+		chain := &inheritChain{}
+		store := &probeStore{inner: histmem.New()}
+		k, repo, ag := registerWithHistory(t, chain.step(), growingLLM(), store)
+
+		a := runIssuer(t, k, repo, ag)
+		bID, err := ag.Spawn(ctx, k, scriptInput{Seed: "b"}, agentkit.WithInheritedHistory(a.ID))
+		gt.NoError(t, err).Required()
+		b := serveUntil(t, k, repo, bID, 5*time.Second, isTerminal)
+		gt.Value(t, b.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, b.HistoryRef).NotEqual(agentkit.HistoryRef(""))
+		gt.Value(t, b.InheritedHistory).Equal(&agentkit.InheritedHistory{Process: a.ID, Ref: a.HistoryRef})
+
+		cID, err := ag.Spawn(ctx, k, scriptInput{Seed: "c"}, agentkit.WithInheritedHistory(b.ID))
+		gt.NoError(t, err).Required()
+		c := serveUntil(t, k, repo, cID, 5*time.Second, isTerminal)
+		gt.Value(t, c.Status).Equal(agentkit.ProcessSucceeded)
+		gt.Value(t, c.InheritedHistory).Equal(&agentkit.InheritedHistory{Process: b.ID, Ref: b.HistoryRef})
+		gt.Value(t, chain.first("c")).Equal(committedHistory(t, store, b))
+	})
+
+	// The version passed through is read, never released: C's commits announce
+	// only C's own superseded version, and A's record still resolves.
+	t.Run("the passed-through version is never discarded", func(t *testing.T) {
+		chain := &inheritChain{}
+		store := &probeStore{inner: histmem.New()}
+		k, repo, ag := registerWithHistory(t, chain.step(), growingLLM(), store)
+
+		a := runIssuer(t, k, repo, ag)
+		b := spawnDirect(t, k, repo, ag, agentkit.WithInheritedHistory(a.ID))
+		cID, err := ag.Spawn(ctx, k, scriptInput{Seed: "c"}, agentkit.WithInheritedHistory(b.ID))
+		gt.NoError(t, err).Required()
+		c := serveUntil(t, k, repo, cID, 5*time.Second, isTerminal)
+		gt.Value(t, c.Status).Equal(agentkit.ProcessSucceeded)
+
+		// saved() is in call order: A's two versions, then C's two. Each Process
+		// released exactly its own first version, under its own id.
+		refs := store.saved()
+		gt.Array(t, refs).Length(4)
+		gt.Value(t, store.discardedPairs()).Equal([]histCall{
+			{pid: a.ID, ref: refs[0]},
+			{pid: cID, ref: refs[2]},
+		})
+		gt.Value(t, discardedRef(store.discardedPairs(), a.HistoryRef)).Equal(false)
+		gt.Value(t, histLen(committedHistory(t, store, a))).Equal(2)
+	})
+
+	t.Run("a process with neither its own nor an inherited version", func(t *testing.T) {
+		chain := &inheritChain{}
+		k, repo, ag := registerWithHistory(t, chain.step(), growingLLM(), histmem.New())
+
+		// Finished, but it never had a conversation in either way.
+		d := spawnDirect(t, k, repo, ag)
+		gt.Nil(t, d.InheritedHistory)
+
+		_, err := ag.Spawn(ctx, k, scriptInput{Seed: "c"}, agentkit.WithInheritedHistory(d.ID))
+		gt.Error(t, err).Is(agentkit.ErrInvalidRequest)
+		now := time.Now()
+		claimed, err := repo.ClaimNextProcess(ctx, "probe", now.Add(time.Minute), now)
+		gt.NoError(t, err)
+		gt.Nil(t, claimed)
 	})
 }
 
