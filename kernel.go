@@ -339,13 +339,24 @@ func validateInheritFrom(cfg *spawnConfig, name AgentName, b StrategyBinding) er
 	return nil
 }
 
-// inheritedHistoryOf pins the version issuer's record currently names.
+// inheritedHistoryOf pins the version issuer's conversation currently is.
+//
+// When issuer has committed a version of its own, that is the one. When it has
+// not but was itself spawned with WithInheritedHistory, its conversation is the
+// version it inherited — the same reading ensureLoaded and conversationClosed
+// give that record — so the pair is passed on as-is: Process stays the one that
+// saved the version, under whose id the store addresses it. However many such
+// Processes sit in between, the result names the saving Process directly.
 func inheritedHistoryOf(issuer *Process) (*InheritedHistory, error) {
-	if issuer.HistoryRef == "" {
-		return nil, goerr.Wrap(ErrInvalidRequest, "the process to inherit from has committed no conversation",
-			goerr.V("from", issuer.ID), goerr.V("status", issuer.Status))
+	if issuer.HistoryRef != "" {
+		return &InheritedHistory{Process: issuer.ID, Ref: issuer.HistoryRef}, nil
 	}
-	return &InheritedHistory{Process: issuer.ID, Ref: issuer.HistoryRef}, nil
+	if issuer.InheritedHistory != nil {
+		ih := *issuer.InheritedHistory
+		return &ih, nil
+	}
+	return nil, goerr.Wrap(ErrInvalidRequest, "the process to inherit from has committed no conversation",
+		goerr.V("from", issuer.ID), goerr.V("status", issuer.Status))
 }
 
 // Respond delivers a response to a question await (a confirmation's yes/no is

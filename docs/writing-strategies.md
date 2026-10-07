@@ -325,17 +325,29 @@ without touching the ones before it.
 What crosses is the conversation and nothing else. State does not: the new
 Process runs `Init` on the input you give it, like any other.
 
-**Inherit from a Process that is finished.** agentkit pins the version at `Spawn`
-and never releases it, but it cannot keep the *issuing* Process from releasing it:
-if `previous` is still running, its next commit reports that version as
-superseded, and reclaiming it is then the store's decision
-([ADR-0017](adr/0017-history-is-an-immutable-versioned-store.md)). Inheriting
-from a running Process is allowed — branching off its current conversation is a
-reasonable thing to want — but the version can be gone by the time it is read,
-which surfaces as a failing first transition, not as an empty conversation.
+`previous` does not have to have used `sys.Session()` itself. If it was spawned
+with `WithInheritedHistory` and finished without committing a conversation of
+its own — say it answered with a single `sys.Generate` and returned `Done` — its
+conversation is still the one it inherited, and the new Process inherits that
+same version. A chain of such turns always points back to the Process that
+actually saved the version; `InheritedHistory` on the new Process names that
+Process, not `previous`.
 
-`Spawn` fails synchronously if `previous` does not exist, or has committed no
-conversation yet, or the agent was registered without `WithHistoryStore`.
+**Inherit a version whose saving Process is finished.** agentkit pins the version
+at `Spawn` and never releases it, but it cannot keep the Process that saved it
+from releasing it: if that Process is still running, its next commit reports the
+version as superseded, and reclaiming it is then the store's decision
+([ADR-0017](adr/0017-history-is-an-immutable-versioned-store.md)). Usually the
+saving Process is `previous` itself. When `previous` only passed on a version it
+inherited, it is an earlier Process, and `previous` having finished says nothing
+about it. Inheriting from a running Process is allowed — branching off its
+current conversation is a reasonable thing to want — but the version can be gone
+by the time it is read, which surfaces as a failing first transition, not as an
+empty conversation.
+
+`Spawn` fails synchronously if `previous` does not exist, or has no conversation
+at all — it committed none of its own and inherited none — or the agent was
+registered without `WithHistoryStore`.
 
 **An inherited conversation is not always cheaper than a fresh prompt.** It can
 be much longer than the prompt it replaces. If the provider's prompt cache still
@@ -369,7 +381,8 @@ fold into the parent when the await resolves. Naming any Process the caller did
 not spawn — a sibling's child, an unrelated Process, the caller's own — is
 `ErrInvalidRequest`, and so is an id no Process has; the other failures are the
 same as on `Spawn` — a child spawned earlier in the same `Step` fails as having
-committed no conversation. Naming a child that is still running is allowed, with
+committed no conversation, and a finished child that committed none of its own
+passes on the version it inherited. Naming a child that is still running is allowed, with
 the same caveat as inheriting from a running Process above. A `SpawnMiddleware` sees the resolved pair on
 `req.InheritedHistory` and can set it to `nil` to start the child empty.
 

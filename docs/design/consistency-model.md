@@ -196,8 +196,11 @@ the superseded version is no longer referenced, but that call is a notification 
 the store decides when, or whether, to reclaim. Versions left by a crash between
 a save and its commit are never announced at all, so a store needs its own policy
 for them. Nor is the survival of an inherited version guaranteed: the Process
-that issued it releases it on its own next commit, so inheriting from a Process
-still running means the version may be gone by the time it is read. And the effect model is unchanged ([ADR-0003](../adr/0003-at-least-once-replay-no-effect-journal.md)):
+that saved it releases it on its own next commit, so inheriting from a Process
+still running means the version may be gone by the time it is read. (A Process
+that committed no version of its own passes on the pair it inherited, so the
+saving Process can be an earlier one than the Process `WithInheritedHistory`
+named.) And the effect model is unchanged ([ADR-0003](../adr/0003-at-least-once-replay-no-effect-journal.md)):
 a replay still re-calls the LLM and re-runs tools.
 
 Because the save precedes the commit, a History-store outage prevents the

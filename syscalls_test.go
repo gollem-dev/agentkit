@@ -473,6 +473,82 @@ func TestSpawnChildInheritsSiblingHistory(t *testing.T) {
 	gt.Value(t, histLen(committedHistory(t, store, firstProc))).Equal(1)
 }
 
+// A child that answered without Session() committed no version of its own; its
+// conversation is the one it inherited, so a sibling spawned from it receives
+// that version, named under the child that saved it.
+func TestSpawnChildInheritsThroughChildWithoutOwnVersion(t *testing.T) {
+	ctx := context.Background()
+	chain := &inheritChain{}
+	store := histmem.New()
+	reg := agentkit.NewRegistry()
+	child, err := agentkit.Register(reg, "child", 1, &scriptStrategy{step: chain.step()},
+		agentkit.WithHistoryStore[[]byte](store))
+	gt.NoError(t, err)
+
+	var mu sync.Mutex
+	var ids []agentkit.ProcessID
+	var inheritErr error
+	// Each Step spawns one child and waits on it: "a" saves a conversation, the
+	// direct one inherits from "a", and "c" inherits from the direct one.
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		var seed string
+		var opts []agentkit.SpawnOption
+		mu.Lock()
+		switch st.N {
+		case 0:
+			seed = "a"
+		case 1:
+			seed, opts = directAnswerSeed, []agentkit.SpawnOption{agentkit.WithInheritedHistory(ids[0])}
+		case 2:
+			seed, opts = "c", []agentkit.SpawnOption{agentkit.WithInheritedHistory(ids[1])}
+		}
+		mu.Unlock()
+		if seed == "" {
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		id, err := child.SpawnChild(c, sys, scriptInput{Seed: seed}, opts...)
+		if err != nil {
+			mu.Lock()
+			inheritErr = err
+			mu.Unlock()
+			return st, agentkit.Done([]byte("rejected")), nil
+		}
+		mu.Lock()
+		ids = append(ids, id)
+		mu.Unlock()
+		st.N++
+		return st, agentkit.Suspend[[]byte](agentkit.WaitChildren(agentkit.AwaitKey(seed), id)), nil
+	}
+	parent, err := agentkit.Register(reg, "parent", 1, &scriptStrategy{step: step})
+	gt.NoError(t, err)
+	repo := memory.New()
+	k, err := agentkit.New(repo, growingLLM(), reg)
+	gt.NoError(t, err)
+
+	pid, err := parent.Spawn(ctx, k, scriptInput{Seed: "s"})
+	gt.NoError(t, err)
+	p := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessSucceeded)
+	mu.Lock()
+	gt.NoError(t, inheritErr)
+	got := append([]agentkit.ProcessID(nil), ids...)
+	mu.Unlock()
+	gt.Value(t, string(p.Output)).Equal("done")
+	gt.Array(t, got).Length(3).Required()
+
+	a, err := k.GetProcess(ctx, got[0])
+	gt.NoError(t, err)
+	direct, err := k.GetProcess(ctx, got[1])
+	gt.NoError(t, err)
+	c, err := k.GetProcess(ctx, got[2])
+	gt.NoError(t, err)
+
+	gt.Value(t, direct.HistoryRef).Equal(agentkit.HistoryRef(""))
+	gt.Value(t, c.InheritedHistory).Equal(&agentkit.InheritedHistory{Process: a.ID, Ref: a.HistoryRef})
+	gt.Value(t, c.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, chain.first("c")).Equal(committedHistory(t, store, a))
+}
+
 // Only a Process the caller itself spawned can be named. Everything else is
 // refused before a child is minted, whether or not the named Process exists.
 func TestSpawnChildInheritedHistoryValidation(t *testing.T) {
