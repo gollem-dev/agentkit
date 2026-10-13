@@ -153,7 +153,8 @@ and "nobody answered".
 The runtime. Two halves that happen to share dependencies:
 
 - **The lifecycle API** — `Agent[I].Spawn`, `Respond`, `Cancel`, `GetProcess`,
-  `ListAwaits`, `ListEvents`.
+  `ListAwaits`, `ListEvents`. A `Cancel` reaches every descendant of the Process
+  it names ([ADR-0021](adr/0021-cancel-reaches-every-descendant.md)).
 - **The worker loop** — `Serve`.
 
 They are one type because they need identical wiring. A deployment that only

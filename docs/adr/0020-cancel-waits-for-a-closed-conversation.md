@@ -2,8 +2,10 @@
 
 ## Summary
 
-When a worker observes `CancelRequested` on a Process it is driving, it does not
-finalize while the **managed conversation** the last transition committed still
+When a worker observes a cancel on a Process it is driving — its own
+`CancelRequested`, or a cancelled ancestor
+([ADR-0021](0021-cancel-reaches-every-descendant.md)) — it does not finalize
+while the **managed conversation** the last transition committed still
 holds a tool call nobody answered. It runs the strategy's next transition and
 looks again, bounded by `WithMaxCancelDeferrals` (default: the rest of the
 claim), after which it finalizes whatever the conversation looks like.
@@ -60,7 +62,8 @@ seed a Spawn) that this change does not add.
 `hasOpenToolCall` walks a `gollem.History` and reports whether any tool call is
 missing its response. `Kernel.conversationClosed` gets the committed version from
 the claim's `historyState` and answers with the negation. `driveClaim` tests the
-deferral bound first, then that, before finalizing a cancel.
+deferral bound first, then that, before finalizing a cancel — whether the cancel
+is the row's own or derived from a cancelled ancestor.
 
 **The kernel reads conversation structure here.** It already builds conversation
 messages in `Session().CallTool` — the one exception
@@ -141,3 +144,4 @@ current one, recorded as a known gap rather than papered over.
 | Date | Change |
 |---|---|
 | 2026-08-02 | Initial record. |
+| 2026-10-13 | The deferral also covers a cancel derived from a cancelled ancestor (ADR-0021). |

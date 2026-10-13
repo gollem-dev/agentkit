@@ -416,6 +416,17 @@ func (k *Kernel) Respond(ctx context.Context, pid ProcessID, key AwaitKey, respo
 // awaits cancelled, process.finished event). running -> only sets
 // cancel_requested (the worker finalizes at the next transition boundary).
 // terminal -> ErrProcessFinished.
+//
+// A cancellation reaches every descendant (ADR-0021). When this Process commits
+// as cancelled — inside this call for pending/waiting, at the worker's next
+// boundary for running — each child named by an await that commit closed is
+// cancelled the same way, with the same reason: a pending or waiting child ends
+// at once, a running one gets cancel_requested. A failure there is logged, not
+// returned, so a nil error does not mean every descendant has ended; read them
+// with GetProcess. Any descendant this does not reach is treated as
+// cancel-requested by the worker that claims it next, deferral included. Work
+// that must outlive its parent is not a child: start it as its own root with
+// Agent.Spawn.
 func (k *Kernel) Cancel(ctx context.Context, pid ProcessID, reason string) error {
 	for {
 		proc, err := k.repo.GetProcess(ctx, pid)
