@@ -3670,3 +3670,684 @@ func TestSettleTimeoutRejectsNonPositiveValues(t *testing.T) {
 		})
 	}
 }
+
+// --- a cancel reaches every descendant (ADR-0021) ---
+
+type agentMap = map[agentkit.AgentName]agentkit.Agent[scriptInput]
+
+// treeKernel registers the steps build returns on one registry over repo. build
+// receives the map the handles are registered into, so a step that spawns can
+// name another agent of the same tree; the map is filled before any step runs.
+func treeKernel(t *testing.T, repo agentkit.Repository, model gollem.LLMClient,
+	build func(agents agentMap) map[agentkit.AgentName]stepFn) (*agentkit.Kernel, agentMap) {
+	t.Helper()
+	reg := agentkit.NewRegistry()
+	agents := agentMap{}
+	for name, step := range build(agents) {
+		ag, err := agentkit.Register(reg, name, 1, &scriptStrategy{step: step})
+		gt.NoError(t, err)
+		agents[name] = ag
+	}
+	k, err := agentkit.New(repo, model, reg)
+	gt.NoError(t, err)
+	return k, agents
+}
+
+// waitOn spawns one child of each named agent, waits on all of them, and
+// finishes once they are done.
+func waitOn(agents agentMap, children ...agentkit.AgentName) stepFn {
+	return func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if st.N > 0 {
+			return st, agentkit.Done([]byte("done")), nil
+		}
+		ids := make([]agentkit.ProcessID, 0, len(children))
+		for _, name := range children {
+			id, err := agents[name].SpawnChild(c, sys, scriptInput{Seed: string(name)})
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			ids = append(ids, id)
+		}
+		st.N = 1
+		return st, agentkit.Suspend[[]byte](agentkit.WaitChildren("kids", ids...)), nil
+	}
+}
+
+// parkStep suspends on a timer far in the future, so the Process sits in waiting
+// until something else ends it. With generate set it spends one LLM call first.
+func parkStep(generate bool) stepFn {
+	return func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if generate {
+			if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+		}
+		return st, agentkit.Suspend[[]byte](agentkit.Timer("later", sys.Now().Add(time.Hour))), nil
+	}
+}
+
+// countingSpin continues forever and counts its transitions.
+func countingSpin(steps *atomic.Int32) stepFn {
+	return func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		steps.Add(1)
+		st.N++
+		return st, agentkit.Continue[[]byte](), nil
+	}
+}
+
+// blockingStep spends one LLM call, then holds the transition until release is
+// closed, so a test can act while the Process is running.
+func blockingStep(entered, release chan struct{}) stepFn {
+	var once sync.Once
+	return func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		once.Do(func() { close(entered) })
+		<-release
+		st.N++
+		return st, agentkit.Continue[[]byte](), nil
+	}
+}
+
+// waitedChildren returns the children the Process's "kids" await names.
+func waitedChildren(t *testing.T, repo agentkit.Repository, pid agentkit.ProcessID) []agentkit.ProcessID {
+	t.Helper()
+	awaits, err := repo.ListAwaits(context.Background(), pid)
+	gt.NoError(t, err)
+	for _, aw := range awaits {
+		if aw.Key == "kids" {
+			return aw.Children
+		}
+	}
+	t.Fatalf("process %s has no kids await", pid)
+	return nil
+}
+
+// insertRows stores Processes as they are, for a test that needs a tree in a
+// state no live run would leave it in.
+func insertRows(t *testing.T, repo agentkit.Repository, rows []*agentkit.Process, awaits ...*agentkit.Await) {
+	t.Helper()
+	gt.NoError(t, repo.Apply(context.Background(), agentkit.ChangeSet{Processes: rows, Awaits: awaits}))
+}
+
+func scriptRow(id agentkit.ProcessID, agent agentkit.AgentName, status agentkit.ProcessStatus, parent *agentkit.ProcessID, root agentkit.ProcessID) *agentkit.Process {
+	return &agentkit.Process{
+		ID: id, Agent: agent, Status: status, ParentID: parent, RootID: root,
+		State: []byte(`{"seed":"s"}`), StateVersion: 1,
+	}
+}
+
+func TestCancelWaitingParentCancelsItsChildren(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	model, calls := mockLLM(textResponse("x"))
+	entered, release := make(chan struct{}), make(chan struct{})
+	k, agents := treeKernel(t, repo, model, func(a agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{
+			"child":  blockingStep(entered, release),
+			"parent": waitOn(a, "child", "child"),
+		}
+	})
+
+	pid, err := agents["parent"].Spawn(ctx, k, scriptInput{Seed: "p"})
+	gt.NoError(t, err)
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, pid))).Equal(agentkit.ClaimSuspended)
+	kids := waitedChildren(t, repo, pid)
+	gt.A(t, kids).Length(2)
+	running, pending := kids[0], kids[1]
+
+	res := make(chan agentkit.ClaimOutcome, 1)
+	claimed := mustClaim(t, k, running)
+	go func() { res <- k.RunClaimForTest(ctx, claimed) }()
+	<-entered
+
+	gt.NoError(t, k.Cancel(ctx, pid, "stop"))
+	gt.Value(t, mustGet(t, repo, pid).Status).Equal(agentkit.ProcessCancelled)
+	pp := mustGet(t, repo, pending)
+	gt.Value(t, pp.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, pp.CancelReason).Equal("stop")
+	rp := mustGet(t, repo, running)
+	gt.Value(t, rp.Status).Equal(agentkit.ProcessRunning)
+	gt.Bool(t, rp.CancelRequested).True()
+
+	close(release)
+	gt.Value(t, <-res).Equal(agentkit.ClaimFinished)
+	rp = mustGet(t, repo, running)
+	gt.Value(t, rp.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, rp.CancelReason).Equal("stop")
+	gt.Value(t, *calls).Equal(1) // nothing generated after the cancel.
+}
+
+func TestCancelRootReachesGrandchildThroughAWaitingChild(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	model, calls := mockLLM(textResponse("x"))
+	entered, release := make(chan struct{}), make(chan struct{})
+	k, agents := treeKernel(t, repo, model, func(a agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{
+			"leaf": blockingStep(entered, release),
+			"mid":  waitOn(a, "leaf"),
+			"root": waitOn(a, "mid"),
+		}
+	})
+
+	root, err := agents["root"].Spawn(ctx, k, scriptInput{Seed: "r"})
+	gt.NoError(t, err)
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, root))).Equal(agentkit.ClaimSuspended)
+	mid := waitedChildren(t, repo, root)[0]
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, mid))).Equal(agentkit.ClaimSuspended)
+	leaf := waitedChildren(t, repo, mid)[0]
+
+	res := make(chan agentkit.ClaimOutcome, 1)
+	claimed := mustClaim(t, k, leaf)
+	go func() { res <- k.RunClaimForTest(ctx, claimed) }()
+	<-entered
+
+	gt.NoError(t, k.Cancel(ctx, root, "stop"))
+	gt.Value(t, mustGet(t, repo, root).Status).Equal(agentkit.ProcessCancelled)
+	mp := mustGet(t, repo, mid)
+	gt.Value(t, mp.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, mp.CancelReason).Equal("stop")
+	lp := mustGet(t, repo, leaf)
+	gt.Bool(t, lp.CancelRequested).True()
+	gt.Value(t, lp.CancelReason).Equal("stop")
+
+	close(release)
+	gt.Value(t, <-res).Equal(agentkit.ClaimFinished)
+	lp = mustGet(t, repo, leaf)
+	gt.Value(t, lp.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, lp.CancelReason).Equal("stop")
+	gt.Value(t, *calls).Equal(1)
+}
+
+// The cascade after a commit is an optimization. When it never ran, the rows
+// below a cancelled root are found by the claim that picks them up, before Step.
+func TestCancelledAncestorStopsAPendingDescendantBeforeStep(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	model, _ := mockLLM(textResponse("x"))
+	var steps atomic.Int32
+	k, _ := treeKernel(t, repo, model, func(agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{"spin": countingSpin(&steps)}
+	})
+
+	sfx := randSuffix()
+	root := agentkit.ProcessID("root-" + sfx)
+	mid := agentkit.ProcessID("mid-" + sfx)
+	leaf := agentkit.ProcessID("leaf-" + sfx)
+	rootRow := scriptRow(root, "spin", agentkit.ProcessCancelled, nil, root)
+	rootRow.CancelReason = "stop"
+	insertRows(t, repo, []*agentkit.Process{
+		rootRow,
+		scriptRow(mid, "spin", agentkit.ProcessWaiting, &root, root),
+		scriptRow(leaf, "spin", agentkit.ProcessPending, &mid, root),
+	}, &agentkit.Await{
+		ProcessID: mid, Key: "kids", Kind: agentkit.AwaitChildren, Status: agentkit.AwaitOpen,
+		Children: []agentkit.ProcessID{leaf}, CreatedAt: time.Now(),
+	})
+
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, leaf))).Equal(agentkit.ClaimFinished)
+	lp := mustGet(t, repo, leaf)
+	gt.Value(t, lp.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, lp.CancelReason).Equal("stop")
+
+	// The leaf's terminal commit woke the intermediate one, which the same check
+	// then finishes: the grandparent is what is cancelled, not its parent.
+	gt.Value(t, mustGet(t, repo, mid).Status).Equal(agentkit.ProcessPending)
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, mid))).Equal(agentkit.ClaimFinished)
+	mp := mustGet(t, repo, mid)
+	gt.Value(t, mp.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, mp.CancelReason).Equal("stop")
+	gt.Value(t, steps.Load()).Equal(int32(0))
+}
+
+func TestCancelledAncestorStopsARunningDescendantAtTheNextBoundary(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	model, calls := mockLLM(textResponse("x"))
+
+	sfx := randSuffix()
+	root := agentkit.ProcessID("root-" + sfx)
+	child := agentkit.ProcessID("child-" + sfx)
+	step := func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		if _, err := sys.Generate(c, []gollem.Input{gollem.Text("go")}); err != nil {
+			return st, agentkit.Decision[[]byte]{}, err
+		}
+		if st.N == 0 {
+			// The root ends without going through a terminal commit, so nothing
+			// cascades: only the child's own check can notice.
+			rp := mustGet(t, repo, root)
+			rp.Status = agentkit.ProcessCancelled
+			rp.CancelReason = "stop"
+			gt.NoError(t, repo.Apply(c, agentkit.ChangeSet{Processes: []*agentkit.Process{rp}}))
+		}
+		st.N++
+		return st, agentkit.Continue[[]byte](), nil
+	}
+	k, _ := treeKernel(t, repo, model, func(agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{"main": step}
+	})
+	insertRows(t, repo, []*agentkit.Process{
+		scriptRow(root, "main", agentkit.ProcessRunning, nil, root),
+		scriptRow(child, "main", agentkit.ProcessPending, &root, root),
+	})
+
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, child))).Equal(agentkit.ClaimFinished)
+	cp := mustGet(t, repo, child)
+	gt.Value(t, cp.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, cp.CancelReason).Equal("stop")
+	gt.Value(t, cp.StateSeq).Equal(1) // the transition in flight committed.
+	gt.Value(t, *calls).Equal(1)
+}
+
+func TestCancelSubtreeLeavesTheRootAndSiblingsRunning(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	model, _ := mockLLM(textResponse("x"))
+	gate := make(chan struct{})
+	gated := func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		select {
+		case <-gate:
+			return st, agentkit.Done([]byte("b")), nil
+		default:
+			return st, agentkit.Continue[[]byte](), nil
+		}
+	}
+	k, agents := treeKernel(t, repo, model, func(a agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{
+			"leaf":    parkStep(false),
+			"sibling": gated,
+			"mid":     waitOn(a, "leaf"),
+			"root":    waitOn(a, "mid", "sibling"),
+		}
+	})
+
+	root, err := agents["root"].Spawn(ctx, k, scriptInput{Seed: "r"})
+	gt.NoError(t, err)
+	serveUntil(t, k, repo, root, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+	kids := waitedChildren(t, repo, root)
+	mid, sibling := kids[0], kids[1]
+	serveUntil(t, k, repo, mid, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+	leaf := waitedChildren(t, repo, mid)[0]
+	serveUntil(t, k, repo, leaf, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+
+	gt.NoError(t, k.Cancel(ctx, mid, "stop"))
+	gt.Value(t, mustGet(t, repo, mid).Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, mustGet(t, repo, leaf).Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, mustGet(t, repo, root).Status).Equal(agentkit.ProcessWaiting)
+	sp := mustGet(t, repo, sibling)
+	gt.Bool(t, sp.Status.Terminal()).False()
+	gt.Bool(t, sp.CancelRequested).False()
+
+	close(gate)
+	rp := serveUntil(t, k, repo, root, 5*time.Second, isTerminal)
+	gt.Value(t, rp.Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, mustGet(t, repo, sibling).Status).Equal(agentkit.ProcessSucceeded)
+	awaits, err := repo.ListAwaits(ctx, root)
+	gt.NoError(t, err)
+	got := map[agentkit.ProcessID]agentkit.ProcessStatus{}
+	for _, aw := range awaits {
+		for _, r := range aw.Results {
+			got[r.ProcessID] = r.Status
+		}
+	}
+	gt.Value(t, got).Equal(map[agentkit.ProcessID]agentkit.ProcessStatus{
+		mid: agentkit.ProcessCancelled, sibling: agentkit.ProcessSucceeded,
+	})
+}
+
+// A running parent may still spawn after Cancel was called — here in the
+// transition ADR-0020 defers to — and that child is not in any await. It is
+// reached by its own check against the parent's cancelled row.
+func TestCancelReachesAChildSpawnedDuringADeferral(t *testing.T) {
+	hs := histmem.New()
+	base := memory.New()
+	gate := newBoundaryGate(base)
+	hr := &hookRepo{Repository: base, onGet: gate.onGet}
+
+	var spins atomic.Int32
+	var childMu sync.Mutex
+	var childID agentkit.ProcessID
+	reg := agentkit.NewRegistry()
+	spin, err := agentkit.Register(reg, "spin", 1, &scriptStrategy{step: countingSpin(&spins)})
+	gt.NoError(t, err)
+	step := func(ctx context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+		switch st.N {
+		case 0:
+			if _, err := sys.Session().Generate(ctx, []gollem.Input{gollem.Text("go")}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+		case 1:
+			if _, err := sys.Session().CallTool(ctx, gollem.FunctionCall{ID: "c1", Name: "probe"}); err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			id, err := spin.SpawnChild(ctx, sys, scriptInput{Seed: "late"})
+			if err != nil {
+				return st, agentkit.Decision[[]byte]{}, err
+			}
+			childMu.Lock()
+			childID = id
+			childMu.Unlock()
+		}
+		st.N++
+		return st, agentkit.Continue[[]byte](), nil
+	}
+	ag, err := agentkit.Register(reg, "main", 1, &scriptStrategy{step: step}, agentkit.WithHistoryStore[[]byte](hs))
+	gt.NoError(t, err)
+	k, err := agentkit.New(hr, openToolCallLLM(t, "c1", "probe"), reg,
+		agentkit.WithToolFactory(func(context.Context, *agentkit.Process) ([]gollem.Tool, error) {
+			return []gollem.Tool{mockTool("probe", map[string]any{"ok": true})}, nil
+		}))
+	gt.NoError(t, err)
+
+	p := cancelAtBoundary(t, k, base, ag, gate)
+	gt.Value(t, p.Status).Equal(agentkit.ProcessCancelled)
+	childMu.Lock()
+	id := childID
+	childMu.Unlock()
+	gt.Value(t, id).NotEqual(agentkit.ProcessID(""))
+
+	cp := serveUntil(t, k, base, id, 5*time.Second, isTerminal)
+	gt.Value(t, cp.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, cp.CancelReason).Equal("user stopped")
+}
+
+func TestCancelledChildMetricsFoldIntoTheCancelledParent(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	model, _ := mockLLM(textResponse("x"))
+	k, agents := treeKernel(t, repo, model, func(a agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{"child": parkStep(true), "parent": waitOn(a, "child")}
+	})
+
+	pid, err := agents["parent"].Spawn(ctx, k, scriptInput{Seed: "p"})
+	gt.NoError(t, err)
+	serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+	child := waitedChildren(t, repo, pid)[0]
+	serveUntil(t, k, repo, child, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+
+	gt.NoError(t, k.Cancel(ctx, pid, "stop"))
+	gt.Value(t, mustGet(t, repo, child).Status).Equal(agentkit.ProcessCancelled)
+	pp := mustGet(t, repo, pid)
+	gt.Value(t, pp.Metrics.LLMCalls).Equal(int64(1))
+	gt.Value(t, pp.Metrics.InputTokens).Equal(int64(5))
+}
+
+// A cancel ends a parent before its children, so a grandchild's usage would
+// stop at its already-terminal parent. It has to reach the root as well, and
+// only once.
+func TestLateGrandchildMetricsReachTheRoot(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	model, _ := mockLLM(textResponse("x"))
+	k, agents := treeKernel(t, repo, model, func(a agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{
+			"leaf": parkStep(true),
+			"mid":  waitOn(a, "leaf"),
+			"root": waitOn(a, "mid"),
+		}
+	})
+
+	root, err := agents["root"].Spawn(ctx, k, scriptInput{Seed: "r"})
+	gt.NoError(t, err)
+	serveUntil(t, k, repo, root, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+	mid := waitedChildren(t, repo, root)[0]
+	serveUntil(t, k, repo, mid, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+	leaf := waitedChildren(t, repo, mid)[0]
+	serveUntil(t, k, repo, leaf, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+
+	gt.NoError(t, k.Cancel(ctx, root, "stop"))
+	gt.Value(t, mustGet(t, repo, leaf).Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, mustGet(t, repo, mid).Metrics.LLMCalls).Equal(int64(1))
+	gt.Value(t, mustGet(t, repo, root).Metrics.LLMCalls).Equal(int64(1))
+}
+
+// The parent terminates between the child's read of it and the child's commit.
+// The child's commit conflicts on the parent's Rev, and the retry reads the
+// parent as terminated and carries the usage on to the grandparent — once.
+func TestLateChildMetricsFoldRetriesWhenTheParentTerminatesFirst(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	hr := &hookRepo{Repository: base}
+	model, _ := mockLLM(textResponse("x"))
+	k, _ := treeKernel(t, hr, model, func(agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{"main": doneStep()}
+	})
+	sfx := randSuffix()
+	root := agentkit.ProcessID("root-" + sfx)
+	mid := agentkit.ProcessID("mid-" + sfx)
+	leaf := agentkit.ProcessID("leaf-" + sfx)
+	leafRow := scriptRow(leaf, "main", agentkit.ProcessWaiting, &mid, root)
+	leafRow.Metrics = agentkit.Metrics{LLMCalls: 1}
+	insertRows(t, base, []*agentkit.Process{
+		scriptRow(root, "main", agentkit.ProcessWaiting, nil, root),
+		scriptRow(mid, "main", agentkit.ProcessRunning, &root, root),
+		leafRow,
+	})
+
+	var once sync.Once
+	hr.setApply(func(cs agentkit.ChangeSet) {
+		for _, p := range cs.Processes {
+			if p.ID == leaf && p.Status == agentkit.ProcessCancelled {
+				once.Do(func() {
+					mp := mustGet(t, base, mid)
+					mp.Status = agentkit.ProcessSucceeded
+					gt.NoError(t, base.Apply(ctx, agentkit.ChangeSet{Processes: []*agentkit.Process{mp}}))
+				})
+			}
+		}
+	})
+
+	gt.NoError(t, k.Cancel(ctx, leaf, "stop"))
+	gt.Value(t, mustGet(t, base, leaf).Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, mustGet(t, base, mid).Metrics.LLMCalls).Equal(int64(1))
+	gt.Value(t, mustGet(t, base, root).Metrics.LLMCalls).Equal(int64(1))
+}
+
+// An ancestor the fold has to write but cannot read aborts the whole terminal
+// commit, so nothing is half-applied and the retry adds the usage once.
+func TestLateChildMetricsFoldAbortsWhenAnAncestorCannotBeRead(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	sfx := randSuffix()
+	root := agentkit.ProcessID("root-" + sfx)
+	mid := agentkit.ProcessID("mid-" + sfx)
+	leaf := agentkit.ProcessID("leaf-" + sfx)
+	var failRoot atomic.Bool
+	failRoot.Store(true)
+	hr := &hookRepo{Repository: base, onGet: func(pid agentkit.ProcessID) error {
+		if pid == root && failRoot.Load() {
+			return gollemErr("store unavailable")
+		}
+		return nil
+	}}
+	model, _ := mockLLM(textResponse("x"))
+	k, _ := treeKernel(t, hr, model, func(agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{"main": doneStep()}
+	})
+	leafRow := scriptRow(leaf, "main", agentkit.ProcessWaiting, &mid, root)
+	leafRow.Metrics = agentkit.Metrics{LLMCalls: 1}
+	insertRows(t, base, []*agentkit.Process{
+		scriptRow(root, "main", agentkit.ProcessWaiting, nil, root),
+		scriptRow(mid, "main", agentkit.ProcessCancelled, &root, root),
+		leafRow,
+	})
+
+	gt.Error(t, k.Cancel(ctx, leaf, "stop"))
+	gt.Value(t, mustGet(t, base, leaf).Status).Equal(agentkit.ProcessWaiting)
+	gt.Value(t, mustGet(t, base, mid).Metrics.LLMCalls).Equal(int64(0))
+	gt.Value(t, mustGet(t, base, root).Metrics.LLMCalls).Equal(int64(0))
+
+	failRoot.Store(false)
+	gt.NoError(t, k.Cancel(ctx, leaf, "stop"))
+	gt.Value(t, mustGet(t, base, leaf).Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, mustGet(t, base, mid).Metrics.LLMCalls).Equal(int64(1))
+	gt.Value(t, mustGet(t, base, root).Metrics.LLMCalls).Equal(int64(1))
+}
+
+func TestParentSuccessOrFailureLeavesUnwaitedChildrenRunning(t *testing.T) {
+	cases := map[string]struct {
+		end  agentkit.Decision[[]byte]
+		want agentkit.ProcessStatus
+	}{
+		"succeeded": {agentkit.Done([]byte("done")), agentkit.ProcessSucceeded},
+		"failed":    {agentkit.Fail[[]byte](agentkit.FailureStrategyError, "gave up"), agentkit.ProcessFailed},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := memory.New()
+			model, _ := mockLLM(textResponse("x"))
+			gate := make(chan struct{})
+			var childMu sync.Mutex
+			var childID agentkit.ProcessID
+			k, agents := treeKernel(t, repo, model, func(a agentMap) map[agentkit.AgentName]stepFn {
+				return map[agentkit.AgentName]stepFn{
+					"child": func(_ context.Context, _ agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+						select {
+						case <-gate:
+							return st, agentkit.Done([]byte("child")), nil
+						default:
+							return st, agentkit.Continue[[]byte](), nil
+						}
+					},
+					"parent": func(c context.Context, sys agentkit.Syscalls, st scriptState) (scriptState, agentkit.Decision[[]byte], error) {
+						id, err := a["child"].SpawnChild(c, sys, scriptInput{Seed: "c"})
+						if err != nil {
+							return st, agentkit.Decision[[]byte]{}, err
+						}
+						childMu.Lock()
+						childID = id
+						childMu.Unlock()
+						return st, tc.end, nil
+					},
+				}
+			})
+
+			pid, err := agents["parent"].Spawn(ctx, k, scriptInput{Seed: "p"})
+			gt.NoError(t, err)
+			pp := serveUntil(t, k, repo, pid, 5*time.Second, isTerminal)
+			gt.Value(t, pp.Status).Equal(tc.want)
+
+			childMu.Lock()
+			id := childID
+			childMu.Unlock()
+			cp := mustGet(t, repo, id)
+			gt.Bool(t, cp.Status.Terminal()).False()
+			gt.Bool(t, cp.CancelRequested).False()
+
+			close(gate)
+			cp = serveUntil(t, k, repo, id, 5*time.Second, isTerminal)
+			gt.Value(t, cp.Status).Equal(agentkit.ProcessSucceeded)
+		})
+	}
+}
+
+func TestAncestorReadFailureRequeuesWithoutStep(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	sfx := randSuffix()
+	root := agentkit.ProcessID("root-" + sfx)
+	child := agentkit.ProcessID("child-" + sfx)
+	hr := &hookRepo{Repository: base, onGet: func(pid agentkit.ProcessID) error {
+		if pid == root {
+			return gollemErr("store unavailable")
+		}
+		return nil
+	}}
+	var steps atomic.Int32
+	model, _ := mockLLM(textResponse("x"))
+	k, _ := treeKernel(t, hr, model, func(agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{"spin": countingSpin(&steps)}
+	})
+	insertRows(t, base, []*agentkit.Process{
+		scriptRow(root, "spin", agentkit.ProcessWaiting, nil, root),
+		scriptRow(child, "spin", agentkit.ProcessPending, &root, root),
+	})
+
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, child), noBackoff())).Equal(agentkit.ClaimRequeued)
+	cp := mustGet(t, base, child)
+	gt.Value(t, cp.Status).Equal(agentkit.ProcessPending)
+	gt.Value(t, cp.StepAttempts).Equal(0)
+	gt.Value(t, steps.Load()).Equal(int32(0))
+}
+
+// An ancestor that is not there ends the walk; it does not hold the Process back.
+func TestMissingAncestorEndsTheChain(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	model, _ := mockLLM(textResponse("x"))
+	k, _ := treeKernel(t, repo, model, func(agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{"main": doneStep()}
+	})
+	sfx := randSuffix()
+	missing := agentkit.ProcessID("missing-" + sfx)
+	child := agentkit.ProcessID("child-" + sfx)
+	insertRows(t, repo, []*agentkit.Process{scriptRow(child, "main", agentkit.ProcessPending, &missing, missing)})
+
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, child))).Equal(agentkit.ClaimFinished)
+	gt.Value(t, mustGet(t, repo, child).Status).Equal(agentkit.ProcessSucceeded)
+}
+
+func TestCancelSkipsChildrenThatAlreadyFinished(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	model, _ := mockLLM(textResponse("x"))
+	k, agents := treeKernel(t, repo, model, func(a agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{
+			"quick":  doneStep(),
+			"parked": parkStep(false),
+			"parent": waitOn(a, "quick", "parked"),
+		}
+	})
+
+	pid, err := agents["parent"].Spawn(ctx, k, scriptInput{Seed: "p"})
+	gt.NoError(t, err)
+	serveUntil(t, k, repo, pid, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+	kids := waitedChildren(t, repo, pid)
+	quick, parked := kids[0], kids[1]
+	serveUntil(t, k, repo, quick, 5*time.Second, isTerminal)
+	serveUntil(t, k, repo, parked, 5*time.Second, func(p *agentkit.Process) bool { return p.Status == agentkit.ProcessWaiting })
+
+	gt.NoError(t, k.Cancel(ctx, pid, "stop"))
+	gt.Value(t, mustGet(t, repo, quick).Status).Equal(agentkit.ProcessSucceeded)
+	gt.Value(t, mustGet(t, repo, parked).Status).Equal(agentkit.ProcessCancelled)
+}
+
+// The cascade is not what the parent's cancel stands on, so its failure does not
+// fail that cancel; the child is caught by its own check when it is claimed.
+func TestChildCancelFailureDoesNotFailTheParentCancel(t *testing.T) {
+	ctx := context.Background()
+	base := memory.New()
+	hr := &hookRepo{Repository: base}
+	model, _ := mockLLM(textResponse("x"))
+	var spins atomic.Int32
+	k, agents := treeKernel(t, hr, model, func(a agentMap) map[agentkit.AgentName]stepFn {
+		return map[agentkit.AgentName]stepFn{"spin": countingSpin(&spins), "parent": waitOn(a, "spin")}
+	})
+
+	pid, err := agents["parent"].Spawn(ctx, k, scriptInput{Seed: "p"})
+	gt.NoError(t, err)
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, pid))).Equal(agentkit.ClaimSuspended)
+	child := waitedChildren(t, base, pid)[0]
+
+	hr.setFailApply(func(cs agentkit.ChangeSet) error {
+		for _, p := range cs.Processes {
+			if p.ID == child && p.Status == agentkit.ProcessCancelled {
+				return gollemErr("store refused the write")
+			}
+		}
+		return nil
+	})
+	gt.NoError(t, k.Cancel(ctx, pid, "stop"))
+	gt.Value(t, mustGet(t, base, pid).Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, mustGet(t, base, child).Status).Equal(agentkit.ProcessPending)
+
+	hr.setFailApply(nil)
+	gt.Value(t, k.RunClaimForTest(ctx, mustClaim(t, k, child))).Equal(agentkit.ClaimFinished)
+	cp := mustGet(t, base, child)
+	gt.Value(t, cp.Status).Equal(agentkit.ProcessCancelled)
+	gt.Value(t, cp.CancelReason).Equal("stop")
+	gt.Value(t, spins.Load()).Equal(int32(0))
+}

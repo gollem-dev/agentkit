@@ -87,11 +87,16 @@ worse than retrying after the lease expires.
   distributed counter ([ADR-0010](0010-limiter-is-one-function.md)). It is keyed
   to the child rather than to an await precisely so that a child spawned and
   never waited on, which the point above permits, still reaches the total. A
-  child still running does not.
+  child still running does not. A child that ends after its parent is also
+  added to each terminated ancestor above it, through the first one that has not
+  terminated, so its usage is not stranded at a parent that already reported
+  ([ADR-0021](0021-cancel-reaches-every-descendant.md)).
 - `RootID` is inherited by every descendant, so a whole tree is queryable and
   correlatable by one id.
 - A parent that spawns children and then does *not* wait on them is legal; the
-  children run to completion independently.
+  children run independently of whether the parent succeeds or fails. A
+  cancelled ancestor, though, cancels them as if `Cancel` had been called on
+  each ([ADR-0021](0021-cancel-reaches-every-descendant.md)).
 
 ## History
 
@@ -99,3 +104,4 @@ worse than retrying after the lease expires.
 |---|---|
 | 2026-07-20 | Initial record, extracted from the initial implementation spec (D15, D20, D46, D48). |
 | 2026-07-26 | Metrics now roll up from child to parent (ADR-0010). The earlier consequence said they do not, on the reasoning that sharing a budget needs a distributed counter — it does not, because the await's own commit already writes the parent row. |
+| 2026-10-13 | An unwaited child no longer runs to completion regardless of its parent: a cancelled ancestor cancels it, and a child ending after its parent is also folded into the terminated ancestors above it (ADR-0021). |

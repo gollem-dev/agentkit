@@ -7,9 +7,13 @@ package agentkit
 // Every field is cumulative and never decreases. The zero value means "nothing
 // consumed" and is a valid Metrics.
 //
-// Process.Metrics counts a Process's own effects plus every child that has
-// terminated, once each, so a Limit high in a tree sees what the subtree
-// spent rather than only the row it was called for.
+// Process.Metrics counts a Process's own effects plus the totals its children
+// reported when they terminated, once each, so a Limit high in a tree sees what
+// the subtree spent rather than only the row it was called for. A child's total
+// includes its own terminated children, so usage climbs one level each time a
+// Process terminates. A child that ends after its parent — the usual order under
+// a cancel — is added to the parent and to each terminated ancestor above it,
+// through the first one that has not terminated (ADR-0021).
 //
 // The json tags match the keys the previous map form produced, so a snapshot
 // written before this became a struct still reads back: known counters keep

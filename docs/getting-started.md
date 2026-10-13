@@ -174,7 +174,11 @@ destination. See [ADR-0014](adr/0014-completion-handlers-are-best-effort.md) and
 **It runs synchronously, on whichever instance committed the transition.** A
 slow handler delays that worker's next claim, so keep it short or hand off. For
 a `cancelled` process the committing instance is whoever called `Cancel`, which
-is usually your application rather than a worker.
+is usually your application rather than a worker. Cancelling a process also
+cancels its descendants ([ADR-0021](adr/0021-cancel-reaches-every-descendant.md)),
+and each one's handler runs on whichever instance commits that descendant's own
+terminal state: the instance that cancelled its parent when the descendant was
+pending or waiting, otherwise the worker that claims it.
 
 ## Answering a question
 

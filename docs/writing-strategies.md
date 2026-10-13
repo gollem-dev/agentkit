@@ -508,6 +508,15 @@ to handle that case specially.
 
 `WaitChildren` only accepts your own direct children.
 
+**Cancelling a Process cancels its children.** Once the Process is cancelled,
+every child that has not finished is cancelled with the same reason, and so are
+theirs — whether you waited on them or not. Each one is treated as if `Cancel`
+had been called on it, so a child that is mid-round may run one more transition
+first ([Where a cancel can stop](#where-a-cancel-can-stop)). A child's usage is
+still added to your `Metrics` when it ends. Work that must keep going after the
+spawner is cancelled is not a child: start it as its own root with `Agent.Spawn`
+([ADR-0021](adr/0021-cancel-reaches-every-descendant.md)).
+
 ## Emitting events
 
 ```go

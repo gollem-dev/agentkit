@@ -14,9 +14,9 @@ stateDiagram-v2
   waiting --> running: claimed once a wake deadline is due
   running --> succeeded: Done
   running --> failed: Fail / limit exceeded / retries exhausted
-  running --> cancelled: Cancel
-  waiting --> cancelled: Cancel
-  pending --> cancelled: Cancel
+  running --> cancelled: Cancel / an ancestor is cancelled
+  waiting --> cancelled: Cancel / an ancestor is cancelled
+  pending --> cancelled: Cancel / an ancestor is cancelled
   running --> pending: requeue (transient error) or lease expiry
   succeeded --> [*]
   failed --> [*]
@@ -169,12 +169,15 @@ sequenceDiagram
   else pending / waiting (unclaimed)
     K->>R: finalize as cancelled now (external fence)
     Note right of K: ErrConflict from any concurrent writer → loop re-reads<br/>and re-judges the now-fresh status
+    K->>K: Cancel(each child its closed children awaits named)
     K-->>App: nil
   end
 ```
 
 Either branch reaches termination through the same commit path, so awaits are
 closed and a waiting parent is woken exactly as with any other ending. The
+same path also cancels the children the closed awaits named, and every other
+descendant ends at its own next loop head ([Cancellation](#cancellation)). The
 detail of why an external caller propagates `ErrConflict` instead of retrying
 silently is in [Cancellation](#cancellation) below.
 
@@ -330,7 +333,9 @@ be used to fence.
 re-read the process
   ├─ read failed?          → requeue (no attempt: nothing was tried this round)
   ├─ lease token changed?  → abandon, another worker owns it now
-  └─ cancel requested?     → conversation mid-round and deferrals left?
+  ├─ ancestor read failed? → requeue (no attempt), checked only without a cancel request
+  └─ cancel requested, or  → conversation mid-round and deferrals left?
+     an ancestor cancelled?
                              ├─ yes → run one more transition, ask again
                              └─ no  → finalize as cancelled
 Limit check                → failed(limit_exceeded) if it stops; otherwise its
@@ -357,7 +362,9 @@ row without committing anything, whereas `StateSeq` is written only by this
 worker's own commits.
 
 The re-read at the top of every iteration is what makes `Cancel` responsive
-mid-run and what detects a lost lease before wasting an LLM call.
+mid-run and what detects a lost lease before wasting an LLM call. For a Process
+with a parent it also walks the `ParentID` chain, so a cancelled ancestor is
+observed exactly like the Process's own cancel request.
 
 ### The four decisions
 
@@ -433,6 +440,10 @@ Terminating is a single `Apply` that carries, together:
 - every open await closed as `cancelled`,
 - the parent's `WaitChildren` await updated, and the parent flipped from
   `waiting` to `pending` if this was the last child,
+- this Process's metrics added to the parent, and to every terminated ancestor
+  above it — a parent that already ended has already reported its own total, so
+  a child ending after it would otherwise stop there
+  ([ADR-0021](../adr/0021-cancel-reaches-every-descendant.md)),
 - a `process.finished` event.
 
 Bundling the parent wake into the child's own terminal commit is what closes the
@@ -474,6 +485,34 @@ as with any other termination.
 An external caller's commit conflict is propagated as `ErrConflict` rather than
 being silently retried, so the caller re-reads and re-decides — unlike a worker,
 an external caller has no lease to prove it should win.
+
+### A cancel reaches every descendant
+
+A Process committed as `cancelled` cancels every unfinished descendant, each
+with the nearest cancelled ancestor's `CancelReason`, exactly as if `Cancel` had
+been called on it — the deferral above included, so a running descendant
+mid-round may still end `succeeded` or `failed`
+([ADR-0021](../adr/0021-cancel-reaches-every-descendant.md)). Two mechanisms do
+it, and only the first is load-bearing:
+
+| | Where | Reaches | If it is lost |
+|---|---|---|---|
+| Ancestor check | the loop head of the descendant's own claim | every descendant, through `ParentID` | — this is the guarantee |
+| Cascade | right after the cancelled commit, in `commitFinal` | the children the closed children awaits named | a waiting descendant stays waiting until it is next claimed |
+
+The cascade calls `Kernel.Cancel` on each child, so a pending or waiting child
+ends inline and cascades in turn, while a running child gets `CancelRequested`.
+It runs before the completion handler and in the goroutine that committed the
+cancel. Its failures are logged, not returned, so a `Cancel` that returned nil
+does not prove any descendant has ended. A child the parent never waited on, or
+one spawned in the transitions that ran after `Cancel` was called, is invisible
+from the parent and is reached by its own check instead.
+
+What is not guaranteed: a waiting descendant that the cascade did not reach stays
+`waiting` — calling no model — until a response, a timer or its last child makes
+it claimable. A running child's in-flight `Continue` or `Suspend` commit fails
+when the cascade's write advances its `Rev`, so that transition's usage is not
+recorded, as with any `Cancel` of a running Process.
 
 ### The worker does not stop mid-round
 

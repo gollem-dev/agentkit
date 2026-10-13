@@ -679,14 +679,30 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		if fresh.LeaseToken != claimToken {
 			return ClaimAbandoned // lost the lease between transitions.
 		}
-		if fresh.CancelRequested {
+		// A cancelled ancestor cancels this Process exactly as its own request would
+		// (ADR-0021). It is read rather than relied on being written here: the
+		// cascade after the ancestor's commit reaches only the children it waited on,
+		// and may not run at all.
+		cancelled, reason := fresh.CancelRequested, fresh.CancelReason
+		if !cancelled {
+			anc, aerr := k.cancelledAncestor(ctx, fresh)
+			if aerr != nil {
+				// Nothing ran this iteration, so no attempt is owed — the same reasoning
+				// as the failed read above.
+				return k.settleFailedClaim(ctx, cfg, fresh, claimToken, aerr)
+			}
+			if anc != nil {
+				cancelled, reason = true, anc.CancelReason
+			}
+		}
+		if cancelled {
 			// Stopping here would leave the stored conversation ending on a tool call
 			// nobody answered — unusable as a transcript to send anywhere. Running the
 			// strategy's next transition is what closes it; the bound is what keeps a
 			// conversation that never closes from holding a cancelled Process here.
 			// The bound is tested first so a spent budget costs no History read.
 			if cancelDeferrals >= cfg.maxCancelDeferrals || k.conversationClosed(ctx, hs, fresh) {
-				return k.finalizeClaimed(ctx, cfg, fresh, cancelledWith(fresh.CancelReason), claimToken, Metrics{})
+				return k.finalizeClaimed(ctx, cfg, fresh, cancelledWith(reason), claimToken, Metrics{})
 			}
 			cancelDeferrals++
 			k.logger.Info("cancel deferred: the managed conversation has an unanswered tool call",
@@ -825,6 +841,32 @@ func (k *Kernel) driveClaim(ctx context.Context, cfg serveConfig, proc *Process,
 		return ClaimAbandoned
 	}
 	return ClaimReleased
+}
+
+// cancelledAncestor returns the nearest ancestor of proc that is cancelled, or
+// nil when there is none. It walks every ancestor rather than only the parent:
+// an intermediate Process left waiting on its own children never ends by itself
+// when the cascade after its parent's commit was lost, so reading the parent
+// alone would hide the cancelled root above it (ADR-0021).
+//
+// An ancestor that no longer exists ends the walk, the same reading
+// reportToParent gives a missing parent.
+func (k *Kernel) cancelledAncestor(ctx context.Context, proc *Process) (*Process, error) {
+	for id := proc.ParentID; id != nil; {
+		anc, err := k.repo.GetProcess(ctx, *id)
+		if errors.Is(err, ErrProcessNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, goerr.Wrap(err, "read an ancestor for a cancel check",
+				goerr.V("process", proc.ID), goerr.V("ancestor", *id))
+		}
+		if anc.Status == ProcessCancelled {
+			return anc, nil
+		}
+		id = anc.ParentID
+	}
+	return nil, nil
 }
 
 // claimSpecific claims one pending Process by id, for eager dispatch. It writes
@@ -1248,15 +1290,20 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 			cs.Processes = append(cs.Processes, sys.pendingChildren...)
 			cs.Events = append(cs.Events, sys.pendingEvents...)
 		}
-		// Close this Process's open awaits.
+		// Close this Process's open awaits, keeping the children they named: those
+		// are the only children this Process can reach to cancel after the commit.
 		awaits, err := k.repo.ListAwaits(ctx, p.ID)
 		if err != nil {
 			return false, k.abortFinal(sys, goerr.Wrap(err, "list own awaits for finalize"))
 		}
+		var waited []ProcessID
 		for _, aw := range awaits {
 			if aw.Status == AwaitOpen {
 				aw.Status = AwaitCancelled
 				cs.Awaits = append(cs.Awaits, aw)
+				if aw.Kind == AwaitChildren {
+					waited = append(waited, aw.Children...)
+				}
 			}
 		}
 		// Fold this Process's usage into its parent, and wake the parent if this
@@ -1312,8 +1359,31 @@ func (k *Kernel) commitFinal(ctx context.Context, proc *Process, fenceToken stri
 		if sys != nil {
 			sys.notifySpawnDone(nil)
 		}
+		// Before the completion handler, whose duration is the caller's: every
+		// moment it holds this up is a moment a waited child keeps running.
+		if p.Status == ProcessCancelled {
+			k.cancelChildren(ctx, p.ID, waited, p.CancelReason)
+		}
 		k.fireFinish(ctx, p, typedOut)
 		return true, nil
+	}
+}
+
+// cancelChildren cancels the children a cancelled Process was waiting on, with
+// its reason. It is an optimization, not the guarantee: without it a waiting
+// child would stay parked until something claimed it. Every other descendant,
+// and these ones too when this call is lost, is finalized by cancelledAncestor
+// at its next claim (ADR-0021), which is why a failure is logged, not returned.
+//
+// It runs in the caller's goroutine rather than through eager dispatch, because
+// Cancel is also called from an application process that runs no Serve, and
+// there a waiting child would otherwise never end.
+func (k *Kernel) cancelChildren(ctx context.Context, parent ProcessID, children []ProcessID, reason string) {
+	for _, cid := range children {
+		if err := k.Cancel(ctx, cid, reason); err != nil && !errors.Is(err, ErrProcessFinished) {
+			k.logger.Error("cancel a child of a cancelled process",
+				"process", parent, "child", cid, "error", err)
+		}
 	}
 }
 
@@ -1428,6 +1498,27 @@ func (k *Kernel) reportToParent(ctx context.Context, parentID ProcessID, child *
 	// (#3c). A parent that spawned this child and never waited is written too —
 	// that is the case the fold exists for.
 	cs.Processes = append(cs.Processes, pClone)
+
+	// A parent that has already terminated reported its own total upward when it
+	// did, so this child's usage would stop at it. A cancel makes that the usual
+	// order — a parent ends before its children — hence the walk: every ancestor
+	// that already reported gets the same addition, up to and including the first
+	// one that has not (ADR-0021). Nothing is counted twice, because each ancestor
+	// reports exactly once, at its own terminal commit, and every row written here
+	// is a CAS target that serializes against that commit.
+	for anc := parent; anc.Status.Terminal() && anc.ParentID != nil; {
+		next, gerr := k.repo.GetProcess(ctx, *anc.ParentID)
+		if errors.Is(gerr, ErrProcessNotFound) {
+			break
+		}
+		if gerr != nil {
+			return goerr.Wrap(gerr, "get an ancestor for the metrics fold", goerr.V("ancestor", *anc.ParentID))
+		}
+		nc := next.clone()
+		nc.Metrics = nc.Metrics.add(child.Metrics)
+		cs.Processes = append(cs.Processes, nc)
+		anc = next
+	}
 	return nil
 }
 
